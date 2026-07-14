@@ -180,7 +180,11 @@ class SQLiteLedger:
             event = EventEnvelope.model_validate_json(row["envelope_json"])
         except Exception as error:
             raise LedgerIntegrityError("persisted event envelope is invalid") from error
-        if event.brain_id != row["brain_id"] or event.sequence != row["sequence"]:
+        if (
+            event.event_id != row["event_id"]
+            or event.brain_id != row["brain_id"]
+            or event.sequence != row["sequence"]
+        ):
             raise LedgerIntegrityError("event row keys do not match its envelope")
         if event.body_fingerprint() != row["body_fingerprint"]:
             raise LedgerIntegrityError("event body fingerprint does not match its body")
@@ -195,12 +199,17 @@ class SQLiteLedger:
         event = self._normalize_event(event)
         body_fingerprint = event.body_fingerprint()
         with self._transaction(immediate=True):
-            existing = self._connection.execute(
-                "SELECT brain_id, sequence, body_fingerprint, "
+            matches = self._connection.execute(
+                "SELECT event_id, brain_id, sequence, body_fingerprint, "
                 "envelope_fingerprint, envelope_json "
-                "FROM events WHERE event_id = ?",
-                (event.event_id,),
-            ).fetchone()
+                "FROM events WHERE event_id = ? OR body_fingerprint = ?",
+                (event.event_id, body_fingerprint),
+            ).fetchall()
+            if len(matches) > 1:
+                raise LedgerIntegrityError(
+                    f"event ID {event.event_id} resolves to multiple ledger rows"
+                )
+            existing = matches[0] if matches else None
             if existing is not None:
                 if existing["body_fingerprint"] != body_fingerprint:
                     raise EventConflictError(
@@ -277,7 +286,7 @@ class SQLiteLedger:
         with self._lock:
             self._ensure_open()
             rows = self._connection.execute(
-                "SELECT brain_id, sequence, body_fingerprint, "
+                "SELECT event_id, brain_id, sequence, body_fingerprint, "
                 "envelope_fingerprint, envelope_json "
                 "FROM events WHERE brain_id = ? AND sequence > ? "
                 "ORDER BY sequence ASC LIMIT ?",
@@ -317,7 +326,7 @@ class SQLiteLedger:
             where += " AND sequence <= ?"
             parameters = (brain_id, through_sequence)
         cursor = self._connection.execute(
-            "SELECT brain_id, sequence, body_fingerprint, "
+            "SELECT event_id, brain_id, sequence, body_fingerprint, "
             "envelope_fingerprint, envelope_json "
             f"FROM events WHERE {where} ORDER BY sequence ASC",
             parameters,
@@ -430,7 +439,7 @@ class SQLiteLedger:
             if state is None:
                 state = BrainState.genesis(brain_id)
             cursor = self._connection.execute(
-                "SELECT brain_id, sequence, body_fingerprint, "
+                "SELECT event_id, brain_id, sequence, body_fingerprint, "
                 "envelope_fingerprint, envelope_json "
                 "FROM events WHERE brain_id = ? AND sequence > ? "
                 "ORDER BY sequence ASC",

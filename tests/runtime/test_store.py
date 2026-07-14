@@ -138,6 +138,53 @@ def test_full_envelope_fingerprint_detects_stored_sequence_tampering(
         ledger.list_events(BRAIN)
 
 
+@pytest.mark.parametrize(
+    "decode_path",
+    ["append_retry", "list_events", "replay", "snapshot_validation"],
+)
+def test_relational_event_id_tampering_is_rejected_by_every_decode_path(
+    tmp_path: Path, decode_path: str
+) -> None:
+    database = tmp_path / f"{decode_path}.db"
+    original = make_event("brain.created", {"name": None})
+    with SQLiteLedger.open(database) as ledger:
+        stored = ledger.append(original)
+        state = reduce_many(BrainState.genesis(BRAIN), [stored])
+
+    tampered_event_id = new_id()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "UPDATE events SET event_id = ? WHERE event_id = ?",
+            (tampered_event_id, original.event_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with (
+        SQLiteLedger.open(database) as ledger,
+        pytest.raises(LedgerIntegrityError, match="row keys"),
+    ):
+        if decode_path == "append_retry":
+            ledger.append(original)
+        elif decode_path == "list_events":
+            ledger.list_events(BRAIN)
+        elif decode_path == "replay":
+            ledger.replay(BRAIN)
+        else:
+            ledger.save_snapshot(state)
+
+    connection = sqlite3.connect(database)
+    try:
+        rows = connection.execute(
+            "SELECT sequence, event_id FROM events ORDER BY sequence"
+        ).fetchall()
+        assert rows == [(1, tampered_event_id)]
+    finally:
+        connection.close()
+
+
 def test_concurrent_separate_connections_allocate_monotonic_per_brain_sequences(
     tmp_path: Path,
 ) -> None:
