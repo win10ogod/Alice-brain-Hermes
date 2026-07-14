@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "alice-brain-hermes"
+version = "0.1.0"
+description = "Independent engineering-consciousness runtime and Hermes Agent plugin"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "pydantic>=2.12,<3",
+    "psutil>=7,<8",
+    "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9,<10",
+    "ruff>=0.12,<1",
+]
+
+[project.scripts]
+alice-brain-hermes = "alice_brain_hermes.cli:main"
+
+[project.entry-points."hermes_agent.plugins"]
+alice-brain = "alice_brain_hermes.hermes_plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alice_brain_hermes"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
