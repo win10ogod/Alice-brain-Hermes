@@ -21,6 +21,7 @@ def _write_wheel(
     version: str = "0.1.0",
     dependencies: tuple[str, ...] = (),
     source: str = "from alice_brain_hermes import __version__\n",
+    source_member: str = "fixture/__init__.py",
     entry_points: str | None = None,
 ) -> None:
     requires_dist = "".join(f"Requires-Dist: {item}\n" for item in dependencies)
@@ -30,7 +31,7 @@ def _write_wheel(
     )
     dist_info = f"{name.replace('-', '_')}-{version}.dist-info"
     with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
-        archive.writestr("fixture/__init__.py", source)
+        archive.writestr(source_member, source)
         archive.writestr(f"{dist_info}/METADATA", metadata_text)
         if entry_points is not None:
             archive.writestr(f"{dist_info}/entry_points.txt", entry_points)
@@ -106,6 +107,74 @@ def test_project_audit_allows_dynamic_hermes_namespace(tmp_path: Path) -> None:
     audit_project(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "import importlib\n"
+            "def load_runtime():\n"
+            '    target = "alice_" + "brain"\n'
+            "    return importlib.import_module(target)\n"
+        ),
+        (
+            "import importlib.util\n"
+            'importlib.import_module("alice_brain.runtime")\n'
+        ),
+        (
+            "from importlib import import_module as load\n"
+            "def load_runtime():\n"
+            '    target = "alice_brain"\n'
+            "    return load(target)\n"
+        ),
+        (
+            "import importlib\n"
+            "load = importlib.import_module\n"
+            'load("alice_brain")\n'
+        ),
+        (
+            "from importlib import import_module\n"
+            "def load_runtime():\n"
+            "    load = import_module\n"
+            '    target = "alice_brain"\n'
+            "    return load(target)\n"
+        ),
+    ],
+)
+def test_project_audit_rejects_scoped_dynamic_import_bindings(
+    tmp_path: Path, source: str
+) -> None:
+    _write_source(tmp_path, source)
+
+    with pytest.raises(AuditViolation, match="forbidden import root"):
+        audit_project(tmp_path)
+
+
+def test_project_audit_keeps_static_bindings_inside_their_scope(
+    tmp_path: Path,
+) -> None:
+    _write_source(
+        tmp_path,
+        "import importlib\n"
+        'target = "alice_brain"\n'
+        "def load_runtime(target):\n"
+        "    return importlib.import_module(target)\n",
+    )
+
+    audit_project(tmp_path)
+
+
+def test_project_audit_allows_scoped_hermes_dynamic_imports(tmp_path: Path) -> None:
+    _write_source(
+        tmp_path,
+        "import importlib.util\n"
+        "def load_runtime():\n"
+        '    target = "alice_brain_hermes.runtime"\n'
+        "    return importlib.import_module(target)\n",
+    )
+
+    audit_project(tmp_path)
+
+
 @pytest.mark.parametrize("suffix", [".toml", ".yaml", ".ini"])
 def test_project_audit_rejects_exact_root_executable_config_values(
     tmp_path: Path, suffix: str
@@ -121,6 +190,39 @@ def test_project_audit_allows_hermes_executable_config_value(tmp_path: Path) -> 
     (tmp_path / "plugin.toml").write_text(
         '[project.entry-points."hermes_agent.plugins"]\n'
         'alice-brain = "alice_brain_hermes.hermes_plugin"\n',
+        encoding="utf-8",
+    )
+
+    audit_project(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        (
+            "runtime.toml",
+            '[runtime]\ncommand = ["uv", "run", "alice-brain", "daemon"]\n',
+        ),
+        (
+            "runtime.json",
+            '{"runtime": {"command": ["uv", "run", "alice_brain", "daemon"]}}',
+        ),
+    ],
+)
+def test_project_audit_rejects_wrapped_config_command_arrays(
+    tmp_path: Path, filename: str, content: str
+) -> None:
+    (tmp_path / filename).write_text(content, encoding="utf-8")
+
+    with pytest.raises(AuditViolation, match="daemon service"):
+        audit_project(tmp_path)
+
+
+def test_project_audit_allows_hermes_wrapped_config_command_array(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "runtime.toml").write_text(
+        '[runtime]\ncommand = ["uv", "run", "alice-brain-hermes", "daemon"]\n',
         encoding="utf-8",
     )
 
@@ -192,6 +294,52 @@ def test_project_audit_allows_hermes_state_and_wrapped_command(tmp_path: Path) -
     audit_project(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "from pathlib import Path\n"
+            'CHECKOUT = Path("..") / "alice_brain"\n'
+        ),
+        (
+            "from pathlib import Path as FilePath\n"
+            'CHECKOUT = FilePath("..") / "alice_brain"\n'
+        ),
+        (
+            "import os\n"
+            'CHECKOUT = os.path.join("..", "alice_brain")\n'
+        ),
+        (
+            "import os as platform_os\n"
+            'CHECKOUT = platform_os.path.join("..", "alice_brain")\n'
+        ),
+        (
+            "from os import path as os_path\n"
+            'CHECKOUT = os_path.join("..", "alice_brain")\n'
+        ),
+    ],
+)
+def test_project_audit_rejects_static_python_path_construction(
+    tmp_path: Path, source: str
+) -> None:
+    _write_source(tmp_path, source)
+
+    with pytest.raises(AuditViolation, match="sibling Alice-brain checkout path"):
+        audit_project(tmp_path)
+
+
+def test_project_audit_allows_static_hermes_path_construction(tmp_path: Path) -> None:
+    _write_source(
+        tmp_path,
+        "from pathlib import Path\n"
+        "import os\n"
+        'STATE = Path("..") / "alice_brain_hermes"\n'
+        'CACHE = os.path.join("..", "alice_brain_hermes", "cache")\n',
+    )
+
+    audit_project(tmp_path)
+
+
 def test_project_audit_rejects_git_submodules(tmp_path: Path) -> None:
     (tmp_path / ".gitmodules").write_text(
         '[submodule "Alice-brain"]\n\tpath = Alice-brain\n', encoding="utf-8"
@@ -249,6 +397,25 @@ def test_project_audit_never_ignores_nested_shipping_source_directories(
         audit_project(tmp_path)
 
 
+def test_project_audit_rejects_exact_forbidden_source_package_path(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "src" / "alice_brain" / "__init__.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+
+    with pytest.raises(AuditViolation, match="forbidden package path component"):
+        audit_project(tmp_path)
+
+
+def test_project_audit_allows_hermes_source_package_path(tmp_path: Path) -> None:
+    source = tmp_path / "src" / "alice_brain_hermes" / "__init__.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+
+    audit_project(tmp_path)
+
+
 @pytest.mark.parametrize("root_name", ["tests", "docs", "dist"])
 def test_project_audit_ignores_root_only_nonshipping_directories(
     tmp_path: Path, root_name: str
@@ -294,6 +461,27 @@ def test_wheel_audit_checks_packaged_python_ast(tmp_path: Path) -> None:
 
     with pytest.raises(AuditViolation, match="forbidden import root"):
         audit_wheel(wheel)
+
+
+def test_wheel_audit_rejects_exact_forbidden_package_member_path(
+    tmp_path: Path,
+) -> None:
+    wheel = tmp_path / "fixture-0.1.0-py3-none-any.whl"
+    _write_wheel(wheel, source_member="alice_brain/__init__.py", source="VALUE = 1\n")
+
+    with pytest.raises(AuditViolation, match="forbidden package path component"):
+        audit_wheel(wheel)
+
+
+def test_wheel_audit_allows_hermes_package_member_path(tmp_path: Path) -> None:
+    wheel = tmp_path / "fixture-0.1.0-py3-none-any.whl"
+    _write_wheel(
+        wheel,
+        source_member="alice_brain_hermes/__init__.py",
+        source="VALUE = 1\n",
+    )
+
+    audit_wheel(wheel)
 
 
 def test_wheel_audit_checks_packaged_entry_points(tmp_path: Path) -> None:
@@ -342,5 +530,16 @@ def test_release_audit_requires_project_version_match(tmp_path: Path) -> None:
     )
     wheel = tmp_path / "alice_brain_hermes-9.9.9-py3-none-any.whl"
     _write_wheel(wheel, version="9.9.9")
+
+    assert main(["--root", str(tmp_path), str(wheel)]) == 1
+
+
+def test_release_audit_requires_a_static_project_version(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "alice-brain-hermes"\ndynamic = ["version"]\n',
+        encoding="utf-8",
+    )
+    wheel = tmp_path / "alice_brain_hermes-0.1.0-py3-none-any.whl"
+    _write_wheel(wheel)
 
     assert main(["--root", str(tmp_path), str(wheel)]) == 1
