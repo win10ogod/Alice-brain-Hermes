@@ -60,7 +60,10 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
             raise DomainInvariantError(
                 "clock.tick elapsed_seconds must be a finite non-negative number"
             )
-        values["logical_clock"] = state.logical_clock + float(elapsed)
+        logical_clock = state.logical_clock + float(elapsed)
+        if not math.isfinite(logical_clock):
+            raise DomainInvariantError("clock.tick logical clock overflow")
+        values["logical_clock"] = logical_clock
     elif event.event_type == "capabilities.reported":
         capabilities = _payload_mapping(
             event.payload.get("capabilities"), field="capabilities"

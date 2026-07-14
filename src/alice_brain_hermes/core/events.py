@@ -60,12 +60,15 @@ def thaw_json(value: Any) -> Any:
     return value
 
 
-def _hashable_json(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return tuple((key, _hashable_json(item)) for key, item in sorted(value.items()))
-    if isinstance(value, (list, tuple)):
-        return tuple(_hashable_json(item) for item in value)
-    return value
+def _canonical_json_value(value: Any) -> str:
+    frozen = _freeze_json(value)
+    return json.dumps(
+        thaw_json(frozen),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 class FrozenJsonDict(Mapping[str, Any]):
@@ -96,11 +99,18 @@ class FrozenJsonDict(Mapping[str, Any]):
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, Mapping):
-            return thaw_json(self) == thaw_json(other)
+            try:
+                return self.canonical_json() == _canonical_json_value(other)
+            except (TypeError, ValueError):
+                return False
         return NotImplemented
 
     def __hash__(self) -> int:
-        return hash(_hashable_json(self))
+        return hash(self.canonical_json())
+
+    def canonical_json(self) -> str:
+        """Serialize with JSON type distinctions preserved recursively."""
+        return _canonical_json_value(self)
 
     @classmethod
     def _validate(cls, value: Any) -> FrozenJsonDict:
@@ -195,6 +205,22 @@ class EventEnvelope(BaseModel):
         """Hash the complete immutable body, excluding ledger allocation."""
         body = self.canonical_json(exclude_sequence=True).encode("utf-8")
         return hashlib.sha256(body).hexdigest()
+
+    def envelope_fingerprint(self) -> str:
+        """Hash the full stored envelope, including its allocated sequence."""
+        envelope = self.canonical_json().encode("utf-8")
+        return hashlib.sha256(envelope).hexdigest()
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, EventEnvelope):
+            try:
+                return self.canonical_json() == other.canonical_json()
+            except (TypeError, ValueError):
+                return False
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.canonical_json())
 
     def revalidated(self) -> EventEnvelope:
         """Revalidate even values created through Pydantic's unchecked model_copy."""

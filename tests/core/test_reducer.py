@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from alice_brain_hermes.core.events import EventEnvelope, new_event
+from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict, new_event
 from alice_brain_hermes.core.reducer import reduce_many, reduce_state
 from alice_brain_hermes.core.state import BrainState
 from alice_brain_hermes.errors import DomainInvariantError
@@ -50,6 +50,66 @@ def test_event_envelope_is_strict_deeply_frozen_and_canonical() -> None:
             "monotonic_ns": envelope.monotonic_ns,
         }
     ).canonical_json(exclude_sequence=True)
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (True, 1),
+        (1, 1.0),
+        (1.0, True),
+    ],
+)
+def test_frozen_json_equality_is_recursively_type_sensitive(
+    left: object, right: object
+) -> None:
+    first = FrozenJsonDict({"outer": [{"value": left}]})
+    second = FrozenJsonDict({"outer": [{"value": right}]})
+
+    assert first != second
+    assert first != {"outer": [{"value": right}]}
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (True, 1),
+        (1, 1.0),
+        (1.0, True),
+    ],
+)
+def test_event_envelope_equality_uses_canonical_json_types(
+    left: object, right: object
+) -> None:
+    first = event("observation.received", {"nested": {"value": left}})
+    second = first.model_copy(
+        update={"payload": FrozenJsonDict({"nested": {"value": right}})}
+    )
+
+    assert first.canonical_json() != second.canonical_json()
+    assert first != second
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (True, 1),
+        (1, 1.0),
+        (1.0, True),
+    ],
+)
+def test_brain_state_equality_uses_canonical_json_types(
+    left: object, right: object
+) -> None:
+    first = BrainState.genesis(BRAIN).model_copy(
+        update={"capabilities": FrozenJsonDict({"nested": {"value": left}})}
+    )
+    second = BrainState.genesis(BRAIN).model_copy(
+        update={"capabilities": FrozenJsonDict({"nested": {"value": right}})}
+    )
+
+    assert first.canonical_json() != second.canonical_json()
+    assert first != second
 
 
 @pytest.mark.parametrize(
@@ -173,3 +233,23 @@ def test_reducer_rejects_brain_mismatch_sequence_gap_and_bad_clock() -> None:
         reduce_state(state, event("clock.tick", {"elapsed_seconds": 1.0}, 2))
     with pytest.raises(DomainInvariantError, match="elapsed_seconds"):
         reduce_state(state, event("clock.tick", {"elapsed_seconds": -1.0}, 1))
+
+
+def test_brain_state_rejects_nonfinite_logical_clock() -> None:
+    with pytest.raises(ValidationError, match="logical_clock"):
+        BrainState.model_validate(
+            {
+                **BrainState.genesis(BRAIN).model_dump(mode="python"),
+                "logical_clock": float("inf"),
+            }
+        )
+
+
+def test_reducer_rejects_finite_clock_values_whose_sum_overflows() -> None:
+    state = reduce_state(
+        BrainState.genesis(BRAIN),
+        event("clock.tick", {"elapsed_seconds": 1e308}, 1),
+    )
+
+    with pytest.raises(DomainInvariantError, match="overflow"):
+        reduce_state(state, event("clock.tick", {"elapsed_seconds": 1e308}, 2))

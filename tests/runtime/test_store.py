@@ -12,11 +12,12 @@ from alice_brain_hermes.core.state import BrainState
 from alice_brain_hermes.errors import (
     EventConflictError,
     LedgerClosedError,
+    LedgerIntegrityError,
     SchemaVersionError,
     SnapshotConflictError,
 )
 from alice_brain_hermes.ids import new_id
-from alice_brain_hermes.runtime.store import SQLiteLedger
+from alice_brain_hermes.runtime.store import SQLITE_SCHEMA_VERSION, SQLiteLedger
 
 BRAIN = new_id()
 ACTOR = new_id()
@@ -66,6 +67,29 @@ def test_sql_failure_rolls_back_sequence_allocation(tmp_path: Path) -> None:
         assert ledger.append(make_event()).sequence == 1
 
 
+def test_commit_failure_rolls_back_and_connection_recovers(tmp_path: Path) -> None:
+    database = tmp_path / "hermes.db"
+    with SQLiteLedger.open(database) as ledger:
+        connection = ledger._connection
+        connection.executescript(
+            "CREATE TABLE commit_parent(id INTEGER PRIMARY KEY);"
+            "CREATE TABLE commit_child("
+            "parent_id INTEGER NOT NULL REFERENCES commit_parent(id) "
+            "DEFERRABLE INITIALLY DEFERRED);"
+            "CREATE TRIGGER reject_commit AFTER INSERT ON events "
+            "BEGIN INSERT INTO commit_child(parent_id) VALUES (999); END;"
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            ledger.append(make_event())
+
+        assert connection.in_transaction is False
+        connection.execute("DROP TRIGGER reject_commit")
+        connection.execute("DROP TABLE commit_child")
+        connection.execute("DROP TABLE commit_parent")
+        assert ledger.append(make_event()).sequence == 1
+
+
 def test_idempotency_fingerprint_is_canonical_and_excludes_allocated_sequence(
     tmp_path: Path,
 ) -> None:
@@ -73,10 +97,45 @@ def test_idempotency_fingerprint_is_canonical_and_excludes_allocated_sequence(
         original = make_event(payload={"b": 2, "a": [1, 3]})
         first = ledger.append(original)
         reordered = original.model_copy(update={"payload": {"a": [1, 3], "b": 2}})
-        replayed = original.model_copy(update={"sequence": 999})
 
         assert ledger.append(reordered) == first
-        assert ledger.append(replayed) == first
+        assert ledger.append(original) == first
+        assert ledger.append(first) == first
+
+        mismatched_sequence = original.model_copy(update={"sequence": 999})
+        with pytest.raises(EventConflictError, match="sequence"):
+            ledger.append(mismatched_sequence)
+
+
+def test_full_envelope_fingerprint_detects_stored_sequence_tampering(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "hermes.db"
+    with SQLiteLedger.open(database) as ledger:
+        stored = ledger.append(make_event())
+        assert stored.sequence == 1
+
+    connection = sqlite3.connect(database)
+    try:
+        envelope_json = connection.execute(
+            "SELECT envelope_json FROM events WHERE event_id = ?",
+            (stored.event_id,),
+        ).fetchone()[0]
+        tampered_json = envelope_json.replace('"sequence":1', '"sequence":99')
+        assert tampered_json != envelope_json
+        connection.execute(
+            "UPDATE events SET sequence = 99, envelope_json = ? WHERE event_id = ?",
+            (tampered_json, stored.event_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with (
+        SQLiteLedger.open(database) as ledger,
+        pytest.raises(LedgerIntegrityError, match="fingerprint"),
+    ):
+        ledger.list_events(BRAIN)
 
 
 def test_concurrent_separate_connections_allocate_monotonic_per_brain_sequences(
@@ -106,19 +165,19 @@ def test_database_uses_wal_foreign_keys_and_explicit_schema_version(
 ) -> None:
     database = tmp_path / "nested" / "hermes.db"
     with SQLiteLedger.open(database) as ledger:
-        assert ledger.schema_version == 1
+        assert ledger.schema_version == SQLITE_SCHEMA_VERSION
         assert ledger.foreign_keys_enabled is True
 
     connection = sqlite3.connect(database)
     try:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
         assert (
-            connection.execute(
-                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
-            ).fetchone()[0]
-            == "1"
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == SQLITE_SCHEMA_VERSION
         )
+        assert connection.execute(
+            "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == str(SQLITE_SCHEMA_VERSION)
     finally:
         connection.close()
 
@@ -198,6 +257,37 @@ def test_snapshot_roundtrip_and_snapshot_plus_tail_equals_full_replay(
 
         assert ledger.replay(BRAIN) == ledger.replay(BRAIN, use_snapshot=False)
         assert ledger.replay(BRAIN).logical_clock == 3.75
+
+
+@pytest.mark.parametrize(
+    ("stored_value", "substituted_value"),
+    [
+        (True, 1),
+        (1, 1.0),
+        (1.0, True),
+    ],
+)
+def test_snapshot_equivalence_is_recursively_type_sensitive(
+    tmp_path: Path, stored_value: object, substituted_value: object
+) -> None:
+    with SQLiteLedger.open(tmp_path / "hermes.db") as ledger:
+        ledger.append(
+            make_event(
+                "capabilities.reported",
+                {"capabilities": {"nested": {"value": stored_value}}},
+            )
+        )
+        replayed = ledger.replay(BRAIN, use_snapshot=False)
+        substituted = replayed.model_copy(
+            update={
+                "capabilities": {
+                    "nested": {"value": substituted_value},
+                }
+            }
+        )
+
+        with pytest.raises(SnapshotConflictError, match="full replay"):
+            ledger.save_snapshot(substituted)
 
 
 def test_snapshot_sequence_is_monotonic_and_cannot_point_past_ledger(

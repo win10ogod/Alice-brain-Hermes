@@ -17,6 +17,7 @@ class BrainState(BaseModel):
     """Deterministic state produced only by event reduction."""
 
     model_config: ClassVar[ConfigDict] = ConfigDict(
+        allow_inf_nan=False,
         extra="forbid",
         frozen=True,
         strict=True,
@@ -70,6 +71,17 @@ class BrainState(BaseModel):
             separators=(",", ":"),
             sort_keys=True,
         )
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, BrainState):
+            try:
+                return self.canonical_json() == other.canonical_json()
+            except (TypeError, ValueError):
+                return False
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.canonical_json())
 
     def revalidated(self) -> BrainState:
         """Revalidate values created through Pydantic's unchecked model_copy."""

@@ -23,7 +23,7 @@ from alice_brain_hermes.errors import (
 )
 from alice_brain_hermes.ids import validate_id
 
-SQLITE_SCHEMA_VERSION = 1
+SQLITE_SCHEMA_VERSION = 2
 MAX_PAGE_SIZE = 10_000
 
 
@@ -42,7 +42,8 @@ CREATE TABLE events (
     brain_id TEXT NOT NULL,
     sequence INTEGER NOT NULL CHECK (sequence >= 1),
     event_id TEXT NOT NULL UNIQUE,
-    fingerprint TEXT NOT NULL,
+    body_fingerprint TEXT NOT NULL,
+    envelope_fingerprint TEXT NOT NULL,
     envelope_json TEXT NOT NULL,
     PRIMARY KEY (brain_id, sequence),
     FOREIGN KEY (brain_id) REFERENCES brains(brain_id)
@@ -161,11 +162,11 @@ class SQLiteLedger:
             self._connection.execute(begin)
             try:
                 yield
-            except BaseException:
-                self._connection.rollback()
-                raise
-            else:
                 self._connection.commit()
+            except BaseException:
+                if self._connection.in_transaction:
+                    self._connection.rollback()
+                raise
 
     @staticmethod
     def _normalize_event(event: EventEnvelope) -> EventEnvelope:
@@ -181,26 +182,38 @@ class SQLiteLedger:
             raise LedgerIntegrityError("persisted event envelope is invalid") from error
         if event.brain_id != row["brain_id"] or event.sequence != row["sequence"]:
             raise LedgerIntegrityError("event row keys do not match its envelope")
-        if event.body_fingerprint() != row["fingerprint"]:
-            raise LedgerIntegrityError("event fingerprint does not match its body")
+        if event.body_fingerprint() != row["body_fingerprint"]:
+            raise LedgerIntegrityError("event body fingerprint does not match its body")
+        if event.envelope_fingerprint() != row["envelope_fingerprint"]:
+            raise LedgerIntegrityError(
+                "event envelope fingerprint does not match its stored envelope"
+            )
         return event
 
     def append(self, event: EventEnvelope) -> EventEnvelope:
         """Idempotently append one event and allocate its per-brain sequence."""
         event = self._normalize_event(event)
-        fingerprint = event.body_fingerprint()
+        body_fingerprint = event.body_fingerprint()
         with self._transaction(immediate=True):
             existing = self._connection.execute(
-                "SELECT brain_id, sequence, fingerprint, envelope_json "
+                "SELECT brain_id, sequence, body_fingerprint, "
+                "envelope_fingerprint, envelope_json "
                 "FROM events WHERE event_id = ?",
                 (event.event_id,),
             ).fetchone()
             if existing is not None:
-                if existing["fingerprint"] != fingerprint:
+                if existing["body_fingerprint"] != body_fingerprint:
                     raise EventConflictError(
                         f"event ID {event.event_id} already has a different body"
                     )
-                return self._decode_event(existing)
+                stored = self._decode_event(existing)
+                if event.sequence is not None and event.sequence != stored.sequence:
+                    raise EventConflictError(
+                        f"event ID {event.event_id} retry sequence "
+                        f"{event.sequence} does not match stored sequence "
+                        f"{stored.sequence}"
+                    )
+                return stored
 
             if event.sequence is not None:
                 raise ValueError(
@@ -226,13 +239,15 @@ class SQLiteLedger:
             )
             self._connection.execute(
                 "INSERT INTO events("
-                "brain_id, sequence, event_id, fingerprint, envelope_json"
-                ") VALUES (?, ?, ?, ?, ?)",
+                "brain_id, sequence, event_id, body_fingerprint, "
+                "envelope_fingerprint, envelope_json"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     stored.brain_id,
                     sequence,
                     stored.event_id,
-                    fingerprint,
+                    body_fingerprint,
+                    stored.envelope_fingerprint(),
                     stored.canonical_json(),
                 ),
             )
@@ -262,7 +277,8 @@ class SQLiteLedger:
         with self._lock:
             self._ensure_open()
             rows = self._connection.execute(
-                "SELECT brain_id, sequence, fingerprint, envelope_json "
+                "SELECT brain_id, sequence, body_fingerprint, "
+                "envelope_fingerprint, envelope_json "
                 "FROM events WHERE brain_id = ? AND sequence > ? "
                 "ORDER BY sequence ASC LIMIT ?",
                 (brain_id, after_sequence, limit),
@@ -301,7 +317,8 @@ class SQLiteLedger:
             where += " AND sequence <= ?"
             parameters = (brain_id, through_sequence)
         cursor = self._connection.execute(
-            "SELECT brain_id, sequence, fingerprint, envelope_json "
+            "SELECT brain_id, sequence, body_fingerprint, "
+            "envelope_fingerprint, envelope_json "
             f"FROM events WHERE {where} ORDER BY sequence ASC",
             parameters,
         )
@@ -342,7 +359,7 @@ class SQLiteLedger:
             expected = self._full_replay_in_transaction(
                 state.brain_id, through_sequence=state.last_sequence
             )
-            if expected != state:
+            if expected.canonical_json() != state.canonical_json():
                 raise SnapshotConflictError(
                     "snapshot does not equal deterministic full replay"
                 )
@@ -413,7 +430,8 @@ class SQLiteLedger:
             if state is None:
                 state = BrainState.genesis(brain_id)
             cursor = self._connection.execute(
-                "SELECT brain_id, sequence, fingerprint, envelope_json "
+                "SELECT brain_id, sequence, body_fingerprint, "
+                "envelope_fingerprint, envelope_json "
                 "FROM events WHERE brain_id = ? AND sequence > ? "
                 "ORDER BY sequence ASC",
                 (brain_id, state.last_sequence),
