@@ -325,6 +325,89 @@ def test_engine_get_miss_race_adopts_exact_next_event_only_without_tail(
             assert engine.is_stale is False
 
 
+def test_engine_get_miss_race_marks_changed_body_in_target_brain_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "changed-body-target-race.db"
+    with SQLiteLedger.open(database) as engine_ledger:
+        engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
+        target = new_event(
+            "clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0}
+        )
+        conflicting = target.model_copy(
+            update={"payload": {"elapsed_seconds": 2.0}}
+        ).revalidated()
+        original_read = engine_ledger.get_event_and_head
+        raced = False
+
+        def read_then_race(
+            event_id: str, brain_id: str
+        ) -> tuple[EventEnvelope | None, int]:
+            nonlocal raced
+            result = original_read(event_id, brain_id)
+            if not raced:
+                raced = True
+                with SQLiteLedger.open(database) as concurrent:
+                    concurrent.append(conflicting)
+            return result
+
+        monkeypatch.setattr(
+            engine_ledger, "get_event_and_head", read_then_race
+        )
+
+        with pytest.raises(EventConflictError, match="sequence divergence"):
+            engine.append(target)
+
+        assert engine.state.last_sequence == 0
+        assert engine.is_stale is True
+        assert engine_ledger.list_events(BRAIN) == [
+            conflicting.model_copy(update={"sequence": 1}).revalidated()
+        ]
+
+
+def test_engine_get_miss_race_with_changed_body_in_other_brain_is_not_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "changed-body-other-brain-race.db"
+    other_brain = new_id()
+    with SQLiteLedger.open(database) as engine_ledger:
+        engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
+        target = new_event(
+            "clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0}
+        )
+        conflicting = target.model_copy(
+            update={
+                "brain_id": other_brain,
+                "payload": {"elapsed_seconds": 2.0},
+            }
+        ).revalidated()
+        original_read = engine_ledger.get_event_and_head
+        raced = False
+
+        def read_then_race(
+            event_id: str, brain_id: str
+        ) -> tuple[EventEnvelope | None, int]:
+            nonlocal raced
+            result = original_read(event_id, brain_id)
+            if not raced:
+                raced = True
+                with SQLiteLedger.open(database) as concurrent:
+                    concurrent.append(conflicting)
+            return result
+
+        monkeypatch.setattr(
+            engine_ledger, "get_event_and_head", read_then_race
+        )
+
+        with pytest.raises(EventConflictError, match="different body"):
+            engine.append(target)
+
+        assert engine.state.last_sequence == 0
+        assert engine.is_stale is False
+        assert engine_ledger.list_events(BRAIN) == []
+        assert len(engine_ledger.list_events(other_brain)) == 1
+
+
 def test_engine_exact_retries_return_original_without_reduction_or_state_change(
     tmp_path: Path,
 ) -> None:

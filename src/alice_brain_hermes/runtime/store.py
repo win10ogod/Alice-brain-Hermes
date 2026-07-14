@@ -266,6 +266,15 @@ class SQLiteLedger:
         event = self._normalize_event(event)
         body_fingerprint = event.body_fingerprint()
         with self._transaction(immediate=True):
+            head = None
+            if expected_sequence is not None:
+                head = int(
+                    self._connection.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM events "
+                        "WHERE brain_id = ?",
+                        (event.brain_id,),
+                    ).fetchone()[0]
+                )
             matches = self._connection.execute(
                 "SELECT event_id, brain_id, sequence, body_fingerprint, "
                 "envelope_fingerprint, envelope_json "
@@ -284,6 +293,14 @@ class SQLiteLedger:
                     or stored.canonical_json(exclude_sequence=True)
                     != event.canonical_json(exclude_sequence=True)
                 ):
+                    if (
+                        expected_sequence is not None
+                        and head != expected_sequence - 1
+                    ):
+                        raise ExpectedSequenceError(
+                            f"expected sequence {expected_sequence}, but target "
+                            f"brain head is {head}"
+                        )
                     raise EventConflictError(
                         f"event ID {event.event_id} already has a different body"
                     )
@@ -293,23 +310,15 @@ class SQLiteLedger:
                         f"{event.sequence} does not match stored sequence "
                         f"{stored.sequence}"
                     )
-                if expected_sequence is not None:
-                    head = int(
-                        self._connection.execute(
-                            "SELECT COALESCE(MAX(sequence), 0) FROM events "
-                            "WHERE brain_id = ?",
-                            (event.brain_id,),
-                        ).fetchone()[0]
+                if expected_sequence is not None and (
+                    stored.sequence != expected_sequence
+                    or head != expected_sequence
+                ):
+                    raise ExpectedSequenceError(
+                        f"expected sequence {expected_sequence} for brain "
+                        f"{event.brain_id}, but exact event is at sequence "
+                        f"{stored.sequence} and current head is {head}"
                     )
-                    if (
-                        stored.sequence != expected_sequence
-                        or head != expected_sequence
-                    ):
-                        raise ExpectedSequenceError(
-                            f"expected sequence {expected_sequence} for brain "
-                            f"{event.brain_id}, but exact event is at sequence "
-                            f"{stored.sequence} and current head is {head}"
-                        )
                 return stored, False
 
             if event.sequence is not None:
