@@ -13,6 +13,7 @@ from alice_brain_hermes.core.events import EventEnvelope, new_event
 from alice_brain_hermes.core.reducer import reduce_state
 from alice_brain_hermes.core.state import BrainState
 from alice_brain_hermes.core.workspace import WorkspaceCoordinator
+from alice_brain_hermes.errors import EventConflictError
 from alice_brain_hermes.ids import validate_id
 
 
@@ -61,6 +62,7 @@ class ConsciousEngine:
         self._default_coordinator = WorkspaceCoordinator()
         self._lock = threading.RLock()
         self._state = ledger.replay(brain_id)
+        self._diverged = False
 
     @property
     def state(self) -> BrainState:
@@ -68,12 +70,28 @@ class ConsciousEngine:
             return self._state
 
     def append(self, event: EventEnvelope) -> EventEnvelope:
-        """Persist, then reduce; append failures leave in-memory state untouched."""
+        """Validate next state, persist, then publish the authoritative state."""
         if event.brain_id != self.brain_id:
             raise ValueError("event brain does not match engine brain")
+        if event.sequence is not None:
+            raise ValueError("engine rejects presequenced client events")
         with self._lock:
+            if self._diverged:
+                raise EventConflictError(
+                    "engine sequence divergence requires a replayed restart"
+                )
+            provisional = event.model_copy(
+                update={"sequence": self._state.last_sequence + 1}
+            ).revalidated()
+            successor = reduce_state(self._state, provisional)
             stored = self.ledger.append(event)
-            successor = reduce_state(self._state, stored)
+            if stored != provisional:
+                self._diverged = True
+                raise EventConflictError(
+                    "engine sequence divergence: stored envelope does not match "
+                    f"provisionally validated sequence {provisional.sequence}; "
+                    "restart from ledger replay is required"
+                )
             self._state = successor
             return stored
 

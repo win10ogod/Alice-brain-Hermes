@@ -7,7 +7,7 @@ import pytest
 
 from alice_brain_hermes.core.events import EventEnvelope, new_event
 from alice_brain_hermes.core.state import BrainState
-from alice_brain_hermes.errors import DomainInvariantError
+from alice_brain_hermes.errors import DomainInvariantError, EventConflictError
 from alice_brain_hermes.ids import new_id
 from alice_brain_hermes.runtime.engine import ConsciousEngine
 from alice_brain_hermes.runtime.scheduler import ContinuousScheduler
@@ -65,7 +65,7 @@ def test_engine_appends_before_reducing_and_append_failure_leaves_state() -> Non
     assert engine.state is before
 
 
-def test_engine_does_not_hide_domain_failure_after_append() -> None:
+def test_engine_rejects_domain_failure_before_append() -> None:
     ledger = AppendProbeLedger()
     engine = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
 
@@ -80,8 +80,120 @@ def test_engine_does_not_hide_domain_failure_after_append() -> None:
             )
         )
 
-    assert len(ledger.events) == 1
+    assert ledger.events == []
     assert engine.state.last_sequence == 0
+
+
+def test_invalid_event_leaves_sqlite_clean_then_valid_append_and_restart_work(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "brain.db"
+    with SQLiteLedger.open(database) as ledger:
+        engine = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
+        with pytest.raises(DomainInvariantError):
+            engine.append(
+                new_event(
+                    "action.receipt",
+                    BRAIN,
+                    ACTOR,
+                    {"action_id": "missing", "status": "success"},
+                    action_id="missing",
+                )
+            )
+
+        assert ledger.list_events(BRAIN) == []
+        assert engine.state.last_sequence == 0
+        stored = engine.append(
+            new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.25})
+        )
+        assert stored.sequence == 1
+        expected = engine.state
+
+    with SQLiteLedger.open(database) as ledger:
+        restarted = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
+        assert restarted.state == expected
+        assert restarted.state.logical_clock == pytest.approx(1.25)
+
+
+def test_engine_rejects_presequenced_client_event_without_writing() -> None:
+    ledger = AppendProbeLedger()
+    engine = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
+
+    with pytest.raises(ValueError, match="presequenced"):
+        engine.append(
+            new_event(
+                "clock.tick",
+                BRAIN,
+                ACTOR,
+                {"elapsed_seconds": 1.0},
+                sequence=1,
+            )
+        )
+
+    assert ledger.events == []
+    assert engine.state.last_sequence == 0
+
+
+def test_engine_surfaces_sequence_divergence_and_fails_closed_until_restart(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "brain.db"
+    with SQLiteLedger.open(database) as engine_ledger:
+        engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
+        with SQLiteLedger.open(database) as concurrent_ledger:
+            concurrent_ledger.append(
+                new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0})
+            )
+
+        with pytest.raises(EventConflictError, match="sequence divergence"):
+            engine.append(
+                new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 2.0})
+            )
+        assert engine.state.last_sequence == 0
+        assert len(engine_ledger.list_events(BRAIN)) == 2
+
+        with pytest.raises(EventConflictError, match="restart"):
+            engine.append(
+                new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 4.0})
+            )
+        assert len(engine_ledger.list_events(BRAIN)) == 2
+
+    with SQLiteLedger.open(database) as ledger:
+        restarted = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
+        assert restarted.state.last_sequence == 2
+        assert restarted.state.logical_clock == pytest.approx(3.0)
+
+
+def test_pc_rate_budget_replays_identically_after_restart(tmp_path: Path) -> None:
+    database = tmp_path / "brain.db"
+    with SQLiteLedger.open(database) as ledger:
+        engine = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
+        engine.append(
+            new_event(
+                "personality.revised",
+                BRAIN,
+                ACTOR,
+                {"layer": "traits", "values": {"care": 0.05}},
+            )
+        )
+        engine.append(
+            new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 0.5})
+        )
+        engine.append(
+            new_event(
+                "personality.revised",
+                BRAIN,
+                ACTOR,
+                {"layer": "traits", "values": {"care": 0.075}},
+            )
+        )
+        expected = engine.state
+        assert expected.personality.rate_state.traits.available == pytest.approx(0.0)
+
+    with SQLiteLedger.open(database) as ledger:
+        restarted = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
+        assert restarted.state == expected
+        assert restarted.state.personality.rate_state == expected.personality.rate_state
 
 
 def test_off_turn_pulse_records_clock_workspace_and_local_cognition(

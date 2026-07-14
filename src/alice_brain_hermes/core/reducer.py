@@ -16,6 +16,7 @@ from alice_brain_hermes.core.cognition import cognition_result_from_payload
 from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict, thaw_json
 from alice_brain_hermes.core.identity import reduce_identity
 from alice_brain_hermes.core.personality import (
+    advance_personality_clock,
     energy_from_event,
     reduce_personality,
     upsert_energy,
@@ -173,7 +174,11 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
     )
     identity = reduce_identity(state.identity, event)
     values["identity"] = identity
-    values["personality"] = reduce_personality(state.personality, event)
+    values["personality"] = reduce_personality(
+        state.personality,
+        event,
+        logical_clock=state.logical_clock,
+    )
 
     actions, grounded_receipt = reduce_actions(
         state.action_records,
@@ -212,6 +217,9 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
         if not math.isfinite(logical_clock):
             raise DomainInvariantError("clock.tick logical clock overflow")
         values["logical_clock"] = logical_clock
+        values["personality"] = advance_personality_clock(
+            state.personality, logical_clock
+        )
         values["runtime"] = RuntimeState(
             **{
                 **state.runtime.model_dump(mode="python"),

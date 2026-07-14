@@ -135,6 +135,13 @@ class BrainState(BaseModel):
             raise ValueError("identity self_actor_id must equal brain_id")
         if self.identity.name != self.name:
             raise ValueError("foundation and identity names must match")
+        for layer in ("traits", "adaptations", "narrative_ideal"):
+            bucket = getattr(self.personality.rate_state, layer)
+            if bucket.logical_clock != self.logical_clock:
+                raise ValueError(
+                    "personality rate state logical clock must match brain "
+                    "logical clock"
+                )
         action_ids = [item.action_id for item in self.action_records]
         if len(action_ids) != len(set(action_ids)):
             raise ValueError("action records must have unique action IDs")

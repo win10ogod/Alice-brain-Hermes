@@ -187,6 +187,90 @@ def test_pc_has_three_layers_and_enforces_bounded_revision_rates() -> None:
         )
 
 
+def test_pc_same_clock_revisions_share_one_cumulative_layer_budget() -> None:
+    state = BrainState.genesis(BRAIN)
+    initial = state.personality.rate_state.traits
+    assert initial.capacity == pytest.approx(0.05)
+    assert initial.refill_rate == pytest.approx(0.05)
+    assert initial.available == pytest.approx(initial.capacity)
+
+    state = reduce_state(
+        state,
+        event(
+            "personality.revised",
+            {"layer": "traits", "values": {"care": 0.03, "honesty": 0.02}},
+        ),
+    )
+
+    assert state.personality.rate_state.traits.available == pytest.approx(0.0)
+    before = state
+    with pytest.raises(DomainInvariantError, match=r"cumulative.*budget"):
+        reduce_state(
+            state,
+            event(
+                "personality.revised",
+                {"layer": "traits", "values": {"care": -0.02}},
+            ),
+        )
+    assert state is before
+    assert state.personality.traits == {"care": 0.03, "honesty": 0.02}
+    with pytest.raises(DomainInvariantError, match=r"cumulative.*budget"):
+        reduce_state(
+            state,
+            event(
+                "personality.revised",
+                {"layer": "traits", "values": {"care": 0.0300000000001}},
+            ),
+        )
+
+
+def test_pc_budget_refills_by_elapsed_logical_clock_and_rejects_bad_rate_state(
+) -> None:
+    state = reduce_state(
+        BrainState.genesis(BRAIN),
+        event(
+            "personality.revised",
+            {"layer": "traits", "values": {"care": 0.05}},
+        ),
+    )
+    state = reduce_state(
+        state,
+        event("clock.tick", {"elapsed_seconds": 0.5}),
+    )
+
+    bucket = state.personality.rate_state.traits
+    assert bucket.logical_clock == pytest.approx(0.5)
+    assert bucket.available == pytest.approx(0.025)
+    state = reduce_state(
+        state,
+        event(
+            "personality.revised",
+            {"layer": "traits", "values": {"care": 0.075}},
+        ),
+    )
+    assert state.personality.rate_state.traits.available == pytest.approx(0.0)
+
+    raw = state.model_dump(mode="python")
+    raw["personality"]["rate_state"]["traits"]["logical_clock"] = 1.5
+    with pytest.raises(ValidationError, match="logical clock"):
+        BrainState.model_validate(raw)
+
+    raw = state.model_dump(mode="python")
+    raw["personality"]["rate_state"]["traits"]["refill_rate"] = float("inf")
+    with pytest.raises(ValidationError):
+        BrainState.model_validate(raw)
+
+    raw = state.model_dump(mode="python")
+    raw["personality"]["rate_state"]["traits"]["refill_rate"] += 5e-13
+    with pytest.raises(ValidationError, match="runtime policy"):
+        BrainState.model_validate(raw)
+
+    raw = state.model_dump(mode="python")
+    raw["personality"]["rate_state"]["traits"]["logical_clock"] += 5e-13
+    with pytest.raises(ValidationError, match="logical clock"):
+        BrainState.model_validate(raw)
+
+
 def test_energy_is_action_indexed_bounded_and_cannot_dispatch() -> None:
     proposed, assessed, *_ = action_events()
     state = reduce_many(BrainState.genesis(BRAIN), [proposed, assessed])

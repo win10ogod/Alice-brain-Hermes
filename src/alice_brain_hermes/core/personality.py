@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from decimal import Decimal
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict
 from alice_brain_hermes.errors import DomainInvariantError
 
 PersonalityLayer = Literal["traits", "adaptations", "narrative_ideal"]
-_MAX_DELTAS: dict[str, float] = {
-    "traits": 0.05,
-    "adaptations": 0.20,
-    "narrative_ideal": 0.10,
+_RATE_POLICIES: dict[str, tuple[float, float]] = {
+    # (capacity, tokens refilled per logical second)
+    "traits": (0.05, 0.05),
+    "adaptations": (0.20, 0.20),
+    "narrative_ideal": (0.10, 0.10),
 }
 
 
@@ -36,6 +38,118 @@ def _validate_numeric_map(
     return values
 
 
+class LayerRateState(BaseModel):
+    """Persisted logical-time token bucket for one personality layer."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(
+        allow_inf_nan=False,
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        validate_default=True,
+    )
+
+    logical_clock: float = Field(default=0.0, ge=0.0)
+    available: float = Field(ge=0.0)
+    capacity: float = Field(gt=0.0)
+    refill_rate: float = Field(gt=0.0)
+
+    @model_validator(mode="after")
+    def _available_does_not_exceed_capacity(self) -> LayerRateState:
+        if self.available > self.capacity:
+            raise ValueError("personality rate availability exceeds capacity")
+        return self
+
+    def advanced_to(self, logical_clock: float) -> LayerRateState:
+        """Refill deterministically up to a finite non-decreasing clock."""
+        if (
+            isinstance(logical_clock, bool)
+            or not isinstance(logical_clock, (int, float))
+            or not math.isfinite(float(logical_clock))
+        ):
+            raise DomainInvariantError("personality rate logical clock must be finite")
+        target = float(logical_clock)
+        if target < self.logical_clock:
+            raise DomainInvariantError(
+                "personality rate logical clock cannot move backwards"
+            )
+        elapsed = Decimal(str(target)) - Decimal(str(self.logical_clock))
+        available = min(
+            Decimal(str(self.capacity)),
+            Decimal(str(self.available))
+            + elapsed * Decimal(str(self.refill_rate)),
+        )
+        return self.model_copy(
+            update={
+                "logical_clock": target,
+                "available": float(available),
+            }
+        ).revalidated()
+
+    def consumed(self, amount: Decimal) -> LayerRateState:
+        """Consume a finite cumulative-change amount from this bucket."""
+        if not amount.is_finite() or amount < 0:
+            raise DomainInvariantError("personality rate cost must be finite")
+        available = Decimal(str(self.available))
+        if amount > available:
+            raise DomainInvariantError(
+                "personality revision exceeds bounded rate cumulative layer budget"
+            )
+        return self.model_copy(
+            update={"available": float(available - amount)}
+        ).revalidated()
+
+    def revalidated(self) -> LayerRateState:
+        return LayerRateState.model_validate(self.model_dump(mode="python"))
+
+
+def _new_layer_rate_state(layer: PersonalityLayer) -> LayerRateState:
+    capacity, refill_rate = _RATE_POLICIES[layer]
+    return LayerRateState(
+        available=capacity,
+        capacity=capacity,
+        refill_rate=refill_rate,
+    )
+
+
+class PersonalityRateState(BaseModel):
+    """Typed persisted buckets for all three independent PC layers."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(
+        extra="forbid", frozen=True, strict=True, validate_default=True
+    )
+
+    traits: LayerRateState = Field(
+        default_factory=lambda: _new_layer_rate_state("traits")
+    )
+    adaptations: LayerRateState = Field(
+        default_factory=lambda: _new_layer_rate_state("adaptations")
+    )
+    narrative_ideal: LayerRateState = Field(
+        default_factory=lambda: _new_layer_rate_state("narrative_ideal")
+    )
+
+    @model_validator(mode="after")
+    def _policies_are_fixed(self) -> PersonalityRateState:
+        for layer, (capacity, refill_rate) in _RATE_POLICIES.items():
+            bucket = getattr(self, layer)
+            if (
+                bucket.capacity != capacity
+                or bucket.refill_rate != refill_rate
+            ):
+                raise ValueError(
+                    f"{layer} personality rate policy does not match runtime policy"
+                )
+        return self
+
+    def advanced_to(self, logical_clock: float) -> PersonalityRateState:
+        return PersonalityRateState(
+            traits=self.traits.advanced_to(logical_clock),
+            adaptations=self.adaptations.advanced_to(logical_clock),
+            narrative_ideal=self.narrative_ideal.advanced_to(logical_clock),
+        )
+
+
 class PersonalityControl(BaseModel):
     """PC: slow traits, contextual adaptations, and narrative/ideal self."""
 
@@ -46,6 +160,7 @@ class PersonalityControl(BaseModel):
     traits: FrozenJsonDict = Field(default_factory=FrozenJsonDict)
     adaptations: FrozenJsonDict = Field(default_factory=FrozenJsonDict)
     narrative_ideal: FrozenJsonDict = Field(default_factory=FrozenJsonDict)
+    rate_state: PersonalityRateState = Field(default_factory=PersonalityRateState)
 
     @field_validator("traits", "adaptations", "narrative_ideal")
     @classmethod
@@ -114,31 +229,61 @@ def _numeric_values(payload: Any) -> Mapping[str, Any]:
     return payload
 
 
+def advance_personality_clock(
+    personality: PersonalityControl, logical_clock: float
+) -> PersonalityControl:
+    """Advance and persist every layer's token bucket on a clock event."""
+    try:
+        return personality.model_copy(
+            update={"rate_state": personality.rate_state.advanced_to(logical_clock)}
+        ).revalidated()
+    except DomainInvariantError:
+        raise
+    except Exception as error:
+        raise DomainInvariantError("invalid personality rate state") from error
+
+
 def reduce_personality(
-    personality: PersonalityControl, event: EventEnvelope
+    personality: PersonalityControl,
+    event: EventEnvelope,
+    *,
+    logical_clock: float,
 ) -> PersonalityControl:
     if event.event_type != "personality.revised":
         return personality
     layer = event.payload.get("layer")
-    if layer not in _MAX_DELTAS:
+    if layer not in _RATE_POLICIES:
         raise DomainInvariantError("unknown personality layer")
     updates = _numeric_values(event.payload.get("values"))
     current = getattr(personality, layer)
     merged = dict(current.items())
-    maximum = _MAX_DELTAS[layer]
+    try:
+        bucket = getattr(personality.rate_state, layer).advanced_to(logical_clock)
+    except DomainInvariantError:
+        raise
+    except Exception as error:
+        raise DomainInvariantError("invalid personality rate state") from error
+    cumulative_change = Decimal(0)
     for key, raw_value in updates.items():
         if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
             raise DomainInvariantError("personality values must be numeric")
         value = float(raw_value)
-        before = float(current.get(key, 0.0))
-        if not math.isfinite(value) or abs(value - before) > maximum + 1e-12:
-            raise DomainInvariantError(
-                f"{layer} revision exceeds its bounded rate {maximum}"
-            )
+        before = Decimal(str(current.get(key, 0.0)))
+        if not math.isfinite(value):
+            raise DomainInvariantError("personality values must be finite")
+        cumulative_change += abs(Decimal(str(raw_value)) - before)
         merged[key] = value
     try:
-        revised = personality.model_copy(update={layer: FrozenJsonDict(merged)})
+        revised_bucket = bucket.consumed(cumulative_change)
+        revised_rates = personality.rate_state.model_copy(
+            update={layer: revised_bucket}
+        )
+        revised = personality.model_copy(
+            update={layer: FrozenJsonDict(merged), "rate_state": revised_rates}
+        )
         return revised.revalidated()
+    except DomainInvariantError:
+        raise
     except Exception as error:
         raise DomainInvariantError("invalid personality revision") from error
 
@@ -170,8 +315,11 @@ def upsert_energy(
 
 __all__ = [
     "EnergyVector",
+    "LayerRateState",
     "PersonalityControl",
     "PersonalityLayer",
+    "PersonalityRateState",
+    "advance_personality_clock",
     "energy_from_event",
     "reduce_personality",
     "upsert_energy",
