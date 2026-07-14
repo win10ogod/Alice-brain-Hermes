@@ -37,7 +37,7 @@ def _freeze_json(value: Any, *, location: str = "payload") -> Any:
                 raise TypeError(f"{location} keys must be strings")
             frozen[key] = _freeze_json(item, location=f"{location}.{key}")
         return FrozenJsonDict(frozen)
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return tuple(
             _freeze_json(item, location=f"{location}[{index}]")
             for index, item in enumerate(value)
