@@ -175,6 +175,47 @@ def test_project_audit_allows_scoped_hermes_dynamic_imports(tmp_path: Path) -> N
     audit_project(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "import importlib\n"
+            'target = "alice_brain"\n'
+            "importlib.import_module(target)\n"
+            'target = "alice_brain_hermes"\n'
+        ),
+        (
+            "from importlib import import_module as load\n"
+            'target = "alice_brain"\n'
+            "load(target)\n"
+            "load = print\n"
+            'target = "alice_brain_hermes"\n'
+        ),
+    ],
+)
+def test_project_audit_preserves_earlier_dynamic_import_bindings(
+    tmp_path: Path, source: str
+) -> None:
+    _write_source(tmp_path, source)
+
+    with pytest.raises(AuditViolation, match="forbidden import root"):
+        audit_project(tmp_path)
+
+
+def test_project_audit_does_not_apply_later_binding_to_earlier_call(
+    tmp_path: Path,
+) -> None:
+    _write_source(
+        tmp_path,
+        "import importlib\n"
+        'target = "alice_brain_hermes"\n'
+        "importlib.import_module(target)\n"
+        'target = "alice_brain"\n',
+    )
+
+    audit_project(tmp_path)
+
+
 @pytest.mark.parametrize("suffix", [".toml", ".yaml", ".ini"])
 def test_project_audit_rejects_exact_root_executable_config_values(
     tmp_path: Path, suffix: str
@@ -223,6 +264,45 @@ def test_project_audit_allows_hermes_wrapped_config_command_array(
 ) -> None:
     (tmp_path / "runtime.toml").write_text(
         '[runtime]\ncommand = ["uv", "run", "alice-brain-hermes", "daemon"]\n',
+        encoding="utf-8",
+    )
+
+    audit_project(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        (
+            "runtime.yaml",
+            "runtime:\n  command: [uv, run, alice-brain, daemon]\n",
+        ),
+        (
+            "runtime.yml",
+            "runtime:\n  command:\n    - uv\n    - run\n    - alice_brain\n"
+            "    - daemon\n",
+        ),
+    ],
+)
+def test_project_audit_rejects_wrapped_yaml_command_sequences(
+    tmp_path: Path, filename: str, content: str
+) -> None:
+    (tmp_path / filename).write_text(content, encoding="utf-8")
+
+    with pytest.raises(AuditViolation, match="daemon service"):
+        audit_project(tmp_path)
+
+
+def test_project_audit_allows_hermes_wrapped_yaml_command_sequence(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "runtime.yaml").write_text(
+        "runtime:\n"
+        "  command:\n"
+        "    - uv\n"
+        "    - run\n"
+        "    - alice-brain-hermes\n"
+        "    - daemon\n",
         encoding="utf-8",
     )
 
@@ -416,6 +496,25 @@ def test_project_audit_allows_hermes_source_package_path(tmp_path: Path) -> None
     audit_project(tmp_path)
 
 
+def test_project_audit_rejects_exact_forbidden_source_module_filename(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "src" / "alice_brain.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+
+    with pytest.raises(AuditViolation, match="forbidden module filename"):
+        audit_project(tmp_path)
+
+
+def test_project_audit_allows_hermes_source_module_filename(tmp_path: Path) -> None:
+    source = tmp_path / "src" / "alice_brain_hermes.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+
+    audit_project(tmp_path)
+
+
 @pytest.mark.parametrize("root_name", ["tests", "docs", "dist"])
 def test_project_audit_ignores_root_only_nonshipping_directories(
     tmp_path: Path, root_name: str
@@ -478,6 +577,27 @@ def test_wheel_audit_allows_hermes_package_member_path(tmp_path: Path) -> None:
     _write_wheel(
         wheel,
         source_member="alice_brain_hermes/__init__.py",
+        source="VALUE = 1\n",
+    )
+
+    audit_wheel(wheel)
+
+
+def test_wheel_audit_rejects_exact_forbidden_module_member_filename(
+    tmp_path: Path,
+) -> None:
+    wheel = tmp_path / "fixture-0.1.0-py3-none-any.whl"
+    _write_wheel(wheel, source_member="alice_brain.py", source="VALUE = 1\n")
+
+    with pytest.raises(AuditViolation, match="forbidden module filename"):
+        audit_wheel(wheel)
+
+
+def test_wheel_audit_allows_hermes_module_member_filename(tmp_path: Path) -> None:
+    wheel = tmp_path / "fixture-0.1.0-py3-none-any.whl"
+    _write_wheel(
+        wheel,
+        source_member="alice_brain_hermes.py",
         source="VALUE = 1\n",
     )
 

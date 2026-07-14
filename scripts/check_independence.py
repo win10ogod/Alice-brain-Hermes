@@ -16,6 +16,8 @@ from email.policy import compat32
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
+import yaml
+
 FORBIDDEN_IMPORT_ROOT = "_".join(("alice", "brain"))
 FORBIDDEN_DISTRIBUTION = "-".join(("alice", "brain"))
 FORBIDDEN_HOME = "_".join(("ALICE", "BRAIN", "HOME"))
@@ -278,22 +280,27 @@ def _scope_body(scope: ast.AST) -> Sequence[ast.stmt]:
 def _scope_states(tree: ast.AST) -> dict[int, _StaticState]:
     states: dict[int, _StaticState] = {}
 
+    def attach(node: ast.AST, state: _StaticState) -> None:
+        states[id(node)] = state.clone()
+        if isinstance(node, _SCOPES):
+            build(node, state)
+            return
+        for child in ast.iter_child_nodes(node):
+            attach(child, state)
+
     def build(scope: ast.AST, inherited: _StaticState) -> None:
         state = inherited.clone()
         for name in _parameter_names(scope):
             state.discard(name)
+
+        states[id(scope)] = state.clone()
+        body = set(map(id, _scope_body(scope)))
+        for child in ast.iter_child_nodes(scope):
+            if id(child) not in body:
+                attach(child, state)
         for statement in _scope_body(scope):
+            attach(statement, state)
             _bind_statement(statement, state)
-
-        def attach(node: ast.AST) -> None:
-            states[id(node)] = state
-            for child in ast.iter_child_nodes(node):
-                if child is not scope and isinstance(child, _SCOPES):
-                    build(child, state)
-                else:
-                    attach(child)
-
-        attach(scope)
 
     build(tree, _StaticState())
     return states
@@ -390,14 +397,31 @@ def _python_violations(source: str, location: str) -> list[str]:
 
 
 def _nested_command_sequences(value: object) -> Iterable[Sequence[str]]:
-    if isinstance(value, dict):
-        for child in value.values():
-            yield from _nested_command_sequences(child)
-    elif isinstance(value, list):
-        if len(value) >= 2 and all(isinstance(item, str) for item in value):
-            yield value
-        for child in value:
-            yield from _nested_command_sequences(child)
+    seen: set[int] = set()
+    remaining = 10_000
+
+    def walk(current: object, depth: int) -> Iterable[Sequence[str]]:
+        nonlocal remaining
+        if depth > 64 or remaining <= 0 or not isinstance(current, (dict, list)):
+            return
+
+        marker = id(current)
+        if marker in seen:
+            return
+        seen.add(marker)
+        remaining -= 1
+
+        if isinstance(current, dict):
+            for child in current.values():
+                yield from walk(child, depth + 1)
+            return
+
+        if len(current) >= 2 and all(isinstance(item, str) for item in current):
+            yield current
+        for child in current:
+            yield from walk(child, depth + 1)
+
+    yield from walk(value, 0)
 
 
 def _parsed_config_sequences(text: str, location: str) -> Iterable[Sequence[str]]:
@@ -409,7 +433,9 @@ def _parsed_config_sequences(text: str, location: str) -> Iterable[Sequence[str]
             parsed = tomllib.loads(text)
         elif suffix == ".json":
             parsed = json.loads(text)
-    except (tomllib.TOMLDecodeError, json.JSONDecodeError):
+        elif suffix in {".yaml", ".yml"}:
+            parsed = yaml.safe_load(text)
+    except (tomllib.TOMLDecodeError, json.JSONDecodeError, yaml.YAMLError):
         parsed = None
 
     if parsed is not None:
@@ -469,27 +495,35 @@ def _is_ignored_project_path(relative: Path) -> bool:
 def _project_package_path_violations(root: Path) -> list[str]:
     violations: list[str] = []
     for path in root.rglob("*"):
-        if not path.is_dir():
-            continue
         relative = path.relative_to(root)
         if _is_ignored_project_path(relative):
             continue
-        if any(part.casefold() == FORBIDDEN_IMPORT_ROOT for part in relative.parts):
+        if path.is_dir() and any(
+            part.casefold() == FORBIDDEN_IMPORT_ROOT for part in relative.parts
+        ):
             violations.append(
                 f"{relative}: forbidden package path component "
                 f"{FORBIDDEN_IMPORT_ROOT!r}"
+            )
+        elif path.is_file() and path.name.casefold() == f"{FORBIDDEN_IMPORT_ROOT}.py":
+            violations.append(
+                f"{relative}: forbidden module filename "
+                f"{FORBIDDEN_IMPORT_ROOT + '.py'!r}"
             )
     return violations
 
 
 def _wheel_package_path_violation(path: Path, member: str) -> str | None:
-    if any(
-        part.casefold() == FORBIDDEN_IMPORT_ROOT
-        for part in Path(member).parts
-    ):
+    member_path = Path(member)
+    if any(part.casefold() == FORBIDDEN_IMPORT_ROOT for part in member_path.parts):
         return (
             f"{path}!{member}: forbidden package path component "
             f"{FORBIDDEN_IMPORT_ROOT!r}"
+        )
+    if member_path.name.casefold() == f"{FORBIDDEN_IMPORT_ROOT}.py":
+        return (
+            f"{path}!{member}: forbidden module filename "
+            f"{FORBIDDEN_IMPORT_ROOT + '.py'!r}"
         )
     return None
 
