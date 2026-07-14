@@ -14,28 +14,35 @@ from email.policy import compat32
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
-FORBIDDEN_IMPORT_ROOT = "alice" + "_brain"
-FORBIDDEN_DISTRIBUTION = "alice" + "-brain"
-FORBIDDEN_HOME = "ALICE" + "_BRAIN_HOME"
+FORBIDDEN_IMPORT_ROOT = "_".join(("alice", "brain"))
+FORBIDDEN_DISTRIBUTION = "-".join(("alice", "brain"))
+FORBIDDEN_HOME = "_".join(("ALICE", "BRAIN", "HOME"))
+TARGET_DISTRIBUTION = "alice-brain-hermes"
 
 _DISTRIBUTION_NAME = re.compile(r"^\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)")
 _PATH_COMPONENT = re.compile(
-    r'''(?<=[\\/])alice-brain(?=$|[\\/"'\s,\]\)}])''',
+    r'''[\\/](?:[._]?alice[-_]brain)(?=$|[\\/"'\s,\]\)}])''',
     flags=re.IGNORECASE,
 )
 _HOME_TOKEN = re.compile(rf"(?<![A-Z0-9_]){re.escape(FORBIDDEN_HOME)}(?![A-Z0-9_])")
+_EXECUTABLE_IMPORT_ROOT = re.compile(
+    rf"(?<![A-Za-z0-9_]){re.escape(FORBIDDEN_IMPORT_ROOT)}(?![A-Za-z0-9_])"
+)
 _DAEMON_SERVICE = re.compile(
     r"(?<![A-Za-z0-9_-])alice-brain(?:\.sock|://|[-_]daemon|\s+daemon|/daemon)",
     flags=re.IGNORECASE,
 )
 _SCANNED_CONFIG_SUFFIXES = {".cfg", ".ini", ".json", ".toml", ".yaml", ".yml"}
-_IGNORED_DIRECTORIES = {
+_IGNORED_DIRECTORIES_ANYWHERE = {
     ".git",
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
-    ".superpowers",
     ".venv",
+    "__pycache__",
+}
+_IGNORED_ROOT_DIRECTORIES = {
+    ".superpowers",
     "dist",
     "docs",
     "tests",
@@ -67,23 +74,105 @@ def _dependency_violations(requirements: Iterable[str], location: str) -> list[s
     return violations
 
 
-def _import_violations(tree: ast.AST, location: str) -> list[str]:
+def _static_string(node: ast.AST, bindings: dict[str, str]) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return bindings.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _static_string(node.left, bindings)
+        right = _static_string(node.right, bindings)
+        if left is not None and right is not None:
+            return left + right
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.FormattedValue):
+                part = _static_string(value.value, bindings)
+            else:
+                part = _static_string(value, bindings)
+            if part is None:
+                return None
+            parts.append(part)
+        return "".join(parts)
+    return None
+
+
+def _static_bindings(tree: ast.AST) -> dict[str, str]:
+    bindings: dict[str, str] = {}
+    body = getattr(tree, "body", ())
+    for statement in body:
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target = statement.targets[0]
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            target = statement.target
+            value = statement.value
+        if isinstance(target, ast.Name) and value is not None:
+            resolved = _static_string(value, bindings)
+            if resolved is None:
+                bindings.pop(target.id, None)
+            else:
+                bindings[target.id] = resolved
+    return bindings
+
+
+def _import_aliases(
+    tree: ast.AST,
+) -> tuple[set[str], set[str], set[str]]:
+    importlib_modules: set[str] = set()
+    builtins_modules: set[str] = set()
+    import_functions = {"__import__"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound_name = alias.asname or alias.name.split(".", 1)[0]
+                if alias.name == "importlib":
+                    importlib_modules.add(bound_name)
+                elif alias.name == "builtins":
+                    builtins_modules.add(bound_name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            for alias in node.names:
+                if alias.name == "import_module":
+                    import_functions.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "builtins":
+            for alias in node.names:
+                if alias.name == "__import__":
+                    import_functions.add(alias.asname or alias.name)
+    return importlib_modules, builtins_modules, import_functions
+
+
+def _import_violations(
+    tree: ast.AST, location: str, bindings: dict[str, str]
+) -> list[str]:
     violations: list[str] = []
+    importlib_modules, builtins_modules, import_functions = _import_aliases(tree)
     for node in ast.walk(tree):
         names: list[str] = []
         if isinstance(node, ast.Import):
             names.extend(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names.append(node.module)
-        elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "__import__"
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-        ):
-            names.append(node.args[0].value)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                names.append(node.module)
+            elif node.level:
+                names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Call) and node.args:
+            is_import_call = False
+            if isinstance(node.func, ast.Name):
+                is_import_call = node.func.id in import_functions
+            elif isinstance(node.func, ast.Attribute) and isinstance(
+                node.func.value, ast.Name
+            ):
+                owner = node.func.value.id
+                is_import_call = (
+                    node.func.attr == "import_module" and owner in importlib_modules
+                ) or (node.func.attr == "__import__" and owner in builtins_modules)
+            if is_import_call:
+                resolved = _static_string(node.args[0], bindings)
+                if resolved is not None:
+                    names.append(resolved)
 
         for name in names:
             if name.split(".", 1)[0] == FORBIDDEN_IMPORT_ROOT:
@@ -95,10 +184,14 @@ def _import_violations(tree: ast.AST, location: str) -> list[str]:
     return violations
 
 
-def _literal_values(tree: ast.AST) -> Iterable[tuple[int | str, str]]:
+def _literal_values(
+    tree: ast.AST, bindings: dict[str, str]
+) -> Iterable[tuple[int | str, str]]:
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            yield getattr(node, "lineno", "?"), node.value
+        if isinstance(node, (ast.Constant, ast.BinOp, ast.JoinedStr, ast.Name)):
+            value = _static_string(node, bindings)
+            if value is not None:
+                yield getattr(node, "lineno", "?"), value
 
 
 def _external_reference_violations(
@@ -116,23 +209,28 @@ def _external_reference_violations(
     return violations
 
 
-def _command_sequence_violations(tree: ast.AST, location: str) -> list[str]:
+def _command_sequence_violations(
+    tree: ast.AST, location: str, bindings: dict[str, str]
+) -> list[str]:
     violations: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.List, ast.Tuple)):
             continue
-        items = [
-            item.value
-            for item in node.elts
-            if isinstance(item, ast.Constant) and isinstance(item.value, str)
-        ]
+        items = [_static_string(item, bindings) for item in node.elts]
         if len(items) < 2:
             continue
-        if items[0].lower() == FORBIDDEN_DISTRIBUTION and any(
-            item.lower() == "daemon" for item in items[1:]
-        ):
-            line = getattr(node, "lineno", "?")
-            violations.append(f"{location}:{line}: forbidden external daemon service")
+        normalized = [
+            item.strip().lower() if item is not None else None for item in items
+        ]
+        for index, item in enumerate(normalized):
+            if item not in {FORBIDDEN_DISTRIBUTION, FORBIDDEN_IMPORT_ROOT}:
+                continue
+            if any(later == "daemon" for later in normalized[index + 1 :]):
+                line = getattr(node, "lineno", "?")
+                violations.append(
+                    f"{location}:{line}: forbidden external daemon service"
+                )
+                break
     return violations
 
 
@@ -144,24 +242,35 @@ def _python_violations(source: str, location: str) -> list[str]:
             f"{location}: cannot audit invalid Python: {error}"
         ) from error
 
-    violations = _import_violations(tree, location)
-    violations.extend(_external_reference_violations(_literal_values(tree), location))
-    violations.extend(_command_sequence_violations(tree, location))
+    bindings = _static_bindings(tree)
+    violations = _import_violations(tree, location, bindings)
+    violations.extend(
+        _external_reference_violations(_literal_values(tree, bindings), location)
+    )
+    violations.extend(_command_sequence_violations(tree, location, bindings))
     return violations
 
 
 def _config_violations(text: str, location: str) -> list[str]:
-    values = (
-        (line_number, line) for line_number, line in enumerate(text.splitlines(), 1)
-    )
-    return _external_reference_violations(values, location)
+    values = list(enumerate(text.splitlines(), 1))
+    violations = _external_reference_violations(values, location)
+    for line_number, line in values:
+        if _EXECUTABLE_IMPORT_ROOT.search(line):
+            violations.append(
+                f"{location}:{line_number}: forbidden executable import root "
+                f"{FORBIDDEN_IMPORT_ROOT!r}"
+            )
+    return violations
 
 
 def _project_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*"):
         relative_directories = path.relative_to(root).parts[:-1]
-        if not path.is_file() or any(
-            part in _IGNORED_DIRECTORIES for part in relative_directories
+        root_directory = relative_directories[0] if relative_directories else None
+        if not path.is_file():
+            continue
+        if root_directory in _IGNORED_ROOT_DIRECTORIES or any(
+            part in _IGNORED_DIRECTORIES_ANYWHERE for part in relative_directories
         ):
             continue
         if path.suffix == ".py" or path.suffix in _SCANNED_CONFIG_SUFFIXES:
@@ -216,7 +325,12 @@ def audit_project(root: Path) -> None:
     _raise_violations(violations)
 
 
-def audit_wheel(path: Path) -> None:
+def audit_wheel(
+    path: Path,
+    *,
+    expected_name: str = TARGET_DISTRIBUTION,
+    expected_version: str | None = None,
+) -> None:
     """Audit dependency metadata and packaged source in a wheel."""
     violations: list[str] = []
     try:
@@ -235,6 +349,22 @@ def audit_wheel(path: Path) -> None:
                 message = BytesParser(policy=compat32).parsebytes(
                     archive.read(metadata_names[0])
                 )
+                actual_name = message.get("Name")
+                if (
+                    actual_name is None
+                    or _canonicalize_distribution(actual_name)
+                    != _canonicalize_distribution(expected_name)
+                ):
+                    violations.append(
+                        f"{path}!{metadata_names[0]}: expected distribution Name "
+                        f"{expected_name!r}, found {actual_name!r}"
+                    )
+                actual_version = message.get("Version")
+                if expected_version is not None and actual_version != expected_version:
+                    violations.append(
+                        f"{path}!{metadata_names[0]}: expected Version "
+                        f"{expected_version!r}, found {actual_version!r}"
+                    )
                 violations.extend(
                     _dependency_violations(
                         message.get_all("Requires-Dist", []),
@@ -246,7 +376,10 @@ def audit_wheel(path: Path) -> None:
                 if name.endswith(".py"):
                     source = archive.read(name).decode("utf-8")
                     violations.extend(_python_violations(source, f"{path}!{name}"))
-                elif Path(name).suffix in _SCANNED_CONFIG_SUFFIXES:
+                elif (
+                    Path(name).suffix in _SCANNED_CONFIG_SUFFIXES
+                    or name.endswith(".dist-info/entry_points.txt")
+                ):
                     text = archive.read(name).decode("utf-8")
                     violations.extend(_config_violations(text, f"{path}!{name}"))
     except (BadZipFile, OSError, UnicodeDecodeError) as error:
@@ -269,15 +402,38 @@ def _parser() -> argparse.ArgumentParser:
         default=Path.cwd(),
         help="project root to audit (default: current directory)",
     )
+    parser.add_argument(
+        "--project-only",
+        action="store_true",
+        help="audit only project source; release mode otherwise requires wheel files",
+    )
     return parser
+
+
+def _project_version(pyproject: Path) -> str | None:
+    if not pyproject.exists():
+        return None
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    version = data.get("project", {}).get("version")
+    return version if isinstance(version, str) else None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         audit_project(args.root)
-        for wheel in args.wheels:
-            audit_wheel(wheel)
+        if args.project_only:
+            if args.wheels:
+                raise AuditViolation("--project-only does not accept wheel files")
+        else:
+            if not args.wheels:
+                raise AuditViolation(
+                    "release wheel audit requires at least one wheel; "
+                    "use --project-only for a source-only audit"
+                )
+            expected_version = _project_version(args.root / "pyproject.toml")
+            for wheel in args.wheels:
+                audit_wheel(wheel, expected_version=expected_version)
     except AuditViolation as error:
         print(error, file=sys.stderr)
         return 1
