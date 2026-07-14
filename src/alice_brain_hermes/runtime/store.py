@@ -16,6 +16,7 @@ from alice_brain_hermes.core.reducer import reduce_state
 from alice_brain_hermes.core.state import STATE_SCHEMA_VERSION, BrainState
 from alice_brain_hermes.errors import (
     EventConflictError,
+    ExpectedSequenceError,
     LedgerClosedError,
     LedgerIntegrityError,
     SchemaVersionError,
@@ -196,6 +197,49 @@ class SQLiteLedger:
 
     def append(self, event: EventEnvelope) -> EventEnvelope:
         """Idempotently append one event and allocate its per-brain sequence."""
+        stored, _inserted = self._append(event, expected_sequence=None)
+        return stored
+
+    @staticmethod
+    def _validate_expected_sequence(expected_sequence: int) -> int:
+        if isinstance(expected_sequence, bool) or not isinstance(
+            expected_sequence, int
+        ):
+            raise TypeError("expected_sequence must be an integer")
+        if expected_sequence < 1:
+            raise ValueError("expected_sequence must be positive")
+        return expected_sequence
+
+    def get_event(self, event_id: str) -> EventEnvelope | None:
+        """Return one integrity-checked event by its globally unique ID."""
+        event_id = validate_id(event_id)
+        with self._lock:
+            self._ensure_open()
+            row = self._connection.execute(
+                "SELECT event_id, brain_id, sequence, body_fingerprint, "
+                "envelope_fingerprint, envelope_json "
+                "FROM events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            return None if row is None else self._decode_event(row)
+
+    def append_expected(
+        self, event: EventEnvelope, *, expected_sequence: int
+    ) -> tuple[EventEnvelope, bool]:
+        """Append only at an exact sequence, returning ``(event, inserted)``.
+
+        The comparison and insert share one ``BEGIN IMMEDIATE`` transaction.
+        An exact retry remains idempotent even after the ledger has advanced.
+        """
+        expected = self._validate_expected_sequence(expected_sequence)
+        return self._append(event, expected_sequence=expected)
+
+    def _append(
+        self,
+        event: EventEnvelope,
+        *,
+        expected_sequence: int | None,
+    ) -> tuple[EventEnvelope, bool]:
         event = self._normalize_event(event)
         body_fingerprint = event.body_fingerprint()
         with self._transaction(immediate=True):
@@ -211,18 +255,22 @@ class SQLiteLedger:
                 )
             existing = matches[0] if matches else None
             if existing is not None:
-                if existing["body_fingerprint"] != body_fingerprint:
+                stored = self._decode_event(existing)
+                if (
+                    existing["body_fingerprint"] != body_fingerprint
+                    or stored.canonical_json(exclude_sequence=True)
+                    != event.canonical_json(exclude_sequence=True)
+                ):
                     raise EventConflictError(
                         f"event ID {event.event_id} already has a different body"
                     )
-                stored = self._decode_event(existing)
                 if event.sequence is not None and event.sequence != stored.sequence:
                     raise EventConflictError(
                         f"event ID {event.event_id} retry sequence "
                         f"{event.sequence} does not match stored sequence "
                         f"{stored.sequence}"
                     )
-                return stored
+                return stored, False
 
             if event.sequence is not None:
                 raise ValueError(
@@ -239,6 +287,11 @@ class SQLiteLedger:
                     (event.brain_id,),
                 ).fetchone()[0]
             )
+            if expected_sequence is not None and sequence != expected_sequence:
+                raise ExpectedSequenceError(
+                    f"expected sequence {expected_sequence} for brain "
+                    f"{event.brain_id}, but next sequence is {sequence}"
+                )
             self._connection.execute(
                 "UPDATE brains SET next_sequence = ? WHERE brain_id = ?",
                 (sequence + 1, event.brain_id),
@@ -260,7 +313,7 @@ class SQLiteLedger:
                     stored.canonical_json(),
                 ),
             )
-            return stored
+            return stored, True
 
     @staticmethod
     def _validate_page(after_sequence: int, limit: int) -> None:
@@ -359,6 +412,13 @@ class SQLiteLedger:
                 "WHERE brain_id = ? ORDER BY sequence DESC LIMIT 1",
                 (state.brain_id,),
             ).fetchone()
+            if latest is not None and latest["schema_version"] not in {
+                1,
+                STATE_SCHEMA_VERSION,
+            }:
+                raise SchemaVersionError(
+                    f"unsupported snapshot schema {latest['schema_version']}"
+                )
             if latest is not None and state.last_sequence < latest["sequence"]:
                 raise SnapshotConflictError(
                     f"snapshot sequence {state.last_sequence} is older than "
@@ -375,11 +435,31 @@ class SQLiteLedger:
             state_json = state.canonical_json()
             fingerprint = self._snapshot_fingerprint(state_json)
             if latest is not None and state.last_sequence == latest["sequence"]:
-                if latest["fingerprint"] != fingerprint:
+                if latest["schema_version"] == STATE_SCHEMA_VERSION and latest[
+                    "fingerprint"
+                ] != fingerprint:
                     raise SnapshotConflictError(
                         "snapshot sequence already has a different state"
                     )
-                return self._decode_snapshot(latest, state.brain_id)
+                if latest["schema_version"] == STATE_SCHEMA_VERSION:
+                    return self._decode_snapshot(latest, state.brain_id)
+                if latest["schema_version"] != 1:
+                    raise SchemaVersionError(
+                        "unsupported snapshot schema "
+                        f"{latest['schema_version']}"
+                    )
+                self._connection.execute(
+                    "UPDATE snapshots SET schema_version = ?, fingerprint = ?, "
+                    "state_json = ? WHERE brain_id = ? AND sequence = ?",
+                    (
+                        STATE_SCHEMA_VERSION,
+                        fingerprint,
+                        state_json,
+                        state.brain_id,
+                        state.last_sequence,
+                    ),
+                )
+                return state
 
             self._connection.execute(
                 "INSERT INTO snapshots("
@@ -418,7 +498,9 @@ class SQLiteLedger:
             "FROM snapshots WHERE brain_id = ? ORDER BY sequence DESC LIMIT 1",
             (brain_id,),
         ).fetchone()
-        return None if row is None else self._decode_snapshot(row, brain_id)
+        if row is None or row["schema_version"] == 1:
+            return None
+        return self._decode_snapshot(row, brain_id)
 
     def load_snapshot(self, brain_id: str) -> BrainState | None:
         """Load the latest compatible snapshot for a brain."""

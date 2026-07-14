@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from enum import StrEnum
 from typing import Any, ClassVar
 
@@ -87,7 +88,7 @@ def _proposition(
             source_event_id=event.event_id,
             source_actor_id=event.actor_id,
             action_id=action_id,
-            confidence=float(item.get("confidence", 1.0)),
+            confidence=item.get("confidence", 1.0),
         )
     except Exception as error:
         raise DomainInvariantError("invalid world proposition") from error
@@ -107,7 +108,7 @@ def reduce_world(
     event: EventEnvelope,
     *,
     trusted_provenance: bool,
-    grounded_receipt: bool,
+    grounded_receipt: Collection[str],
 ) -> WorldModel:
     """Apply only event-type-fixed layer transitions."""
     layer = _EVENT_LAYERS.get(event.event_type)
@@ -127,6 +128,11 @@ def reduce_world(
         observed = world.observed
         action_id = event.payload.get("action_id")
         for item in observations:
+            proposition_id = (
+                item.get("proposition_id") if hasattr(item, "get") else None
+            )
+            if proposition_id not in grounded_receipt:
+                continue
             proposition = _proposition(
                 event,
                 item,

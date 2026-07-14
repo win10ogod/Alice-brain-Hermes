@@ -38,6 +38,21 @@ class AppendProbeLedger:
         self.events.append(stored)
         return stored
 
+    def get_event(self, event_id: str) -> EventEnvelope | None:
+        return next((item for item in self.events if item.event_id == event_id), None)
+
+    def append_expected(
+        self, event: EventEnvelope, *, expected_sequence: int
+    ) -> tuple[EventEnvelope, bool]:
+        existing = self.get_event(event.event_id)
+        if existing is not None:
+            if existing.body_fingerprint() != event.body_fingerprint():
+                raise EventConflictError("event ID already has a different body")
+            return existing, False
+        if expected_sequence != len(self.events) + 1:
+            raise EventConflictError("expected sequence does not match")
+        return self.append(event), True
+
 
 class FakeClock:
     def __init__(self, *values: float) -> None:
@@ -134,34 +149,85 @@ def test_engine_rejects_presequenced_client_event_without_writing() -> None:
     assert engine.state.last_sequence == 0
 
 
-def test_engine_surfaces_sequence_divergence_and_fails_closed_until_restart(
+def test_engine_rejects_stale_conflicting_action_atomically_until_restart(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "brain.db"
     with SQLiteLedger.open(database) as engine_ledger:
         engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
+        concurrent = new_event(
+            "action.proposed",
+            BRAIN,
+            ACTOR,
+            {"action_id": "a1", "intent": {"writer": "concurrent"}},
+            action_id="a1",
+        )
         with SQLiteLedger.open(database) as concurrent_ledger:
-            concurrent_ledger.append(
-                new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0})
-            )
+            concurrent_ledger.append(concurrent)
 
         with pytest.raises(EventConflictError, match="sequence divergence"):
             engine.append(
-                new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 2.0})
+                new_event(
+                    "action.proposed",
+                    BRAIN,
+                    ACTOR,
+                    {"action_id": "a1", "intent": {"writer": "stale"}},
+                    action_id="a1",
+                )
             )
         assert engine.state.last_sequence == 0
-        assert len(engine_ledger.list_events(BRAIN)) == 2
+        assert engine.is_stale is True
+        assert [item.event_id for item in engine_ledger.list_events(BRAIN)] == [
+            concurrent.event_id
+        ]
 
         with pytest.raises(EventConflictError, match="restart"):
             engine.append(
                 new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 4.0})
             )
-        assert len(engine_ledger.list_events(BRAIN)) == 2
+        assert len(engine_ledger.list_events(BRAIN)) == 1
 
     with SQLiteLedger.open(database) as ledger:
         restarted = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
-        assert restarted.state.last_sequence == 2
-        assert restarted.state.logical_clock == pytest.approx(3.0)
+        assert restarted.state.last_sequence == 1
+        assert restarted.state.actions["a1"].intent == {"writer": "concurrent"}
+
+
+def test_engine_exact_retries_return_original_without_reduction_or_state_change(
+    tmp_path: Path,
+) -> None:
+    with SQLiteLedger.open(tmp_path / "brain.db") as ledger:
+        engine = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
+        tick = new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0})
+        stored_tick = engine.append(tick)
+        after_tick = engine.state
+
+        assert engine.append(tick) == stored_tick
+        assert engine.state is after_tick
+
+        proposal = new_event(
+            "action.proposed",
+            BRAIN,
+            ACTOR,
+            {"action_id": "retry-action", "intent": {"operation": "inspect"}},
+            action_id="retry-action",
+        )
+        stored_proposal = engine.append(proposal)
+        after_proposal = engine.state
+
+        assert engine.append(proposal) == stored_proposal
+        assert engine.state is after_proposal
+        later = engine.append(
+            new_event(
+                "action.prepared",
+                BRAIN,
+                ACTOR,
+                {"action_id": "retry-action", "branch_id": "b1"},
+                action_id="retry-action",
+            )
+        )
+        assert later.sequence == 3
+        assert engine.is_stale is False
 
 
 def test_pc_rate_budget_replays_identically_after_restart(tmp_path: Path) -> None:
@@ -211,6 +277,18 @@ def test_off_turn_pulse_records_clock_workspace_and_local_cognition(
         assert engine.state.logical_clock == 2.5
         assert engine.state.cognition.reflections
         assert engine.state.cognition.cognition_mode == "local"
+        reflection = engine.state.cognition.reflections[-1]
+        assert reflection.uncertainty_basis == "deterministic_heuristic"
+        assert reflection.calibrated is False
+        cognition_event = next(
+            item
+            for item in ledger.list_events(BRAIN, limit=50)
+            if item.event_type == "cognition.reflected"
+        )
+        assert cognition_event.payload["uncertainty_basis"] == (
+            "deterministic_heuristic"
+        )
+        assert cognition_event.payload["calibrated"] is False
 
 
 def test_scheduler_uses_real_elapsed_and_never_synthesizes_catchup_ticks(
@@ -237,6 +315,184 @@ def test_scheduler_uses_real_elapsed_and_never_synthesizes_catchup_ticks(
         assert len(ticks) == 2
         assert [item.payload["elapsed_seconds"] for item in ticks] == [7.75, 22.25]
         assert engine.state.logical_clock == 30.0
+
+
+def test_invalid_clock_samples_do_not_terminate_or_corrupt_valid_baseline(
+    tmp_path: Path,
+) -> None:
+    class ScriptedClock:
+        def __init__(self, *values: object) -> None:
+            self.values = iter(values)
+
+        def __call__(self) -> object:
+            value = next(self.values)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+    clock = ScriptedClock(
+        100.0,
+        90.0,
+        float("nan"),
+        float("inf"),
+        "not-a-number",
+        RuntimeError("clock unavailable"),
+        101.0,
+    )
+    with SQLiteLedger.open(tmp_path / "brain.db") as ledger:
+        engine = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
+        scheduler = ContinuousScheduler(
+            engine,
+            interval_seconds=1.0,
+            monotonic=clock,  # type: ignore[arg-type]
+            sleeper=lambda _: None,
+        )
+
+        assert [scheduler.step() for _ in range(5)] == [False] * 5
+        assert scheduler.step() is True
+
+        ticks = [
+            item
+            for item in ledger.list_events(BRAIN, limit=100)
+            if item.event_type == "clock.tick"
+        ]
+        assert [item.payload["elapsed_seconds"] for item in ticks] == [1.0]
+        assert engine.state.logical_clock == pytest.approx(1.0)
+        assert engine.state.runtime.failure_count == 5
+        assert engine.state.runtime.health == "healthy"
+
+
+def test_invalid_energy_types_and_ranges_leave_ledger_clean(tmp_path: Path) -> None:
+    base_payload: dict[str, object] = {
+        "action_id": "energy-action",
+        "deficits": {"need": 0.2},
+        "salience": 0.5,
+        "urgency": 0.5,
+        "valence": 0.0,
+        "arousal": 0.0,
+        "control": 0.5,
+        "resources": 0.5,
+        "cost": 0.2,
+        "personality_relevance": 0.4,
+    }
+    invalid_values: tuple[object, ...] = (
+        True,
+        "0.5",
+        float("nan"),
+        float("inf"),
+        -0.01,
+        1.01,
+    )
+    with SQLiteLedger.open(tmp_path / "brain.db") as ledger:
+        engine = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
+        engine.append(
+            new_event(
+                "action.proposed",
+                BRAIN,
+                ACTOR,
+                {"action_id": "energy-action", "intent": {}},
+                action_id="energy-action",
+            )
+        )
+        baseline = engine.state
+        count = len(ledger.list_events(BRAIN))
+
+        for invalid in invalid_values:
+            candidate = new_event(
+                "action.energy_assessed",
+                BRAIN,
+                ACTOR,
+                base_payload,
+                action_id="energy-action",
+            ).model_copy(
+                update={"payload": {**base_payload, "urgency": invalid}}
+            )
+            with pytest.raises((DomainInvariantError, ValueError)):
+                engine.append(candidate)
+            assert engine.state is baseline
+            assert len(ledger.list_events(BRAIN)) == count
+
+
+def test_ambiguous_or_mismatched_receipt_evidence_is_not_persisted(
+    tmp_path: Path,
+) -> None:
+    with SQLiteLedger.open(tmp_path / "brain.db") as ledger:
+        engine = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
+        action_id = "receipt-action"
+        for event_type, payload in (
+            ("action.proposed", {"action_id": action_id, "intent": {}}),
+            ("action.prepared", {"action_id": action_id, "branch_id": "b1"}),
+            ("action.dispatched", {"action_id": action_id}),
+        ):
+            engine.append(
+                new_event(
+                    event_type,
+                    BRAIN,
+                    ACTOR,
+                    payload,
+                    action_id=action_id,
+                )
+            )
+        baseline = engine.state
+        count = len(ledger.list_events(BRAIN))
+        invalid_payloads = (
+            {
+                "effect_evidence": {
+                    "kind": "linked_observation",
+                    "observation_ids": ["o1", "o1"],
+                },
+                "observations": [
+                    {"proposition_id": "o1", "content": {"ok": True}}
+                ],
+            },
+            {
+                "effect_evidence": {
+                    "kind": "linked_observation",
+                    "observation_ids": ["o1"],
+                },
+                "observations": [
+                    {"proposition_id": "o1", "content": {"version": 1}},
+                    {"proposition_id": "o1", "content": {"version": 2}},
+                ],
+            },
+            {
+                "effect_evidence": {
+                    "kind": "linked_observation",
+                    "observation_ids": ["missing"],
+                },
+                "observations": [
+                    {"proposition_id": "o1", "content": {"ok": True}}
+                ],
+            },
+            {
+                "effect_evidence": {
+                    "kind": "linked_observation",
+                    "observation_ids": ["o1"],
+                },
+                "observations": [
+                    {
+                        "proposition_id": "o1",
+                        "content": {"ok": True},
+                        "confidence": "0.9",
+                    }
+                ],
+            },
+        )
+
+        for extra in invalid_payloads:
+            receipt = new_event(
+                "action.receipt",
+                BRAIN,
+                ACTOR,
+                {"action_id": action_id, "status": "success", **extra},
+                action_id=action_id,
+            )
+            with pytest.raises(
+                DomainInvariantError, match=r"evidence|observation|proposition"
+            ):
+                engine.append(receipt)
+            assert engine.state is baseline
+            assert len(ledger.list_events(BRAIN)) == count
 
 
 def test_scheduler_records_sanitized_failure_and_continues_future_ticks(

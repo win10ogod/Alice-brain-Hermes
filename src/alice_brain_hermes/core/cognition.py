@@ -48,6 +48,10 @@ class CognitionResult(BaseModel):
     input_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     alternatives: tuple[CognitionAlternative, ...]
     uncertainty: float = Field(ge=0.0, le=1.0)
+    uncertainty_basis: Literal["deterministic_heuristic"] = (
+        "deterministic_heuristic"
+    )
+    calibrated: Literal[False] = False
     reflection: FrozenJsonDict
 
     @field_validator("source_ids", "alternatives", mode="before")
@@ -157,6 +161,10 @@ def cognition_result_from_payload(payload: Mapping[str, Any]) -> CognitionResult
         input_fingerprint=payload["input_fingerprint"],
         alternatives=alternatives,
         uncertainty=float(payload["uncertainty"]),
+        uncertainty_basis=payload.get(
+            "uncertainty_basis", "deterministic_heuristic"
+        ),
+        calibrated=payload.get("calibrated", False),
         reflection=payload["reflection"],
     )
 

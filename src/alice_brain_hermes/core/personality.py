@@ -293,14 +293,14 @@ def energy_from_event(event: EventEnvelope) -> EnergyVector:
         return EnergyVector(
             action_id=event.payload["action_id"],
             deficits=event.payload.get("deficits", {}),
-            salience=float(event.payload["salience"]),
-            urgency=float(event.payload["urgency"]),
-            valence=float(event.payload["valence"]),
-            arousal=float(event.payload["arousal"]),
-            control=float(event.payload["control"]),
-            resources=float(event.payload["resources"]),
-            cost=float(event.payload["cost"]),
-            personality_relevance=float(event.payload["personality_relevance"]),
+            salience=event.payload["salience"],
+            urgency=event.payload["urgency"],
+            valence=event.payload["valence"],
+            arousal=event.payload["arousal"],
+            control=event.payload["control"],
+            resources=event.payload["resources"],
+            cost=event.payload["cost"],
+            personality_relevance=event.payload["personality_relevance"],
         )
     except Exception as error:
         raise DomainInvariantError("invalid action energy vector") from error

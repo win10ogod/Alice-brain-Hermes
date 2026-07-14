@@ -27,6 +27,10 @@ class EventConflictError(LedgerError):
     """Raised when an event ID is reused with a different immutable body."""
 
 
+class ExpectedSequenceError(EventConflictError):
+    """Raised when a new event loses its exact expected-sequence race."""
+
+
 class SnapshotConflictError(LedgerError):
     """Raised when a snapshot is stale, future-dated, or not replay-equivalent."""
 
@@ -39,6 +43,7 @@ __all__ = [
     "AliceBrainHermesError",
     "DomainInvariantError",
     "EventConflictError",
+    "ExpectedSequenceError",
     "LedgerClosedError",
     "LedgerError",
     "LedgerIntegrityError",

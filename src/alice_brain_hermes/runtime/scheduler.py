@@ -65,14 +65,17 @@ class ContinuousScheduler:
 
     def step(self) -> bool:
         """Attempt exactly one tick and retain enough state for a later recovery."""
-        now = float(self._monotonic())
-        elapsed = now - self._last_wake
-        self._last_wake = now
         try:
+            sample = self._monotonic()
+            if isinstance(sample, bool) or not isinstance(sample, (int, float)):
+                raise RuntimeError("monotonic clock returned a non-numeric sample")
+            now = float(sample)
+            elapsed = now - self._last_wake
             if not math.isfinite(now) or not math.isfinite(elapsed) or elapsed < 0:
                 raise RuntimeError(
                     "monotonic clock moved backwards or became non-finite"
                 )
+            self._last_wake = now
             was_degraded = self.health.status == "degraded"
             self.engine.pulse(elapsed)
             if was_degraded:

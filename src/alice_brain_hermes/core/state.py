@@ -18,7 +18,7 @@ from alice_brain_hermes.core.workspace import MemoryRecord, WorkspaceState
 from alice_brain_hermes.core.world import WorldModel
 from alice_brain_hermes.ids import validate_id
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 
 
 class RuntimeFailure(BaseModel):

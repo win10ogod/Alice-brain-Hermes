@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
-from alice_brain_hermes.core.events import new_event
+from alice_brain_hermes.core.events import EventEnvelope, new_event
 from alice_brain_hermes.core.reducer import reduce_many
-from alice_brain_hermes.core.state import BrainState
+from alice_brain_hermes.core.state import STATE_SCHEMA_VERSION, BrainState
 from alice_brain_hermes.errors import (
     EventConflictError,
     LedgerClosedError,
@@ -45,6 +47,49 @@ def test_same_event_is_idempotent_but_conflicting_body_is_rejected(
 
         after_conflict = ledger.append(make_event())
         assert after_conflict.sequence == 2
+
+
+def test_expected_sequence_append_is_atomic_and_preserves_exact_retries(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "hermes.db"
+    with SQLiteLedger.open(database) as first, SQLiteLedger.open(database) as second:
+        original = make_event("clock.tick", {"elapsed_seconds": 1.0})
+        stored, inserted = first.append_expected(original, expected_sequence=1)
+
+        assert inserted is True
+        assert stored.sequence == 1
+        assert first.append_expected(original, expected_sequence=1) == (stored, False)
+
+        intervening = second.append(make_event("opaque.event", {"writer": 2}))
+        assert intervening.sequence == 2
+        stale = make_event("clock.tick", {"elapsed_seconds": 2.0})
+        with pytest.raises(EventConflictError, match="expected sequence"):
+            first.append_expected(stale, expected_sequence=2)
+
+        assert [item.event_id for item in first.list_events(BRAIN)] == [
+            original.event_id,
+            intervening.event_id,
+        ]
+
+
+def test_exact_retry_compares_canonical_body_even_if_fingerprints_collide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        EventEnvelope,
+        "body_fingerprint",
+        lambda _event: "0" * 64,
+    )
+    with SQLiteLedger.open(tmp_path / "hermes.db") as ledger:
+        original = make_event("clock.tick", {"elapsed_seconds": 1.0})
+        ledger.append(original)
+        conflicting = original.model_copy(
+            update={"payload": {"elapsed_seconds": 2.0}}
+        ).revalidated()
+
+        with pytest.raises(EventConflictError, match="different body"):
+            ledger.append(conflicting)
 
 
 def test_sql_failure_rolls_back_sequence_allocation(tmp_path: Path) -> None:
@@ -306,6 +351,67 @@ def test_snapshot_roundtrip_and_snapshot_plus_tail_equals_full_replay(
         assert ledger.replay(BRAIN).logical_clock == 3.75
 
 
+def test_legacy_v1_rate_free_snapshot_is_a_cache_and_can_be_replaced(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "hermes.db"
+    with SQLiteLedger.open(database) as ledger:
+        ledger.append(
+            make_event(
+                "personality.revised",
+                {"layer": "traits", "values": {"care": 0.05}},
+            )
+        )
+        ledger.append(make_event("clock.tick", {"elapsed_seconds": 0.5}))
+        ledger.append(
+            make_event(
+                "personality.revised",
+                {"layer": "traits", "values": {"care": 0.075}},
+            )
+        )
+        full = ledger.replay(BRAIN, use_snapshot=False)
+        assert full.personality.rate_state.traits.available == pytest.approx(0.0)
+
+        legacy = full.model_dump(mode="json")
+        legacy["schema_version"] = 1
+        del legacy["personality"]["rate_state"]
+        legacy_json = json.dumps(
+            legacy,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        ledger._connection.execute(
+            "INSERT INTO snapshots("
+            "brain_id, sequence, schema_version, fingerprint, state_json"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (
+                BRAIN,
+                full.last_sequence,
+                1,
+                hashlib.sha256(legacy_json.encode("utf-8")).hexdigest(),
+                legacy_json,
+            ),
+        )
+
+        assert STATE_SCHEMA_VERSION == 2
+        assert ledger.load_snapshot(BRAIN) is None
+        replayed = ledger.replay(BRAIN)
+        assert replayed == full
+        assert replayed.personality.rate_state.traits.available == pytest.approx(0.0)
+
+        ledger.save_snapshot(replayed)
+        row = ledger._connection.execute(
+            "SELECT schema_version, state_json FROM snapshots "
+            "WHERE brain_id = ? AND sequence = ?",
+            (BRAIN, full.last_sequence),
+        ).fetchone()
+        assert row["schema_version"] == STATE_SCHEMA_VERSION
+        assert '"rate_state"' in row["state_json"]
+        assert ledger.load_snapshot(BRAIN) == full
+
+
 @pytest.mark.parametrize(
     ("stored_value", "substituted_value"),
     [
@@ -379,6 +485,12 @@ def test_snapshot_schema_mismatch_is_visible(tmp_path: Path) -> None:
         pytest.raises(SchemaVersionError, match="999"),
     ):
         ledger.save_snapshot(state)
+
+    with SQLiteLedger.open(database) as ledger:
+        ledger.append(make_event("opaque.event", {"tail": True}))
+        later = ledger.replay(BRAIN, use_snapshot=False)
+        with pytest.raises(SchemaVersionError, match="999"):
+            ledger.save_snapshot(later)
 
 
 def test_replay_is_deterministic_and_unknown_events_are_raw_accounted(

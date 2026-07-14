@@ -7,7 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from alice_brain_hermes.core.action import ActionPhase, RDPhase
-from alice_brain_hermes.core.cognition import LocalCognitionPort
+from alice_brain_hermes.core.cognition import LocalCognitionPort, result_payload
 from alice_brain_hermes.core.events import new_event
 from alice_brain_hermes.core.personality import EnergyVector
 from alice_brain_hermes.core.reducer import reduce_many, reduce_state
@@ -351,7 +351,7 @@ def test_simulation_and_forged_trust_cannot_change_observed() -> None:
     assert state.world.observed == ()
     assert {item.proposition_id for item in state.world.simulated} == {"s1"}
     assert state.actions["a1"].execution_confirmed is True
-    assert state.actions["a1"].effect_confirmed is False
+    assert state.actions["a1"].effect_confirmed is None
 
 
 def test_authorized_receipt_with_linked_evidence_can_ground_observed() -> None:
@@ -384,8 +384,44 @@ def test_status_success_without_effect_evidence_only_confirms_execution() -> Non
     state = reduce_state(state, receipt)
 
     assert state.actions["a1"].execution_confirmed is True
-    assert state.actions["a1"].effect_confirmed is False
+    assert state.actions["a1"].effect_confirmed is None
     assert state.world.observed == ()
+
+
+def test_receipt_promotes_only_exact_linked_observation_ids() -> None:
+    state = reduce_many(
+        BrainState.genesis(BRAIN),
+        [authorized_tool_event(), *action_events()[:4]],
+    )
+    receipt = event(
+        "action.receipt",
+        {
+            "action_id": "a1",
+            "status": "success",
+            "effect_evidence": {
+                "kind": "linked_observation",
+                "observation_ids": ["o-linked"],
+            },
+            "observations": [
+                {
+                    "proposition_id": "o-linked",
+                    "content": {"door": "open"},
+                },
+                {
+                    "proposition_id": "o-bystander",
+                    "content": {"forged": "not linked"},
+                },
+            ],
+        },
+        actor_id=TOOL_ACTOR,
+        adapter_id="hermes-tool",
+        action_id="a1",
+    )
+
+    state = reduce_state(state, receipt)
+
+    assert state.actions["a1"].effect_confirmed is True
+    assert {item.proposition_id for item in state.world.observed} == {"o-linked"}
 
 
 @pytest.mark.parametrize(
@@ -453,6 +489,8 @@ def test_local_cognition_is_deterministic_honest_and_side_effect_free() -> None:
     assert first == second
     assert first.cognition_mode == "local"
     assert first.provider_used is False
+    assert first.uncertainty_basis == "deterministic_heuristic"
+    assert first.calibrated is False
     assert [item.stance for item in first.alternatives] == [
         "proceed",
         "defer",
@@ -461,6 +499,21 @@ def test_local_cognition_is_deterministic_honest_and_side_effect_free() -> None:
     assert all(item.expected_consequences for item in first.alternatives)
     assert 0.0 <= first.uncertainty <= 1.0
     assert BrainState.genesis(BRAIN).actions == {}
+
+
+def test_legacy_local_cognition_event_gets_explicit_uncertainty_labels() -> None:
+    payload = result_payload(LocalCognitionPort().reflect({"legacy": True}))
+    payload.pop("uncertainty_basis", None)
+    payload.pop("calibrated", None)
+
+    state = reduce_state(
+        BrainState.genesis(BRAIN),
+        event("cognition.reflected", payload),
+    )
+
+    restored = state.cognition.reflections[-1]
+    assert restored.uncertainty_basis == "deterministic_heuristic"
+    assert restored.calibrated is False
 
 
 def candidate(

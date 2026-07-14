@@ -144,26 +144,59 @@ def _transition(
         raise DomainInvariantError("invalid action transition") from error
 
 
-def _receipt_grounded(event: EventEnvelope, *, trusted: bool) -> bool:
-    if not trusted:
-        return False
+def _receipt_grounded_ids(
+    event: EventEnvelope, *, trusted: bool
+) -> frozenset[str]:
     evidence = event.payload.get("effect_evidence")
-    observations = event.payload.get("observations")
-    if not isinstance(evidence, Mapping) or not isinstance(observations, (list, tuple)):
-        return False
+    if evidence is None:
+        return frozenset()
+    if not isinstance(evidence, Mapping):
+        raise DomainInvariantError("receipt effect evidence must be an object")
     if evidence.get("kind") != "linked_observation":
-        return False
+        raise DomainInvariantError("receipt effect evidence kind is unsupported")
     evidence_ids = evidence.get("observation_ids")
     if not isinstance(evidence_ids, (list, tuple)) or not evidence_ids:
-        return False
-    linked_ids = {
-        item.get("proposition_id")
-        for item in observations
-        if isinstance(item, Mapping)
-        and isinstance(item.get("proposition_id"), str)
-        and isinstance(item.get("content"), Mapping)
-    }
-    return all(isinstance(item, str) and item in linked_ids for item in evidence_ids)
+        raise DomainInvariantError(
+            "receipt effect evidence requires observation IDs"
+        )
+    if any(not isinstance(item, str) or not item.strip() for item in evidence_ids):
+        raise DomainInvariantError(
+            "receipt effect evidence observation IDs must be non-blank strings"
+        )
+    if len(evidence_ids) != len(set(evidence_ids)):
+        raise DomainInvariantError(
+            "receipt effect evidence observation IDs must be unique"
+        )
+
+    observations = event.payload.get("observations")
+    if not isinstance(observations, (list, tuple)):
+        raise DomainInvariantError("receipt observations must be an array")
+    observations_by_id: dict[str, Mapping[str, Any]] = {}
+    for item in observations:
+        if not isinstance(item, Mapping):
+            raise DomainInvariantError("receipt observation must be an object")
+        proposition_id = item.get("proposition_id")
+        if not isinstance(proposition_id, str) or not proposition_id.strip():
+            raise DomainInvariantError(
+                "receipt observation requires a non-blank proposition ID"
+            )
+        if proposition_id in observations_by_id:
+            raise DomainInvariantError(
+                f"receipt observation ID {proposition_id!r} is ambiguous"
+            )
+        observations_by_id[proposition_id] = item
+
+    linked_ids = frozenset(evidence_ids)
+    if not linked_ids.issubset(observations_by_id):
+        raise DomainInvariantError(
+            "receipt effect evidence does not match supplied observations"
+        )
+    for proposition_id in linked_ids:
+        if not isinstance(observations_by_id[proposition_id].get("content"), Mapping):
+            raise DomainInvariantError(
+                "linked receipt observation content must be an object"
+            )
+    return linked_ids if trusted else frozenset()
 
 
 def reduce_actions(
@@ -171,8 +204,8 @@ def reduce_actions(
     event: EventEnvelope,
     *,
     trusted_provenance: bool,
-) -> tuple[tuple[ActionRecord, ...], bool]:
-    """Return new actions and whether this receipt carries grounded effects."""
+) -> tuple[tuple[ActionRecord, ...], frozenset[str]]:
+    """Return new actions and exact receipt observation IDs grounded as effects."""
     lifecycle_events = {
         "action.proposed",
         "action.prepared",
@@ -181,7 +214,7 @@ def reduce_actions(
         "action.reconstructed",
     }
     if event.event_type not in lifecycle_events:
-        return actions, False
+        return actions, frozenset()
 
     action_id = action_id_from_event(event)
     if event.event_type == "action.proposed":
@@ -200,10 +233,10 @@ def reduce_actions(
             )
         except Exception as error:
             raise DomainInvariantError("invalid action proposal") from error
-        return (*actions, action), False
+        return (*actions, action), frozenset()
 
     action = _find(actions, action_id)
-    grounded = False
+    grounded_ids: frozenset[str] = frozenset()
     if event.event_type == "action.prepared":
         branch_id = event.payload.get("branch_id")
         if branch_id is not None and (
@@ -235,7 +268,9 @@ def reduce_actions(
         execution = (
             True if status == "success" else False if status == "failure" else None
         )
-        grounded = _receipt_grounded(event, trusted=trusted_provenance)
+        grounded_ids = _receipt_grounded_ids(
+            event, trusted=trusted_provenance
+        )
         action = _transition(
             action,
             event,
@@ -244,7 +279,7 @@ def reduce_actions(
             rd_phase=RDPhase.PREPARE,
             updates={
                 "execution_confirmed": execution,
-                "effect_confirmed": grounded,
+                "effect_confirmed": True if grounded_ids else None,
                 "receipt": FrozenJsonDict(event.payload),
             },
         )
@@ -259,8 +294,8 @@ def reduce_actions(
             updates={"reconstruction": FrozenJsonDict(outcome)},
         )
     else:
-        return actions, False
-    return _replace(actions, action), grounded
+        return actions, frozenset()
+    return _replace(actions, action), grounded_ids
 
 
 __all__ = [
