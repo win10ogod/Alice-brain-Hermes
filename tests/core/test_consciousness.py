@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import localcontext
 from uuid import UUID
 
 import pytest
@@ -222,6 +223,54 @@ def test_pc_same_clock_revisions_share_one_cumulative_layer_budget() -> None:
                 {"layer": "traits", "values": {"care": 0.0300000000001}},
             ),
         )
+
+
+def test_pc_cumulative_change_is_independent_of_ambient_decimal_precision() -> None:
+    tiny_updates = {f"z-tiny-{index:04d}": 1e-30 for index in range(1_000)}
+    values = {"a-big": 0.05, **tiny_updates}
+    initial = BrainState.genesis(BRAIN)
+
+    with localcontext() as context:
+        context.prec = 6
+        with pytest.raises(DomainInvariantError, match=r"cumulative.*budget"):
+            reduce_state(
+                initial,
+                event(
+                    "personality.revised",
+                    {"layer": "traits", "values": values},
+                ),
+            )
+
+    assert initial.personality.traits == {}
+    assert initial.personality.rate_state.traits.available == pytest.approx(0.05)
+
+
+def test_pc_accepted_revision_is_order_and_ambient_precision_independent() -> None:
+    tiny_updates = {f"z-tiny-{index:04d}": 1e-30 for index in range(1_000)}
+    first_values = {"a-big": 0.049, **tiny_updates}
+    second_values = dict(reversed(tuple(first_values.items())))
+
+    with localcontext() as context:
+        context.prec = 6
+        first = reduce_state(
+            BrainState.genesis(BRAIN),
+            event(
+                "personality.revised",
+                {"layer": "traits", "values": first_values},
+            ),
+        )
+    with localcontext() as context:
+        context.prec = 50
+        second = reduce_state(
+            BrainState.genesis(BRAIN),
+            event(
+                "personality.revised",
+                {"layer": "traits", "values": second_values},
+            ),
+        )
+
+    assert first == second
+    assert first.personality.rate_state.traits.available == pytest.approx(0.001)
 
 
 def test_pc_budget_refills_by_elapsed_logical_clock_and_rejects_bad_rate_state(

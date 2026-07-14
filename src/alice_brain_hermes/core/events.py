@@ -79,9 +79,11 @@ class FrozenJsonDict(Mapping[str, Any]):
     def __init__(self, values: Mapping[str, Any] | None = None) -> None:
         source = {} if values is None else values
         data: dict[str, Any] = {}
-        for key, value in source.items():
-            if not isinstance(key, str):
-                raise TypeError("JSON object keys must be strings")
+        keys = tuple(source)
+        if any(not isinstance(key, str) for key in keys):
+            raise TypeError("JSON object keys must be strings")
+        for key in sorted(keys):
+            value = source[key]
             data[key] = _freeze_json(value, location=f"payload.{key}")
         self._data = MappingProxyType(data)
 

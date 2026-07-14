@@ -26,6 +26,10 @@ class EventLedger(Protocol):
 
     def get_event(self, event_id: str) -> EventEnvelope | None: ...
 
+    def get_event_and_head(
+        self, event_id: str, brain_id: str
+    ) -> tuple[EventEnvelope | None, int]: ...
+
     def replay(self, brain_id: str) -> BrainState: ...
 
 
@@ -92,7 +96,17 @@ class ConsciousEngine:
                 raise EventConflictError(
                     "engine sequence divergence requires a replayed restart"
                 )
-            existing = self.ledger.get_event(event.event_id)
+            existing, head = self.ledger.get_event_and_head(
+                event.event_id, self.brain_id
+            )
+            if head != self._state.last_sequence:
+                self._diverged = True
+                raise EventConflictError(
+                    "engine sequence divergence: authoritative ledger head "
+                    f"{head} does not match replayed state "
+                    f"{self._state.last_sequence}; restart from ledger replay "
+                    "is required"
+                )
             if existing is not None:
                 if (
                     existing.body_fingerprint() != event.body_fingerprint()

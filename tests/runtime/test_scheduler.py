@@ -7,6 +7,7 @@ import pytest
 
 from alice_brain_hermes.core.events import EventEnvelope, new_event
 from alice_brain_hermes.core.state import BrainState
+from alice_brain_hermes.core.workspace import derive_candidates
 from alice_brain_hermes.errors import DomainInvariantError, EventConflictError
 from alice_brain_hermes.ids import new_id
 from alice_brain_hermes.runtime.engine import ConsciousEngine
@@ -40,6 +41,13 @@ class AppendProbeLedger:
 
     def get_event(self, event_id: str) -> EventEnvelope | None:
         return next((item for item in self.events if item.event_id == event_id), None)
+
+    def get_event_and_head(
+        self, event_id: str, brain_id: str
+    ) -> tuple[EventEnvelope | None, int]:
+        return self.get_event(event_id), len(
+            [item for item in self.events if item.brain_id == brain_id]
+        )
 
     def append_expected(
         self, event: EventEnvelope, *, expected_sequence: int
@@ -193,6 +201,130 @@ def test_engine_rejects_stale_conflicting_action_atomically_until_restart(
         assert restarted.state.actions["a1"].intent == {"writer": "concurrent"}
 
 
+def test_engine_uses_one_authoritative_head_view_before_event_semantics(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "brain.db"
+    with SQLiteLedger.open(database) as engine_ledger:
+        engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
+        future = new_event(
+            "action.proposed",
+            BRAIN,
+            ACTOR,
+            {"action_id": "future", "intent": {"writer": "concurrent"}},
+            action_id="future",
+        )
+        with SQLiteLedger.open(database) as concurrent:
+            concurrent.append(future)
+
+        changed_body = future.model_copy(
+            update={
+                "payload": {
+                    "action_id": "future",
+                    "intent": {"writer": "stale-engine"},
+                }
+            }
+        ).revalidated()
+        with pytest.raises(EventConflictError, match="sequence divergence"):
+            engine.append(changed_body)
+
+        assert engine.is_stale is True
+        assert engine.state.last_sequence == 0
+
+    followup_database = tmp_path / "followup.db"
+    with SQLiteLedger.open(followup_database) as engine_ledger:
+        engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
+        with SQLiteLedger.open(followup_database) as concurrent:
+            concurrent.append(
+                new_event(
+                    "action.proposed",
+                    BRAIN,
+                    ACTOR,
+                    {"action_id": "precursor", "intent": {}},
+                    action_id="precursor",
+                )
+            )
+
+        with pytest.raises(EventConflictError, match="sequence divergence"):
+            engine.append(
+                new_event(
+                    "action.prepared",
+                    BRAIN,
+                    ACTOR,
+                    {"action_id": "precursor", "branch_id": "b1"},
+                    action_id="precursor",
+                )
+            )
+
+        assert engine.is_stale is True
+
+
+def test_engine_rejects_old_exact_retry_when_an_unseen_tail_exists(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "brain.db"
+    with SQLiteLedger.open(database) as engine_ledger:
+        engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
+        original = new_event(
+            "clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0}
+        )
+        stored = engine.append(original)
+        with SQLiteLedger.open(database) as concurrent:
+            concurrent.append(new_event("opaque.tail", BRAIN, ACTOR, {}))
+
+        with pytest.raises(EventConflictError, match="sequence divergence"):
+            engine.append(original)
+
+        assert stored.sequence == 1
+        assert engine.state.last_sequence == 1
+        assert engine.is_stale is True
+
+
+@pytest.mark.parametrize("with_tail", [False, True])
+def test_engine_get_miss_race_adopts_exact_next_event_only_without_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_tail: bool
+) -> None:
+    database = tmp_path / f"race-{with_tail}.db"
+    with SQLiteLedger.open(database) as engine_ledger:
+        engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
+        target = new_event(
+            "clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0}
+        )
+        original_read = engine_ledger.get_event_and_head
+        raced = False
+
+        def read_then_race(
+            event_id: str, brain_id: str
+        ) -> tuple[EventEnvelope | None, int]:
+            nonlocal raced
+            result = original_read(event_id, brain_id)
+            if not raced:
+                raced = True
+                with SQLiteLedger.open(database) as concurrent:
+                    concurrent.append(target)
+                    if with_tail:
+                        concurrent.append(
+                            new_event("opaque.tail", BRAIN, ACTOR, {})
+                        )
+            return result
+
+        monkeypatch.setattr(
+            engine_ledger, "get_event_and_head", read_then_race
+        )
+
+        if with_tail:
+            with pytest.raises(EventConflictError, match="sequence divergence"):
+                engine.append(target)
+            assert engine.state.last_sequence == 0
+            assert engine.is_stale is True
+        else:
+            stored = engine.append(target)
+            assert stored.sequence == 1
+            assert engine.state.last_sequence == 1
+            assert engine.state.logical_clock == pytest.approx(1.0)
+            assert engine.is_stale is False
+
+
 def test_engine_exact_retries_return_original_without_reduction_or_state_change(
     tmp_path: Path,
 ) -> None:
@@ -260,6 +392,69 @@ def test_pc_rate_budget_replays_identically_after_restart(tmp_path: Path) -> Non
         restarted = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
         assert restarted.state == expected
         assert restarted.state.personality.rate_state == expected.personality.rate_state
+
+
+def test_energy_activation_and_c0_drive_are_stable_across_canonical_replay(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "brain.db"
+    deficit_items = [
+        item
+        for index in range(50)
+        for item in ((f"a-{index:02d}", 0.1), (f"z-{index:02d}", 0.9))
+    ]
+    deficits = dict(deficit_items)
+    with SQLiteLedger.open(database) as ledger:
+        engine = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
+        engine.append(
+            new_event(
+                "action.proposed",
+                BRAIN,
+                ACTOR,
+                {"action_id": "stable-energy", "intent": {}},
+                action_id="stable-energy",
+            )
+        )
+        engine.append(
+            new_event(
+                "action.energy_assessed",
+                BRAIN,
+                ACTOR,
+                {
+                    "action_id": "stable-energy",
+                    "deficits": deficits,
+                    "salience": 0.0,
+                    "urgency": 0.0,
+                    "valence": 0.0,
+                    "arousal": 0.0,
+                    "control": 0.0,
+                    "resources": 0.0,
+                    "cost": 5.49999e-11,
+                    "personality_relevance": 0.0,
+                },
+                action_id="stable-energy",
+            )
+        )
+        live_activation = engine.state.energies["stable-energy"].activation
+        live_drive = next(
+            item
+            for item in derive_candidates(engine.state)
+            if item.specialist == "drives"
+        ).score
+
+    with SQLiteLedger.open(database) as ledger:
+        restarted = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
+        replayed_activation = restarted.state.energies[
+            "stable-energy"
+        ].activation
+        replayed_drive = next(
+            item
+            for item in derive_candidates(restarted.state)
+            if item.specialist == "drives"
+        ).score
+
+    assert live_activation == replayed_activation == 0.114999999995
+    assert live_drive == replayed_drive == 0.114999999995
 
 
 def test_off_turn_pulse_records_clock_workspace_and_local_cognition(

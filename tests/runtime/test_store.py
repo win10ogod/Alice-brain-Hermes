@@ -487,10 +487,46 @@ def test_snapshot_schema_mismatch_is_visible(tmp_path: Path) -> None:
         ledger.save_snapshot(state)
 
     with SQLiteLedger.open(database) as ledger:
-        ledger.append(make_event("opaque.event", {"tail": True}))
-        later = ledger.replay(BRAIN, use_snapshot=False)
+        tail = ledger.append(make_event("opaque.event", {"tail": True}))
+        later = reduce_many(BrainState.genesis(BRAIN), [stored, tail])
+        with pytest.raises(SchemaVersionError, match="999"):
+            ledger.replay(BRAIN, use_snapshot=False)
         with pytest.raises(SchemaVersionError, match="999"):
             ledger.save_snapshot(later)
+
+
+@pytest.mark.parametrize("newer_schema", [1, STATE_SCHEMA_VERSION])
+@pytest.mark.parametrize("future_schema", [999, "future"])
+def test_older_future_snapshot_schema_cannot_be_hidden_by_newer_cache(
+    tmp_path: Path, newer_schema: int, future_schema: object
+) -> None:
+    database = tmp_path / f"{future_schema}-hidden-by-{newer_schema}.db"
+    with SQLiteLedger.open(database) as ledger:
+        first = ledger.append(make_event("brain.created", {"name": None}))
+        second = ledger.append(make_event("opaque.event", {"tail": True}))
+        state = reduce_many(BrainState.genesis(BRAIN), [first, second])
+        ledger.save_snapshot(state)
+        if newer_schema == 1:
+            ledger._connection.execute(
+                "UPDATE snapshots SET schema_version = 1 "
+                "WHERE brain_id = ? AND sequence = ?",
+                (BRAIN, state.last_sequence),
+            )
+        ledger._connection.execute(
+            "INSERT INTO snapshots("
+            "brain_id, sequence, schema_version, fingerprint, state_json"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (BRAIN, 1, future_schema, "future", "{}"),
+        )
+
+        with pytest.raises(SchemaVersionError, match=str(future_schema)):
+            ledger.load_snapshot(BRAIN)
+        with pytest.raises(SchemaVersionError, match=str(future_schema)):
+            ledger.replay(BRAIN)
+        with pytest.raises(SchemaVersionError, match=str(future_schema)):
+            ledger.replay(BRAIN, use_snapshot=False)
+        with pytest.raises(SchemaVersionError, match=str(future_schema)):
+            ledger.save_snapshot(state)
 
 
 def test_replay_is_deterministic_and_unknown_events_are_raw_accounted(

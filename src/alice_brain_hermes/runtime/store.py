@@ -223,13 +223,36 @@ class SQLiteLedger:
             ).fetchone()
             return None if row is None else self._decode_event(row)
 
+    def get_event_and_head(
+        self, event_id: str, brain_id: str
+    ) -> tuple[EventEnvelope | None, int]:
+        """Read an event ID and one brain head at one SQLite snapshot."""
+        event_id = validate_id(event_id)
+        brain_id = validate_id(brain_id)
+        with self._lock:
+            self._ensure_open()
+            row = self._connection.execute(
+                "SELECT event.event_id, event.brain_id, event.sequence, "
+                "event.body_fingerprint, event.envelope_fingerprint, "
+                "event.envelope_json, "
+                "COALESCE((SELECT MAX(sequence) FROM events "
+                "WHERE brain_id = ?), 0) AS brain_head "
+                "FROM (SELECT 1) AS singleton "
+                "LEFT JOIN events AS event ON event.event_id = ?",
+                (brain_id, event_id),
+            ).fetchone()
+            if row is None:
+                raise LedgerIntegrityError("event/head read returned no row")
+            event = None if row["event_id"] is None else self._decode_event(row)
+            return event, int(row["brain_head"])
+
     def append_expected(
         self, event: EventEnvelope, *, expected_sequence: int
     ) -> tuple[EventEnvelope, bool]:
         """Append only at an exact sequence, returning ``(event, inserted)``.
 
         The comparison and insert share one ``BEGIN IMMEDIATE`` transaction.
-        An exact retry remains idempotent even after the ledger has advanced.
+        A raced exact next event is adopted only while it is still the head.
         """
         expected = self._validate_expected_sequence(expected_sequence)
         return self._append(event, expected_sequence=expected)
@@ -270,6 +293,23 @@ class SQLiteLedger:
                         f"{event.sequence} does not match stored sequence "
                         f"{stored.sequence}"
                     )
+                if expected_sequence is not None:
+                    head = int(
+                        self._connection.execute(
+                            "SELECT COALESCE(MAX(sequence), 0) FROM events "
+                            "WHERE brain_id = ?",
+                            (event.brain_id,),
+                        ).fetchone()[0]
+                    )
+                    if (
+                        stored.sequence != expected_sequence
+                        or head != expected_sequence
+                    ):
+                        raise ExpectedSequenceError(
+                            f"expected sequence {expected_sequence} for brain "
+                            f"{event.brain_id}, but exact event is at sequence "
+                            f"{stored.sequence} and current head is {head}"
+                        )
                 return stored, False
 
             if event.sequence is not None:
@@ -389,12 +429,31 @@ class SQLiteLedger:
                 state = reduce_state(state, self._decode_event(row))
         return state
 
+    def _validate_snapshot_schemas_in_transaction(self, brain_id: str) -> None:
+        rows = self._connection.execute(
+            "SELECT DISTINCT schema_version FROM snapshots "
+            "WHERE brain_id = ? ORDER BY schema_version",
+            (brain_id,),
+        ).fetchall()
+        supported = {1, STATE_SCHEMA_VERSION}
+        for row in rows:
+            schema_version = row["schema_version"]
+            if (
+                isinstance(schema_version, bool)
+                or not isinstance(schema_version, int)
+                or schema_version not in supported
+            ):
+                raise SchemaVersionError(
+                    f"unsupported snapshot schema {schema_version!r}"
+                )
+
     def save_snapshot(self, state: BrainState) -> BrainState:
         """Save only a monotonic snapshot exactly equivalent to full replay."""
         if not isinstance(state, BrainState):
             raise TypeError("save_snapshot accepts only BrainState instances")
         state = state.revalidated()
         with self._transaction(immediate=True):
+            self._validate_snapshot_schemas_in_transaction(state.brain_id)
             maximum_row = self._connection.execute(
                 "SELECT COALESCE(MAX(sequence), 0) AS maximum "
                 "FROM events WHERE brain_id = ?",
@@ -505,8 +564,8 @@ class SQLiteLedger:
     def load_snapshot(self, brain_id: str) -> BrainState | None:
         """Load the latest compatible snapshot for a brain."""
         brain_id = validate_id(brain_id)
-        with self._lock:
-            self._ensure_open()
+        with self._transaction(immediate=False):
+            self._validate_snapshot_schemas_in_transaction(brain_id)
             return self._load_snapshot_in_transaction(brain_id)
 
     def replay(self, brain_id: str, *, use_snapshot: bool = True) -> BrainState:
@@ -515,6 +574,7 @@ class SQLiteLedger:
         if not isinstance(use_snapshot, bool):
             raise TypeError("use_snapshot must be a boolean")
         with self._transaction(immediate=False):
+            self._validate_snapshot_schemas_in_transaction(brain_id)
             state = (
                 self._load_snapshot_in_transaction(brain_id) if use_snapshot else None
             )

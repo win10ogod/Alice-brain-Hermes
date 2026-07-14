@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
-from decimal import Decimal
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from decimal import MAX_EMAX, MIN_EMIN, ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -19,6 +20,26 @@ _RATE_POLICIES: dict[str, tuple[float, float]] = {
     "adaptations": (0.20, 0.20),
     "narrative_ideal": (0.10, 0.10),
 }
+_FINITE_FLOAT_DECIMAL_PRECISION = 768
+
+
+@contextmanager
+def _deterministic_decimal_context(*, term_count: int = 1) -> Iterator[None]:
+    """Isolate PC arithmetic from ambient Decimal context.
+
+    A finite binary64 converted through ``str`` can span decimal exponents
+    -324 through +308.  The base precision covers an exact subtraction across
+    that complete span; the term-count digits cover an exact finite sum.
+    """
+    with localcontext() as context:
+        context.prec = _FINITE_FLOAT_DECIMAL_PRECISION + len(
+            str(max(1, term_count))
+        )
+        context.Emax = MAX_EMAX
+        context.Emin = MIN_EMIN
+        context.rounding = ROUND_HALF_EVEN
+        context.clamp = 0
+        yield
 
 
 def _validate_numeric_map(
@@ -73,12 +94,13 @@ class LayerRateState(BaseModel):
             raise DomainInvariantError(
                 "personality rate logical clock cannot move backwards"
             )
-        elapsed = Decimal(str(target)) - Decimal(str(self.logical_clock))
-        available = min(
-            Decimal(str(self.capacity)),
-            Decimal(str(self.available))
-            + elapsed * Decimal(str(self.refill_rate)),
-        )
+        with _deterministic_decimal_context():
+            elapsed = Decimal(str(target)) - Decimal(str(self.logical_clock))
+            available = min(
+                Decimal(str(self.capacity)),
+                Decimal(str(self.available))
+                + elapsed * Decimal(str(self.refill_rate)),
+            )
         return self.model_copy(
             update={
                 "logical_clock": target,
@@ -90,14 +112,14 @@ class LayerRateState(BaseModel):
         """Consume a finite cumulative-change amount from this bucket."""
         if not amount.is_finite() or amount < 0:
             raise DomainInvariantError("personality rate cost must be finite")
-        available = Decimal(str(self.available))
-        if amount > available:
-            raise DomainInvariantError(
-                "personality revision exceeds bounded rate cumulative layer budget"
-            )
-        return self.model_copy(
-            update={"available": float(available - amount)}
-        ).revalidated()
+        with _deterministic_decimal_context():
+            available = Decimal(str(self.available))
+            if amount > available:
+                raise DomainInvariantError(
+                    "personality revision exceeds bounded rate cumulative layer budget"
+                )
+            remaining = available - amount
+        return self.model_copy(update={"available": float(remaining)}).revalidated()
 
     def revalidated(self) -> LayerRateState:
         return LayerRateState.model_validate(self.model_dump(mode="python"))
@@ -205,7 +227,8 @@ class EnergyVector(BaseModel):
     @property
     def activation(self) -> float:
         deficit = (
-            sum(float(value) for value in self.deficits.values()) / len(self.deficits)
+            math.fsum(float(value) for value in self.deficits.values())
+            / len(self.deficits)
             if self.deficits
             else 0.0
         )
@@ -263,16 +286,27 @@ def reduce_personality(
         raise
     except Exception as error:
         raise DomainInvariantError("invalid personality rate state") from error
-    cumulative_change = Decimal(0)
+    changes: list[tuple[Decimal, Decimal]] = []
     for key, raw_value in updates.items():
         if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
             raise DomainInvariantError("personality values must be numeric")
-        value = float(raw_value)
-        before = Decimal(str(current.get(key, 0.0)))
+        try:
+            value = float(raw_value)
+        except (OverflowError, ValueError) as error:
+            raise DomainInvariantError("personality values must be finite") from error
         if not math.isfinite(value):
             raise DomainInvariantError("personality values must be finite")
-        cumulative_change += abs(Decimal(str(raw_value)) - before)
+        if not -1.0 <= value <= 1.0:
+            raise DomainInvariantError("personality values must be in [-1.0, 1.0]")
+        changes.append(
+            (Decimal(str(raw_value)), Decimal(str(current.get(key, 0.0))))
+        )
         merged[key] = value
+    with _deterministic_decimal_context(term_count=len(changes)):
+        cumulative_change = sum(
+            ((after - before).copy_abs() for after, before in changes),
+            Decimal(0),
+        )
     try:
         revised_bucket = bucket.consumed(cumulative_change)
         revised_rates = personality.rate_state.model_copy(

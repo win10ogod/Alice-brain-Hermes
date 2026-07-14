@@ -52,6 +52,37 @@ def test_event_envelope_is_strict_deeply_frozen_and_canonical() -> None:
     ).canonical_json(exclude_sequence=True)
 
 
+def test_frozen_json_iteration_is_recursively_canonical() -> None:
+    first = FrozenJsonDict(
+        {
+            "z": {"z-inner": 3, "a-inner": 2},
+            "a": [{"z-list": 1, "a-list": 0}],
+        }
+    )
+    second = FrozenJsonDict(
+        {
+            "a": [{"a-list": 0, "z-list": 1}],
+            "z": {"a-inner": 2, "z-inner": 3},
+        }
+    )
+
+    assert tuple(first) == tuple(second) == ("a", "z")
+    assert tuple(first["z"]) == tuple(second["z"]) == (
+        "a-inner",
+        "z-inner",
+    )
+    assert tuple(first["a"][0]) == tuple(second["a"][0]) == (
+        "a-list",
+        "z-list",
+    )
+    state = reduce_state(
+        BrainState.genesis(BRAIN),
+        event("capabilities.reported", {"capabilities": first}),
+    )
+    assert tuple(state.capabilities) == ("a", "z")
+    assert tuple(state.capabilities["z"]) == ("a-inner", "z-inner")
+
+
 @pytest.mark.parametrize(
     ("left", "right"),
     [
