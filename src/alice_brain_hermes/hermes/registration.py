@@ -51,6 +51,38 @@ _BOOTSTRAP_MAX_STRING_BYTES = 16_384
 # stdlib-only registration boundary inert instead of importing runtime models.
 _BOOTSTRAP_MAX_CAPTURE_SEQUENCE = 2**63 - 2
 _EMPTY_BOOTSTRAP_COPY_STATS: MappingProxyType[str, int] = MappingProxyType({})
+_HOST_VALUE_UNRESOLVED = object()
+
+
+class _HermesHostAccess:
+    """Worker-only, once-resolved access to one Hermes plugin context."""
+
+    def __init__(self, context: Any) -> None:
+        self._context = context
+        self._lock = threading.Lock()
+        self._brain_profile: Any = _HOST_VALUE_UNRESOLVED
+        self._llm: Any = _HOST_VALUE_UNRESOLVED
+
+    def brain_profile(self) -> Any:
+        """Resolve and cache the project profile only on an operational worker."""
+
+        with self._lock:
+            if self._brain_profile is _HOST_VALUE_UNRESOLVED:
+                profile_name = self._context.profile_name
+                from alice_brain_hermes.hermes.identity_client import (
+                    hermes_brain_profile,
+                )
+
+                self._brain_profile = hermes_brain_profile(profile_name)
+            return self._brain_profile
+
+    def llm(self) -> Any:
+        """Resolve and cache Hermes' host-owned LLM with its existing defaults."""
+
+        with self._lock:
+            if self._llm is _HOST_VALUE_UNRESOLVED:
+                self._llm = self._context.llm
+            return self._llm
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +289,8 @@ class _BootstrapCaptureBuffer:
         self._transport_bridge: Any | None = None
         self._stop_event = threading.Event()
         self._stop_requested = False
+        self._host_context: Any | None = None
+        self._identity_worker: Any | None = None
         self._start_worker_on_capture = start_worker_on_capture
         self._health = _BootstrapHealth()
         self._handed_off_dropped_events = 0
@@ -323,6 +357,56 @@ class _BootstrapCaptureBuffer:
 
     def publish_context(self, context: str | None) -> None:
         self._context = context if type(context) is str and context else None
+
+    def bind_host_context(self, context: Any) -> None:
+        """Retain the opaque context without reading any lazy host property."""
+
+        with self._worker_lock:
+            self._host_context = context
+
+    def host_context_for_worker(self) -> Any:
+        """Return the context only to the operational bootstrap worker."""
+
+        context = self.bound_host_context_for_worker()
+        if context is None:
+            raise RuntimeError("Hermes host context is not registered")
+        return context
+
+    def bound_host_context_for_worker(self) -> Any | None:
+        """Return a bound context, or ``None`` for direct bridge test seams."""
+
+        with self._worker_lock:
+            return self._host_context
+
+    @property
+    def identity_worker_for_test(self) -> Any | None:
+        return self.identity_worker_for_worker()
+
+    def identity_worker_for_worker(self) -> Any | None:
+        with self._worker_lock:
+            return self._identity_worker
+
+    def _adopt_identity_worker(self, worker: Any) -> None:
+        with self._worker_lock:
+            current = self._identity_worker
+            if current is not None and current is not worker:
+                raise RuntimeError("bootstrap identity worker ownership changed")
+            self._identity_worker = worker
+
+    def _stop_identity_worker(self, worker: Any | None = None) -> None:
+        with self._worker_lock:
+            owned = self._identity_worker
+        if owned is None:
+            return
+        if worker is not None and owned is not worker:
+            raise RuntimeError("bootstrap identity worker identity changed")
+        stop = getattr(owned, "stop_for_test", None)
+        if not callable(stop):
+            raise RuntimeError("identity worker has no bounded stop operation")
+        stop()
+        with self._worker_lock:
+            if self._identity_worker is owned:
+                self._identity_worker = None
 
     def capture(self, hook: str, kwargs: dict[str, Any]) -> None:
         with self._capture_lock:
@@ -965,6 +1049,81 @@ class _BootstrapCaptureBuffer:
             return tuple(sorted(items, key=lambda item: item.capture_seq))
 
 
+def _configure_identity_worker(
+    buffer: _BootstrapCaptureBuffer,
+    *,
+    runtime_home: Any,
+    profile_factory: Any,
+    llm_factory: Any,
+) -> None:
+    """Create the optional naming worker without resolving either host value."""
+
+    from os import environ
+
+    from alice_brain_hermes.hermes.identity import (
+        IdentityLlmMode,
+        IdentityNamingWorker,
+        read_identity_llm_mode,
+    )
+
+    mode = read_identity_llm_mode(environ)
+    if mode is IdentityLlmMode.OFF:
+        return
+
+    from alice_brain_hermes.hermes.identity_client import (
+        DaemonIdentityNamingLeasePort,
+    )
+
+    port = DaemonIdentityNamingLeasePort(
+        runtime_home,
+        profile_factory=profile_factory,
+    )
+    worker = IdentityNamingWorker(
+        mode=mode,
+        lease_port=port,
+        llm_factory=llm_factory,
+    )
+    adopt = getattr(buffer, "_adopt_identity_worker", None)
+    if not callable(adopt):
+        raise RuntimeError("bootstrap cannot own the identity naming worker")
+    adopt(worker)
+    # Once adopted, this exact object owns any RAM terminal intent it may
+    # create. A prelaunch failure, ambiguous start, or fast fatal exit must
+    # never make bootstrap replace or clear it; the monitor restarts it in place.
+    worker.start()
+
+
+def _ensure_identity_worker_running(buffer: _BootstrapCaptureBuffer) -> bool:
+    """Restart the same dead worker while preserving ambiguous ownership."""
+
+    worker = buffer.identity_worker_for_worker()
+    if worker is None:
+        return True
+    try:
+        if worker.worker_started:
+            return True
+    except BaseException as error:
+        buffer.mark_worker_degraded(error)
+        return False
+    try:
+        worker.start()
+    except BaseException as error:
+        # IdentityNamingWorker retains an alive or unprobeable thread owner.
+        # Never replace that object: its RAM terminal intent is authoritative.
+        buffer.mark_worker_degraded(error)
+        return False
+    try:
+        if worker.worker_started:
+            return True
+    except BaseException as error:
+        buffer.mark_worker_degraded(error)
+        return False
+    buffer.mark_worker_degraded(
+        RuntimeError("Hermes identity naming worker did not restart")
+    )
+    return False
+
+
 def _bootstrap_worker_entry(buffer: _BootstrapCaptureBuffer) -> None:
     worker = buffer._worker
     if worker is None:
@@ -975,16 +1134,35 @@ def _bootstrap_worker_entry(buffer: _BootstrapCaptureBuffer) -> None:
     try:
         _bootstrap_worker_main(buffer)
     finally:
-        try:
-            buffer._stop_transport_bridge()
-        except BaseException as error:
-            buffer.mark_worker_degraded(error)
-        finally:
-            buffer._publish_worker_exit(worker)
+        for cleanup_name in ("_stop_identity_worker", "_stop_transport_bridge"):
+            cleanup = getattr(buffer, cleanup_name, None)
+            if not callable(cleanup):
+                continue
+            try:
+                cleanup()
+            except BaseException as error:
+                buffer.mark_worker_degraded(error)
+        buffer._publish_worker_exit(worker)
 
 
 def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
+    from alice_brain_hermes.hermes.bridge import HookBridge, default_runtime_home
+
     bridge: Any | None = getattr(buffer, "_transport_bridge", None)
+    runtime_home = getattr(bridge, "runtime_home", None)
+    if runtime_home is None:
+        runtime_home = default_runtime_home()
+    host_access: _HermesHostAccess | None = None
+    shared_profile_factory: Any | None = None
+    bound_host_context = getattr(buffer, "bound_host_context_for_worker", None)
+    if callable(bound_host_context):
+        context = bound_host_context()
+        if context is not None:
+            host_access = _HermesHostAccess(context)
+            shared_profile_factory = host_access.brain_profile
+    identity_owner = getattr(buffer, "identity_worker_for_worker", None)
+    identity_configured = callable(identity_owner) and identity_owner() is not None
+    identity_retry_after = 0.0
     while True:
         try:
             stop_probe = getattr(buffer, "worker_stop_requested", None)
@@ -994,16 +1172,13 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
             if bridge is None:
                 candidate: Any | None = None
                 try:
-                    from alice_brain_hermes.hermes.bridge import (
-                        HookBridge,
-                        default_runtime_home,
-                    )
-
-                    candidate = HookBridge(
-                        default_runtime_home(),
-                        start_worker_on_capture=False,
-                        context_sink=buffer.publish_context,
-                    )
+                    bridge_arguments: dict[str, Any] = {
+                        "start_worker_on_capture": False,
+                        "context_sink": buffer.publish_context,
+                    }
+                    if shared_profile_factory is not None:
+                        bridge_arguments["profile_factory"] = shared_profile_factory
+                    candidate = HookBridge(runtime_home, **bridge_arguments)
                     adopt = getattr(buffer, "_adopt_transport_bridge", None)
                     if adopt is not None:
                         adopt(candidate)
@@ -1040,6 +1215,34 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                         buffer.mark_worker_degraded(error)
                         buffer.wait(0.1)
                         continue
+            current_time = time.monotonic()
+            if (
+                host_access is not None
+                and not identity_configured
+                and current_time >= identity_retry_after
+            ):
+                try:
+                    _configure_identity_worker(
+                        buffer,
+                        runtime_home=runtime_home,
+                        profile_factory=shared_profile_factory,
+                        llm_factory=host_access.llm,
+                    )
+                except BaseException as error:
+                    buffer.mark_worker_degraded(error)
+                    identity_configured = (
+                        buffer.identity_worker_for_worker() is not None
+                    )
+                    identity_retry_after = current_time + 0.1
+                else:
+                    # Includes the permanent, default-off configuration.
+                    identity_configured = True
+            if (
+                identity_configured
+                and current_time >= identity_retry_after
+                and not _ensure_identity_worker_running(buffer)
+            ):
+                identity_retry_after = current_time + 0.1
             capture = buffer.next_for_worker()
             if capture is None:
                 buffer.publish_context(bridge.projections.read_context())
@@ -1391,6 +1594,7 @@ def register(ctx: Any) -> None:
         setattr(ctx, _REGISTRATION_STATE_ATTRIBUTE, "registering")
         registered_hook_count = 0
         try:
+            _BOOTSTRAP.bind_host_context(ctx)
             for hook_name in APPROVED_HOOKS:
                 register_hook(hook_name, HOOK_CALLBACKS[hook_name])
                 registered_hook_count += 1

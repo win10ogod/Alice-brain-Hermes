@@ -38,8 +38,10 @@ Hermes Agent 0.18.x
 └─────────────────────────────────────────────────────┘
 ```
 
-Hook callback 只做有界複製、序號保留、`put_nowait` 與 cache read；不在 callback thread
-中做 SQLite、socket RPC、provider call、檔案 I/O 或 daemon 啟停。序號洞、queue overflow、不完整 hook
+Plugin 註冊只保留不透明的 Hermes context，不讀取 `ctx.profile_name` 或 `ctx.llm`。
+Hook callback 只做有界複製、序號保留、`put_nowait`、cache read 與啟動 bootstrap
+worker；不在 callback thread 中做 profile/LLM 解析、SQLite、socket RPC、provider call、
+檔案 I/O 或 daemon 啟停。序號洞、queue overflow、不完整 hook
 覆蓋、語意無法判讀與 late/conflicting receipt 都有可見證據，不偽裝成完整 trace。
 
 ## PC/E/ST/RD/A
@@ -123,6 +125,18 @@ export ALICE_BRAIN_HERMES_IDENTITY_LLM_MODE=name_when_unnamed
 不在 hook callback 中呼叫 LLM；它不覆寫 provider、model、profile、agent、temperature、token 或
 timeout 設定。只有精確的 `{name, reason}` JSON 可完成租約；框架不指定 `Alice`、不從自由
 文字猜名字、不產生 fallback 或數字後綴。
+
+Bootstrap worker 在第一次需要時才以 thread-safe cache 讀取一次宿主 profile，
+`default` 對應 `hermes.default`，其他名稱對應不暴露原名的決定性 SHA-256 key；
+bridge 與命名 client 共用同一個 `BrainProfileV1` factory/cache。`off` 模式不會建立
+identity worker，也不會讀取 `ctx.llm`。這些背景 client 只連接已存在的 daemon；
+找不到 discovery/runtime home 時會保留可觀測失敗，不會自動啟動 daemon 或建立資料夾。
+
+命名 worker 對待終態意圖的可靠性邊界是「同一程序」：待重送的 lease、choice 或
+failure 意圖只保留在 RAM，thread/transport fault 可在程序存活時精確重送。如果
+process/OS 在 claim 到 terminal ACK 之間崩潰，特別是 LLM 已產生 choice 但尚未取得
+daemon ACK 的視窗，exact intent 可能遺失，只能等原 lease 過期後再呼叫。本專案
+不宣稱跨 process exactly-once。
 
 ## 可觀測性
 

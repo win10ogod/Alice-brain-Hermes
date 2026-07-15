@@ -15,6 +15,7 @@ from alice_brain_hermes.protocol.identity import (
     IdentityChoiceV1,
     IdentityNamingLeaseV1,
 )
+from alice_brain_hermes.protocol.models import BrainProfileV1
 
 
 class FakeClient:
@@ -64,10 +65,12 @@ def test_port_reads_profile_only_when_claiming_and_uses_fresh_clients(
     constructed: list[tuple[Path, dict[str, object]]] = []
     profile_reads = 0
 
-    def profile_factory() -> str:
+    profile = hermes_brain_profile("default")
+
+    def profile_factory() -> BrainProfileV1:
         nonlocal profile_reads
         profile_reads += 1
-        return "default"
+        return profile
 
     def client_factory(home: Path, **kwargs: object) -> FakeClient:
         constructed.append((home, kwargs))
@@ -90,6 +93,7 @@ def test_port_reads_profile_only_when_claiming_and_uses_fresh_clients(
     assert len(constructed) == 3
     assert all(client.closed for client in clients)
     assert clients[0].calls[0][0] == "brain.resolve"
+    assert clients[0].calls[0][1] == {"profile": profile.model_dump(mode="json")}
     assert clients[0].calls[1] == (
         "identity.naming.claim",
         {"brain_id": brain_id},
@@ -116,3 +120,22 @@ def test_port_reads_profile_only_when_claiming_and_uses_fresh_clients(
         kwargs == {"initialize": True, "timeout_seconds": 3.0}
         for _home, kwargs in constructed
     )
+
+
+def test_port_rejects_a_second_host_name_mapping_boundary(tmp_path: Path) -> None:
+    client_reads = 0
+
+    def client_factory(*_args: object, **_kwargs: object) -> object:
+        nonlocal client_reads
+        client_reads += 1
+        return object()
+
+    port = DaemonIdentityNamingLeasePort(
+        tmp_path,
+        profile_factory=lambda: "default",  # type: ignore[return-value]
+        client_factory=client_factory,
+    )
+
+    with pytest.raises(TypeError, match="BrainProfileV1"):
+        port.claim()
+    assert client_reads == 0

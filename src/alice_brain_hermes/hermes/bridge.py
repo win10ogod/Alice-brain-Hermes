@@ -53,6 +53,11 @@ _TOKEN = re.compile(r"^[0-9a-f]{64}$")
 
 ClientFactory = Callable[..., Any]
 _BootstrapCaptureDisposition = Literal["accepted", "late_after_close"]
+ProfileFactory = Callable[[], BrainProfileV1]
+
+
+def _default_brain_profile() -> BrainProfileV1:
+    return BrainProfileV1(profile_key="hermes.default", name=None)
 
 
 @dataclass(slots=True)
@@ -467,6 +472,7 @@ class HookBridge:
         connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
         frame_refresh_seconds: float = DEFAULT_FRAME_REFRESH_SECONDS,
         client_factory: ClientFactory | None = None,
+        profile_factory: ProfileFactory | None = None,
         start_worker_on_capture: bool = True,
         context_sink: Callable[[str | None], None] | None = None,
     ) -> None:
@@ -488,6 +494,8 @@ class HookBridge:
                 raise ValueError(f"{name} must be finite, positive, and at most 60")
         if type(start_worker_on_capture) is not bool:
             raise TypeError("start_worker_on_capture must be an exact bool")
+        if profile_factory is not None and not callable(profile_factory):
+            raise TypeError("profile_factory must be callable")
         active_id = bridge_instance_id or new_id()
         self._bridge_instance_id = validate_id(active_id)
         active_token = recovery_token or secrets.token_hex(32)
@@ -500,6 +508,7 @@ class HookBridge:
         )
         self.projections = AtomicProjectionCache(context_sink=context_sink)
         self._client_factory = client_factory or self._default_client_factory
+        self._profile_factory = profile_factory or _default_brain_profile
         self._reconnect_delay_seconds = float(reconnect_delay_seconds)
         self._connect_timeout_seconds = float(connect_timeout_seconds)
         self._frame_refresh_seconds = float(frame_refresh_seconds)
@@ -1278,7 +1287,9 @@ class HookBridge:
                 initialize=True,
                 timeout_seconds=self._connect_timeout_seconds,
             )
-            profile = BrainProfileV1(profile_key="hermes.default", name=None)
+            profile = self._profile_factory()
+            if type(profile) is not BrainProfileV1:
+                raise TypeError("profile_factory must return an exact BrainProfileV1")
             resolved = client.call(
                 "brain.resolve",
                 {"profile": profile.model_dump(mode="json")},

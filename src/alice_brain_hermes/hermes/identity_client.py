@@ -22,7 +22,7 @@ from alice_brain_hermes.protocol.identity import (
 from alice_brain_hermes.protocol.models import BrainProfileV1
 
 ClientFactory = Callable[..., Any]
-ProfileFactory = Callable[[], str]
+ProfileFactory = Callable[[], BrainProfileV1]
 
 
 def hermes_brain_profile(profile_name: str) -> BrainProfileV1:
@@ -90,7 +90,9 @@ class DaemonIdentityNamingLeasePort:
             close()
 
     def claim(self) -> IdentityNamingLeaseV1 | None:
-        profile = hermes_brain_profile(self._profile_factory())
+        profile = self._profile_factory()
+        if type(profile) is not BrainProfileV1:
+            raise TypeError("profile_factory must return an exact BrainProfileV1")
         client = self._client()
         try:
             resolved = client.call(

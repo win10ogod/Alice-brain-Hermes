@@ -77,7 +77,8 @@ alice-brain-hermes doctor|trace|identity
 ## 6. 資料流
 
 1. session start 附接或建立本專案自己的 `brain_id`。
-2. 未命名 brain 由 `ctx.llm.complete_structured` 產生名稱與理由，依序記錄 cognition、C1 與 identity 事件。
+2. 只有運算者明確設定 `name_when_unnamed` 時，獨立 worker 才對未命名 brain
+   使用宿主預設 `ctx.llm.complete_structured` 產生名稱與理由；`off` 是預設且不讀取 LLM。
 3. pre-LLM 送出 observation/turn 並取得 compact state frame。
 4. Hermes 按原 provider 路徑推理；插件只觀測 attempt、completion、error 與 tool proposal。
 5. pre-tool 建立 ST/RD.prepare；post-tool 寫入 receipt 並 RD.reconstruct。
