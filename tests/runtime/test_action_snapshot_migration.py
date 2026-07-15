@@ -94,7 +94,7 @@ def test_v3_action_snapshot_is_replay_only_and_legacy_events_restore_outcome(
     assert action.outcome is ActionOutcome.FAILURE
 
 
-def legacy_action_ack_database(database: Path, *, mark_sqlite_v3: bool):
+def legacy_action_ack_database(database: Path, *, sqlite_version: int | None):
     brain_id = new_id()
     bridge_instance_id = new_id()
     gap = BridgeGapV1(
@@ -157,12 +157,13 @@ def legacy_action_ack_database(database: Path, *, mark_sqlite_v3: bool):
         legacy_frame.pop("semantic_schema_version")
         legacy_frame.pop("aggregate_semantic_complete")
         legacy_frame.pop("semantic_evidence")
-        legacy_frame["rd"]["actions"][-1]["execution_confirmed"] = False
-        legacy_frame["a"]["actions"][-1]["execution_confirmed"] = False
-        for section in ("rd", "a"):
-            legacy_frame["omission_counts"][section]["fields"][
-                "omitted_record_json_nodes"
-            ]["omitted"] -= 2
+        if sqlite_version != 4:
+            legacy_frame["rd"]["actions"][-1]["execution_confirmed"] = False
+            legacy_frame["a"]["actions"][-1]["execution_confirmed"] = False
+            for section in ("rd", "a"):
+                legacy_frame["omission_counts"][section]["fields"][
+                    "omitted_record_json_nodes"
+                ]["omitted"] -= 2
         legacy_ack = BridgeCommitAckV1(
             record_fingerprint=current_ack.record_fingerprint,
             event_id=current_ack.raw_event_id,
@@ -178,14 +179,12 @@ def legacy_action_ack_database(database: Path, *, mark_sqlite_v3: bool):
             "WHERE bridge_instance_id = ? AND first_capture_seq = 1",
             (legacy_ack_json, bridge_instance_id),
         )
-        if mark_sqlite_v3:
+        if sqlite_version is not None:
             connection.execute("PRAGMA foreign_keys = OFF")
             connection.execute("DROP TABLE hermes_span")
             connection.execute("DROP TABLE brain_observability")
             connection.execute("DROP INDEX bridge_record_event")
-            connection.execute(
-                "ALTER TABLE bridge_record RENAME TO bridge_record_v5"
-            )
+            connection.execute("ALTER TABLE bridge_record RENAME TO bridge_record_v5")
             connection.executescript(_CREATE_BRIDGE_RECORD_V4_SCHEMA)
             connection.execute(
                 "INSERT INTO bridge_record(bridge_instance_id, first_capture_seq, "
@@ -197,9 +196,10 @@ def legacy_action_ack_database(database: Path, *, mark_sqlite_v3: bool):
             )
             connection.execute("DROP TABLE bridge_record_v5")
             connection.execute(
-                "UPDATE schema_metadata SET value = '3' WHERE key = 'schema_version'"
+                "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
+                (str(sqlite_version),),
             )
-            connection.execute("PRAGMA user_version = 3")
+            connection.execute(f"PRAGMA user_version = {sqlite_version}")
     return brain_id, bridge_instance_id, gap, current_ack
 
 
@@ -209,7 +209,7 @@ def test_v3_bridge_ack_is_migrated_after_failure_execution_semantics_change(
     database = tmp_path / "legacy-v3-bridge-ack.db"
     brain_id, bridge_instance_id, gap, current_ack = legacy_action_ack_database(
         database,
-        mark_sqlite_v3=True,
+        sqlite_version=3,
     )
 
     with SQLiteLedger.open(database) as restarted:
@@ -236,11 +236,38 @@ def test_v3_bridge_ack_is_migrated_after_failure_execution_semantics_change(
     assert duplicate == migrated_ack
 
 
+def test_v4_bridge_ack_migrates_to_explicit_legacy_raw_only_without_backfill(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-v4-bridge-ack.db"
+    brain_id, bridge_instance_id, gap, current_ack = legacy_action_ack_database(
+        database,
+        sqlite_version=4,
+    )
+
+    with SQLiteLedger.open(database) as restarted:
+        [row] = restarted._connection.execute(
+            "SELECT ack_json FROM bridge_record WHERE bridge_instance_id = ?",
+            (bridge_instance_id,),
+        ).fetchall()
+        migrated = BridgeCommitAckV2.model_validate_json(row["ack_json"])
+        duplicate = ConsciousEngine(
+            restarted, brain_id, actor_id=brain_id
+        ).commit_bridge_record(bridge_instance_id, gap)
+
+    assert migrated.semantic_status == "legacy_raw_only"
+    assert migrated.semantic_complete is False
+    assert migrated.derived_event_ids == ()
+    assert migrated.raw_event_id == current_ack.raw_event_id
+    assert migrated.frame.semantic_evidence.legacy_raw_only_records == 1
+    assert duplicate == migrated
+
+
 def test_current_database_rejects_ack_tampered_to_deterministic_legacy_shape(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "current-tampered-ack.db"
-    legacy_action_ack_database(database, mark_sqlite_v3=False)
+    legacy_action_ack_database(database, sqlite_version=None)
 
     with pytest.raises(SchemaVersionError, match="bridge or profile"):
         SQLiteLedger.open(database)

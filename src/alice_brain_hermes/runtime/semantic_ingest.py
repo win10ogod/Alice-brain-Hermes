@@ -134,16 +134,18 @@ def match_hermes_span(
         and span.occurrence_capture_seq < record.capture_seq
     )
     open_spans = tuple(span for span in eligible if span.closed_capture_seq is None)
-    if len(open_spans) > 1:
-        return None, "ambiguous_open_span"
-    if len(open_spans) == 1:
-        return open_spans[0], None
     closed_spans = tuple(
         span
         for span in eligible
         if span.closed_capture_seq is not None
         and span.closed_capture_seq < record.capture_seq
     )
+    if len(open_spans) > 1:
+        return None, "ambiguous_open_span"
+    if len(open_spans) == 1:
+        if closed_spans:
+            return None, "ambiguous_open_closed_span"
+        return open_spans[0], None
     if not closed_spans:
         return None, None
     return max(
@@ -171,6 +173,8 @@ class SemanticPlan:
             raise ValueError("semantic plan completeness does not match status")
         if self.semantic_status == "applied" and not self.derived_events:
             raise ValueError("applied semantic plan requires derived evidence")
+        if self.semantic_status == "gap" and len(self.derived_events) not in {0, 1}:
+            raise ValueError("semantic gap plan contains zero or one gap event")
         if self.semantic_status in {"not_applicable", "legacy_raw_only"} and (
             self.derived_events
         ):
@@ -202,9 +206,7 @@ def _observation_provenance(record: HermesObservationV1) -> dict[str, str | None
     }
 
 
-def build_raw_event(
-    stream: BridgeStreamState, record: BridgeRecordV1
-) -> EventEnvelope:
+def build_raw_event(stream: BridgeStreamState, record: BridgeRecordV1) -> EventEnvelope:
     if record.bridge_instance_id != stream.bridge_instance_id:
         raise ValueError("bridge record does not match semantic stream")
     if isinstance(record, HermesObservationV1):
@@ -438,9 +440,7 @@ def _post_tool_plan(
     matched_span: HermesSpan | None,
 ) -> SemanticPlan:
     if matched_span is None:
-        return _semantic_gap(
-            stream, record, raw_event, reason="unmatched_post_tool"
-        )
+        return _semantic_gap(stream, record, raw_event, reason="unmatched_post_tool")
     _validate_matched_span(
         record,
         matched_span,
@@ -457,6 +457,15 @@ def _post_tool_plan(
     ):
         return _semantic_gap(
             stream, record, raw_event, reason="invalid_post_tool_error_type"
+        )
+    if raw_status == "ok" and raw_error_type is not None:
+        return _semantic_gap(stream, record, raw_event, reason="ok_with_error_type")
+    if raw_status != "error" and raw_error_type == "thread_missing_result":
+        return _semantic_gap(
+            stream,
+            record,
+            raw_event,
+            reason="misattributed_thread_missing_result",
         )
     if raw_status == "ok":
         receipt_status, execution, outcome = "success", True, "success"
@@ -638,8 +647,7 @@ def _attributed_plan(
             "context_sha256": span_context_fingerprint(record),
             "hook": record.hook,
             "late": bool(
-                matched_span is not None
-                and matched_span.closed_capture_seq is not None
+                matched_span is not None and matched_span.closed_capture_seq is not None
             ),
             "occurrence_capture_seq": occurrence,
             "raw_payload_sha256": _json_fingerprint(
@@ -647,9 +655,7 @@ def _attributed_plan(
             ),
             "source": "hermes_observer_v1",
         },
-        causation_id=(
-            raw_event.event_id if not preceding else preceding[-1].event_id
-        ),
+        causation_id=(raw_event.event_id if not preceding else preceding[-1].event_id),
     )
     return SemanticPlan(
         semantic_status="applied",

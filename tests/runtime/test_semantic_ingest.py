@@ -266,6 +266,89 @@ def test_non_host_post_tool_status_is_one_semantic_gap(status: str) -> None:
     assert [event.event_type for event in plan.derived_events] == ["semantic.gap"]
 
 
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        ("ok", "ImpossibleOkError"),
+        ("timeout", "thread_missing_result"),
+        ("cancelled", "thread_missing_result"),
+        ("blocked", "thread_missing_result"),
+    ],
+)
+def test_contradictory_source_error_type_is_one_semantic_gap(
+    status: str, error_type: str
+) -> None:
+    instance = new_id()
+    source = stream(instance)
+    record = tool_observation(
+        instance,
+        9,
+        hook="post_tool_call",
+        status=status,
+        error_type=error_type,
+    )
+    matched = HermesSpan(
+        bridge_instance_id=instance,
+        span_kind="tool",
+        external_id="tool-reused",
+        occurrence_capture_seq=7,
+        context_fingerprint=span_context_fingerprint(record),
+        action_id="hermes-action-7",
+    )
+
+    plan = build_semantic_plan(
+        source,
+        record,
+        raw_event=build_raw_event(source, record),
+        matched_span=matched,
+    )
+
+    assert plan.semantic_status == "gap"
+    assert [event.event_type for event in plan.derived_events] == ["semantic.gap"]
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type", "event_type"),
+    [
+        ("timeout", "TimeoutError", "action.receipt"),
+        ("cancelled", "CancelledError", "action.receipt"),
+        ("blocked", "PolicyBlocked", "action.blocked"),
+    ],
+)
+def test_true_host_non_error_status_preserves_nonreserved_error_type(
+    status: str, error_type: str, event_type: str
+) -> None:
+    instance = new_id()
+    source = stream(instance)
+    record = tool_observation(
+        instance,
+        9,
+        hook="post_tool_call",
+        status=status,
+        error_type=error_type,
+    )
+    matched = HermesSpan(
+        bridge_instance_id=instance,
+        span_kind="tool",
+        external_id="tool-reused",
+        occurrence_capture_seq=7,
+        context_fingerprint=span_context_fingerprint(record),
+        action_id="hermes-action-7",
+    )
+
+    plan = build_semantic_plan(
+        source,
+        record,
+        raw_event=build_raw_event(source, record),
+        matched_span=matched,
+    )
+
+    terminal = plan.derived_events[-1]
+    assert terminal.event_type == event_type
+    assert terminal.payload["source_status"] == status
+    assert terminal.payload["source_error_type"] == error_type
+
+
 def test_unmatched_post_tool_is_raw_plus_semantic_gap_not_fabricated_action() -> None:
     instance = new_id()
     source = stream(instance)
@@ -325,9 +408,7 @@ def test_late_tool_receipt_uses_closed_occurrence_without_redispatch() -> None:
     pre_raw = build_raw_event(source, pre)
     pre_plan = build_semantic_plan(source, pre, raw_event=pre_raw)
     assert pre_plan.span_open is not None
-    first_post = tool_observation(
-        instance, 2, hook="post_tool_call", status="timeout"
-    )
+    first_post = tool_observation(instance, 2, hook="post_tool_call", status="timeout")
     first_raw = build_raw_event(source, first_post)
     first_plan = build_semantic_plan(
         source,
@@ -398,6 +479,44 @@ def test_two_indistinguishable_open_occurrences_are_explicitly_ambiguous() -> No
 
     assert matched is None
     assert reason == "ambiguous_open_span"
+    assert plan.semantic_status == "gap"
+    assert [event.event_type for event in plan.derived_events] == ["semantic.gap"]
+
+
+def test_open_and_closed_reused_occurrences_are_explicitly_ambiguous() -> None:
+    instance = new_id()
+    source = stream(instance)
+    completion = tool_observation(instance, 9, hook="post_tool_call")
+    context_fingerprint = span_context_fingerprint(completion)
+    closed = HermesSpan(
+        bridge_instance_id=instance,
+        span_kind="tool",
+        external_id="tool-reused",
+        occurrence_capture_seq=2,
+        context_fingerprint=context_fingerprint,
+        action_id="action-closed",
+        closed_capture_seq=3,
+    )
+    opened = HermesSpan(
+        bridge_instance_id=instance,
+        span_kind="tool",
+        external_id="tool-reused",
+        occurrence_capture_seq=8,
+        context_fingerprint=context_fingerprint,
+        action_id="action-open",
+    )
+
+    matched, reason = match_hermes_span(completion, (closed, opened))
+    plan = build_semantic_plan(
+        source,
+        completion,
+        raw_event=build_raw_event(source, completion),
+        matched_span=matched,
+        forced_gap_reason=reason,
+    )
+
+    assert matched is None
+    assert reason == "ambiguous_open_closed_span"
     assert plan.semantic_status == "gap"
     assert [event.event_type for event in plan.derived_events] == ["semantic.gap"]
 

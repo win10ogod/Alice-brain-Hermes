@@ -716,8 +716,7 @@ def test_capabilities_report_unobserved_streams_and_transport_limits() -> None:
     assert capabilities["bridge_close_recovery"] == "opaque_token_v1"
     assert capabilities["limits"]["max_response_bytes"] == 1_048_576
     assert (
-        capabilities["limits"]["max_response_bytes"]
-        <= models_module.MAX_PROTOCOL_BYTES
+        capabilities["limits"]["max_response_bytes"] <= models_module.MAX_PROTOCOL_BYTES
     )
     assert capabilities["limits"]["max_request_bytes"] == (
         models_module.TASK6_MAX_DETACHED_RECORD_BYTES

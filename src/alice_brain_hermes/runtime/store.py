@@ -31,6 +31,7 @@ from alice_brain_hermes.errors import (
     BridgeClosedError,
     CaptureGapRequiredError,
     CaptureSequenceError,
+    DomainCapacityError,
     EventConflictError,
     ExpectedSequenceError,
     FrameSizeError,
@@ -742,9 +743,7 @@ class SQLiteLedger:
                 )
             )
         self._connection.execute("DROP INDEX bridge_record_event")
-        self._connection.execute(
-            "ALTER TABLE bridge_record RENAME TO bridge_record_v4"
-        )
+        self._connection.execute("ALTER TABLE bridge_record RENAME TO bridge_record_v4")
         for statement in _statements(_CREATE_BRIDGE_RECORD_V5_SCHEMA):
             self._connection.execute(statement)
         for values in migrated_rows:
@@ -918,9 +917,7 @@ class SQLiteLedger:
                 semantic_gap_records=int(health["semantic_gap_records"]),
                 total_bridges=int(bridges["total_bridges"]),
                 connected_open_bridges=int(bridges["connected_open_bridges"]),
-                disconnected_open_bridges=int(
-                    bridges["disconnected_open_bridges"]
-                ),
+                disconnected_open_bridges=int(bridges["disconnected_open_bridges"]),
                 clean_closed_bridges=int(bridges["clean_closed_bridges"]),
                 abandoned_bridges=int(bridges["abandoned_bridges"]),
             )
@@ -984,9 +981,9 @@ class SQLiteLedger:
             values["legacy_raw_only_records"] = int(
                 values["legacy_raw_only_records"]
             ) + int(pending_plan.semantic_status == "legacy_raw_only")
-            values["semantic_gap_records"] = int(
-                values["semantic_gap_records"]
-            ) + int(pending_plan.semantic_status == "gap")
+            values["semantic_gap_records"] = int(values["semantic_gap_records"]) + int(
+                pending_plan.semantic_status == "gap"
+            )
             if isinstance(pending_record, BridgeGapV1):
                 values["dropped_events"] = (
                     int(values["dropped_events"]) + pending_record.dropped_count
@@ -1638,18 +1635,17 @@ class SQLiteLedger:
             (stream.bridge_instance_id,),
         ).fetchall()
         if historical_states is None:
+            replay_targets = {
+                int(row["ledger_sequence"])
+                + (0 if legacy_bridge_schema else int(row["derived_event_count"]))
+                for row in rows
+            }
+            if not legacy_bridge_schema:
+                replay_targets.update(int(row["ledger_sequence"]) - 1 for row in rows)
             historical_states, replayed_final = (
                 self._replay_target_states_in_transaction(
                     stream.brain_id,
-                    {
-                        int(row["ledger_sequence"])
-                        + (
-                            0
-                            if legacy_bridge_schema
-                            else int(row["derived_event_count"])
-                        )
-                        for row in rows
-                    },
+                    replay_targets,
                 )
             )
         else:
@@ -1712,17 +1708,14 @@ class SQLiteLedger:
                         historical_state=historical_state,
                     )
                     if ack.semantic_status == "legacy_raw_only":
-                        expected_legacy_fingerprint = (
-                            self._legacy_semantic_fingerprint(
-                                record_fingerprint=record.fingerprint(),
-                                raw_event_id=ack.raw_event_id,
-                                raw_event_sequence=ack.raw_event_sequence,
-                                through_capture_seq=record.last_capture_seq,
-                            )
+                        expected_legacy_fingerprint = self._legacy_semantic_fingerprint(
+                            record_fingerprint=record.fingerprint(),
+                            raw_event_id=ack.raw_event_id,
+                            raw_event_sequence=ack.raw_event_sequence,
+                            through_capture_seq=record.last_capture_seq,
                         )
                         if (
-                            ack.semantic_fingerprint
-                            != expected_legacy_fingerprint
+                            ack.semantic_fingerprint != expected_legacy_fingerprint
                             or ack.semantic_complete
                             or ack.derived_event_count != 0
                         ):
@@ -1744,9 +1737,11 @@ class SQLiteLedger:
                         events = tuple(
                             self._decode_event(event_row) for event_row in event_rows
                         )
-                        raw_event = events[0].model_copy(
-                            update={"sequence": None}
-                        ).revalidated()
+                        raw_event = (
+                            events[0]
+                            .model_copy(update={"sequence": None})
+                            .revalidated()
+                        )
                         capacity_gap: str | None = None
                         if (
                             isinstance(record, HermesObservationV1)
@@ -1754,9 +1749,7 @@ class SQLiteLedger:
                             and len(expected_spans) >= MAX_HERMES_SPANS_PER_STREAM
                         ):
                             required = (
-                                len(expected_spans)
-                                - MAX_HERMES_SPANS_PER_STREAM
-                                + 1
+                                len(expected_spans) - MAX_HERMES_SPANS_PER_STREAM + 1
                             )
                             victim_indexes = sorted(
                                 (
@@ -1779,22 +1772,64 @@ class SQLiteLedger:
                             matched_span, correlation_gap = match_hermes_span(
                                 record, tuple(expected_spans)
                             )
+                        actual_derived = events[1:]
+                        domain_capacity_gap = (
+                            ack.semantic_status == "gap"
+                            and len(actual_derived) == 1
+                            and actual_derived[0].event_type == "semantic.gap"
+                            and actual_derived[0].payload.get("reason")
+                            == "semantic_domain_capacity"
+                        )
+                        forced_gap_reason = capacity_gap or correlation_gap
+                        if domain_capacity_gap:
+                            predecessor = historical_states.get(
+                                ack.raw_event_sequence - 1
+                            )
+                            if predecessor is None:
+                                raise LedgerIntegrityError(
+                                    "semantic capacity gap has no predecessor state"
+                                )
+                            candidate = build_semantic_plan(
+                                stream,
+                                record,
+                                raw_event=raw_event,
+                                matched_span=matched_span,
+                                forced_gap_reason=forced_gap_reason,
+                            )
+                            candidate_state = predecessor
+                            try:
+                                for offset, event in enumerate(
+                                    (raw_event, *candidate.derived_events)
+                                ):
+                                    provisional = event.model_copy(
+                                        update={
+                                            "sequence": (
+                                                ack.raw_event_sequence + offset
+                                            )
+                                        }
+                                    ).revalidated()
+                                    candidate_state = reduce_state(
+                                        candidate_state, provisional
+                                    )
+                            except DomainCapacityError:
+                                forced_gap_reason = "semantic_domain_capacity"
+                            else:
+                                raise LedgerIntegrityError(
+                                    "semantic capacity gap is not reproducible"
+                                )
                         expected_plan = build_semantic_plan(
                             stream,
                             record,
                             raw_event=raw_event,
                             matched_span=matched_span,
-                            forced_gap_reason=capacity_gap or correlation_gap,
+                            forced_gap_reason=forced_gap_reason,
                         )
-                        actual_derived = events[1:]
                         if (
                             expected_plan.semantic_status != ack.semantic_status
                             or expected_plan.semantic_complete
                             is not ack.semantic_complete
-                            or expected_plan.fingerprint()
-                            != ack.semantic_fingerprint
-                            or len(expected_plan.derived_events)
-                            != len(actual_derived)
+                            or expected_plan.fingerprint() != ack.semantic_fingerprint
+                            or len(expected_plan.derived_events) != len(actual_derived)
                             or any(
                                 expected.event_id != actual.event_id
                                 or expected.canonical_json(exclude_sequence=True)
@@ -2019,6 +2054,23 @@ class SQLiteLedger:
                 health = expected[stream.brain_id]
                 health["semantic_gap_records"] += 1
                 health["semantic_complete"] = 0
+        covered = self._bridge_batch_sequences_in_transaction()
+        event_cursor = self._connection.execute(
+            "SELECT event_id, brain_id, sequence, body_fingerprint, "
+            "envelope_fingerprint, envelope_json FROM events "
+            "ORDER BY brain_id, sequence"
+        )
+        while event_rows := event_cursor.fetchmany(512):
+            for event_row in event_rows:
+                event = self._decode_event(event_row)
+                if (
+                    event.event_type in {"semantic.gap", "trace.gap"}
+                    and event.sequence not in covered.get(event.brain_id, set())
+                    and not self._is_reserved_abandonment_gap(event)
+                ):
+                    health = expected[event.brain_id]
+                    health["semantic_gap_records"] += 1
+                    health["semantic_complete"] = 0
         persisted_rows = self._connection.execute(
             "SELECT brain_id, trace_complete, semantic_complete, dropped_events, "
             "semantic_records, legacy_raw_only_records, semantic_gap_records "
@@ -2040,8 +2092,26 @@ class SQLiteLedger:
                 "persisted observability metadata does not match replay"
             )
 
+    def _bridge_batch_sequences_in_transaction(self) -> dict[str, set[int]]:
+        covered: dict[str, set[int]] = {}
+        rows = self._connection.execute(
+            "SELECT stream.brain_id, record.ledger_sequence, "
+            "record.derived_event_count FROM bridge_record AS record "
+            "JOIN bridge_stream AS stream ON stream.bridge_instance_id = "
+            "record.bridge_instance_id ORDER BY stream.brain_id, "
+            "record.ledger_sequence"
+        ).fetchall()
+        for row in rows:
+            first = int(row["ledger_sequence"])
+            last = first + int(row["derived_event_count"])
+            covered.setdefault(str(row["brain_id"]), set()).update(
+                range(first, last + 1)
+            )
+        return covered
+
     def _validate_semantic_frame_evidence_in_transaction(self) -> None:
         timeline: dict[str, list[tuple[int, str, object]]] = {}
+        covered = self._bridge_batch_sequences_in_transaction()
         record_rows = self._connection.execute(
             "SELECT stream.brain_id, record.ledger_sequence, "
             "record.record_kind, record.record_json, record.semantic_status, "
@@ -2069,6 +2139,15 @@ class SQLiteLedger:
                     timeline.setdefault(event.brain_id, []).append(
                         (event.sequence, "abandonment", event)
                     )
+                elif event.event_type in {
+                    "semantic.gap",
+                    "trace.gap",
+                } and event.sequence not in covered.get(event.brain_id, set()):
+                    if event.sequence is None:
+                        raise LedgerIntegrityError("unbounded gap has no sequence")
+                    timeline.setdefault(event.brain_id, []).append(
+                        (event.sequence, "unbounded_gap", event)
+                    )
         for brain_id, entries in timeline.items():
             health = {
                 "schema_version": SEMANTIC_SCHEMA_VERSION,
@@ -2078,7 +2157,7 @@ class SQLiteLedger:
                 "dropped_events": 0,
             }
             for _, kind, value in sorted(entries, key=lambda item: item[0]):
-                if kind == "abandonment":
+                if kind in {"abandonment", "unbounded_gap"}:
                     health["semantic_gap_records"] += 1
                     continue
                 row = value
@@ -2111,8 +2190,7 @@ class SQLiteLedger:
                 )
                 if (
                     ack.frame.semantic_schema_version != SEMANTIC_SCHEMA_VERSION
-                    or ack.frame.semantic_evidence.model_dump(mode="python")
-                    != health
+                    or ack.frame.semantic_evidence.model_dump(mode="python") != health
                     or ack.frame.aggregate_semantic_complete is not expected_complete
                 ):
                     raise LedgerIntegrityError(
@@ -2251,7 +2329,8 @@ class SQLiteLedger:
             bridge_targets = self._connection.execute(
                 "SELECT stream.brain_id, "
                 + sequence_expression
-                + " AS ledger_sequence "
+                + " AS ledger_sequence, record.ledger_sequence - 1 "
+                "AS predecessor_sequence "
                 "FROM bridge_record AS record JOIN bridge_stream AS stream "
                 "ON stream.bridge_instance_id = record.bridge_instance_id "
                 "ORDER BY stream.brain_id, record.ledger_sequence"
@@ -2263,6 +2342,8 @@ class SQLiteLedger:
                         "bridge record references an unknown brain"
                     )
                 target_sequences[brain_id].add(int(row["ledger_sequence"]))
+                if version == SQLITE_SCHEMA_VERSION:
+                    target_sequences[brain_id].add(int(row["predecessor_sequence"]))
 
         historical_states: dict[str, dict[int, BrainState]] = {}
         final_states: dict[str, BrainState] = {}
@@ -2874,9 +2955,7 @@ class SQLiteLedger:
                     None if latest_receipt is None else latest_receipt.status.value
                 ),
                 "latest_receipt_disposition": (
-                    None
-                    if latest_receipt is None
-                    else latest_receipt.disposition.value
+                    None if latest_receipt is None else latest_receipt.disposition.value
                 ),
                 "execution_confirmed": action.execution_confirmed,
                 "effect_confirmed": action.effect_confirmed,
@@ -3987,9 +4066,7 @@ class SQLiteLedger:
         return ack
 
     @staticmethod
-    def _raw_bridge_event_matches(
-        event: EventEnvelope, record: BridgeRecordV1
-    ) -> bool:
+    def _raw_bridge_event_matches(event: EventEnvelope, record: BridgeRecordV1) -> bool:
         if isinstance(record, HermesObservationV1):
             return (
                 event.event_type == HOOK_EVENT_TYPES[record.hook]
@@ -4001,15 +4078,11 @@ class SQLiteLedger:
                 and event.correlation_id
                 == getattr(record.context, "api_request_id", None)
             )
-        return (
-            event.event_type == "trace.gap"
-            and event.payload
-            == {
-                **record.model_dump(mode="json"),
-                "exact": True,
-                "trace_complete": False,
-            }
-        )
+        return event.event_type == "trace.gap" and event.payload == {
+            **record.model_dump(mode="json"),
+            "exact": True,
+            "trace_complete": False,
+        }
 
     def _decode_duplicate_bridge_record(
         self,
@@ -4096,6 +4169,15 @@ class SQLiteLedger:
             raise LedgerIntegrityError("semantic bridge batch events are missing")
         events = tuple(self._decode_event(event_row) for event_row in event_rows)
         raw_event, *derived_events = events
+        semantic_gap_shape_matches = True
+        if ack.semantic_status == "gap":
+            semantic_gap_shape_matches = (
+                isinstance(persisted, BridgeGapV1) and not derived_events
+            ) or (
+                isinstance(persisted, HermesObservationV1)
+                and len(derived_events) == 1
+                and derived_events[0].event_type == "semantic.gap"
+            )
         if (
             raw_event.event_id != row["event_id"]
             or raw_event.event_id != ack.raw_event_id
@@ -4104,6 +4186,7 @@ class SQLiteLedger:
             or ack.last_event_sequence != last_sequence
             or tuple(event.event_id for event in derived_events)
             != ack.derived_event_ids
+            or not semantic_gap_shape_matches
             or any(
                 event.brain_id != stream.brain_id
                 or event.actor_id != stream.server_actor_id
@@ -4120,12 +4203,8 @@ class SQLiteLedger:
                 historical_state,
                 through_capture_seq=persisted.last_capture_seq,
                 capture_coverage=self._record_capture_coverage(persisted),
-                aggregate_semantic_complete=(
-                    ack.frame.aggregate_semantic_complete
-                ),
-                semantic_evidence=ack.frame.semantic_evidence.model_dump(
-                    mode="python"
-                ),
+                aggregate_semantic_complete=(ack.frame.aggregate_semantic_complete),
+                semantic_evidence=ack.frame.semantic_evidence.model_dump(mode="python"),
                 stream_connected=True,
             )
             if (
@@ -4237,9 +4316,7 @@ class SQLiteLedger:
                 )
 
             raw_event = self._bridge_event(stream, record)
-            capacity_gap = self._prepare_semantic_span_capacity_in_transaction(
-                record
-            )
+            capacity_gap = self._prepare_semantic_span_capacity_in_transaction(record)
             matched_span, correlation_gap = self._matched_span_in_transaction(record)
             plan = build_semantic_plan(
                 stream,
@@ -4248,15 +4325,35 @@ class SQLiteLedger:
                 matched_span=matched_span,
                 forced_gap_reason=capacity_gap or correlation_gap,
             )
-            unsequenced_events = (raw_event, *plan.derived_events)
-            provisional_events = tuple(
-                event.model_copy(update={"sequence": expected_sequence + offset})
-                .revalidated()
-                for offset, event in enumerate(unsequenced_events)
-            )
-            successor = expected_state
-            for provisional in provisional_events:
-                successor = reduce_state(successor, provisional)
+
+            def sequence_and_reduce(
+                semantic_plan: SemanticPlan,
+            ) -> tuple[tuple[EventEnvelope, ...], BrainState]:
+                unsequenced = (raw_event, *semantic_plan.derived_events)
+                provisionals = tuple(
+                    event.model_copy(
+                        update={"sequence": expected_sequence + offset}
+                    ).revalidated()
+                    for offset, event in enumerate(unsequenced)
+                )
+                reduced = expected_state
+                for provisional in provisionals:
+                    reduced = reduce_state(reduced, provisional)
+                return provisionals, reduced
+
+            try:
+                provisional_events, successor = sequence_and_reduce(plan)
+            except DomainCapacityError:
+                if plan.semantic_status != "applied":
+                    raise
+                plan = build_semantic_plan(
+                    stream,
+                    record,
+                    raw_event=raw_event,
+                    matched_span=matched_span,
+                    forced_gap_reason="semantic_domain_capacity",
+                )
+                provisional_events, successor = sequence_and_reduce(plan)
             raw_provisional = provisional_events[0]
             derived_provisionals = provisional_events[1:]
             last_event_sequence = provisional_events[-1].sequence
@@ -4522,6 +4619,8 @@ class SQLiteLedger:
                     stored.canonical_json(),
                 ),
             )
+            if stored.event_type in {"semantic.gap", "trace.gap"}:
+                self._record_unbounded_gap_observability(stored.brain_id)
             return stored, True
 
     @staticmethod
