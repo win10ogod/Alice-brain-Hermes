@@ -6,6 +6,7 @@ import math
 import queue
 import threading
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from importlib import import_module, metadata
 from types import MappingProxyType
@@ -55,6 +56,37 @@ class _BootstrapHealth:
     worker_started: bool = False
     degraded: bool = False
     last_error: str | None = None
+    worker_error: str | None = None
+    registration_attempts: int = 0
+    registration_failures: int = 0
+    registration_complete: bool = False
+    registered_hook_count: int = 0
+    missing_hooks: tuple[str, ...] = APPROVED_HOOKS
+    registration_error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _DispatchReservation:
+    """Identity proving which sequence belongs to one public callback."""
+
+    buffer: _BootstrapCaptureBuffer
+    capture_seq: int
+
+
+@dataclass(slots=True)
+class _DispatchAttempt:
+    """Thread-local callback attempt; nested callbacks restore their parent."""
+
+    reservation: _DispatchReservation | None = None
+    notify_buffer: _BootstrapCaptureBuffer | None = None
+
+
+_DISPATCH_STATE = threading.local()
+
+
+def _active_dispatch_attempt() -> _DispatchAttempt | None:
+    attempt = getattr(_DISPATCH_STATE, "attempt", None)
+    return attempt if isinstance(attempt, _DispatchAttempt) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,9 +146,7 @@ def _copy_bootstrap_text(value: str, stats: _BootstrapCopyStats) -> str:
     ):
         return value
     stats.truncated_paths += 1
-    return encoded[:_BOOTSTRAP_MAX_STRING_BYTES].decode(
-        "utf-8", errors="ignore"
-    )
+    return encoded[:_BOOTSTRAP_MAX_STRING_BYTES].decode("utf-8", errors="ignore")
 
 
 def _copy_bootstrap_value(
@@ -208,7 +238,7 @@ class _BootstrapCaptureBuffer:
             raise TypeError("start_worker_on_capture must be an exact bool")
         self._queue: queue.Queue[_BootstrapCapture] = queue.Queue(queue_capacity)
         self._overflow: deque[_BootstrapCapture] = deque()
-        self._capture_lock = threading.Lock()
+        self._capture_lock = threading.RLock()
         self._worker_lock = threading.Lock()
         self._wake = threading.Event()
         self._next_capture_seq = 1
@@ -231,19 +261,15 @@ class _BootstrapCaptureBuffer:
 
     def capture(self, hook: str, kwargs: dict[str, Any]) -> None:
         with self._capture_lock:
-            capture_seq = self._next_capture_seq
-            self._next_capture_seq += 1
-            self._health = replace(
-                self._health,
-                pending_records=self._health.pending_records + 1,
-            )
-            if kwargs.get("telemetry_schema_version") != "hermes.observer.v1":
-                self._record_gap_locked(
-                    capture_seq,
-                    "invalid_source_schema",
-                )
-            else:
-                try:
+            reservation = self._reserve_locked()
+            capture_seq = reservation.capture_seq
+            try:
+                if kwargs.get("telemetry_schema_version") != "hermes.observer.v1":
+                    self._record_gap_locked(
+                        capture_seq,
+                        "invalid_source_schema",
+                    )
+                else:
                     stats = _BootstrapCopyStats()
                     detached: dict[str, object] = {}
                     item_count = len(kwargs)
@@ -270,26 +296,155 @@ class _BootstrapCaptureBuffer:
                         self._queue.put_nowait(capture)
                     except queue.Full:
                         self._record_gap_locked(capture_seq, "queue_full")
-                except Exception:
-                    self._record_gap_locked(capture_seq, "callback_internal")
-        self._notify_worker()
+                    except BaseException:
+                        self._record_gap_locked(capture_seq, "callback_internal")
+            except BaseException:
+                self._record_gap_locked(capture_seq, "callback_internal")
+        self._defer_or_notify_worker()
 
-    def record_dispatch_failure(self) -> None:
-        """Reserve one exact gap when dispatch fails before capture begins."""
+    def _reserve_locked(self) -> _DispatchReservation:
+        attempt = _active_dispatch_attempt()
+        if attempt is not None and attempt.reservation is not None:
+            raise RuntimeError("one Hermes callback may reserve only one capture")
+        capture_seq = self._next_capture_seq
+        updated_health = replace(
+            self._health,
+            pending_records=self._health.pending_records + 1,
+        )
+        self._next_capture_seq = capture_seq + 1
+        self._health = updated_health
+        reservation = _DispatchReservation(self, capture_seq)
+        if attempt is not None:
+            attempt.reservation = reservation
+            attempt.notify_buffer = self
+        return reservation
+
+    def record_dispatch_failure(
+        self,
+        reservation: _DispatchReservation | None = None,
+    ) -> None:
+        """Retain one exact gap, reusing this callback's reservation if present."""
 
         try:
             with self._capture_lock:
-                capture_seq = self._next_capture_seq
-                self._next_capture_seq += 1
-                self._health = replace(
-                    self._health,
-                    pending_records=self._health.pending_records + 1,
+                if reservation is None:
+                    reservation = self._reserve_locked()
+                elif reservation.buffer is not self:
+                    raise RuntimeError("dispatch reservation belongs to another buffer")
+                self._record_gap_locked(
+                    reservation.capture_seq,
+                    "callback_internal",
                 )
-                self._record_gap_locked(capture_seq, "callback_internal")
         except BaseException as error:
             self.mark_worker_degraded(error)
             return
+        self._defer_or_notify_worker()
+
+    def _defer_or_notify_worker(self) -> None:
+        attempt = _active_dispatch_attempt()
+        if (
+            attempt is not None
+            and attempt.reservation is not None
+            and attempt.reservation.buffer is self
+        ):
+            attempt.notify_buffer = self
+            return
         self._notify_worker()
+
+    def _replace_pending_with_gap_locked(
+        self,
+        gap: _BootstrapCapture,
+    ) -> str:
+        """Return ``replaced``, ``gap``, or ``missing`` for one reserved sequence."""
+
+        capture_seq = gap.capture_seq
+
+        def replacement_state(existing: _BootstrapCapture) -> str | None:
+            if not existing.capture_seq <= capture_seq <= existing.last_capture_seq:
+                return None
+            if existing.is_gap:
+                return "gap"
+            if (
+                existing.capture_seq != capture_seq
+                or existing.last_capture_seq != capture_seq
+            ):
+                raise RuntimeError("observation capture range is not singular")
+            return "replaced"
+
+        for attribute in ("_worker_retained", "_queue_head"):
+            existing = getattr(self, attribute)
+            if existing is None:
+                continue
+            state = replacement_state(existing)
+            if state == "replaced":
+                setattr(self, attribute, gap)
+                return state
+            if state == "gap":
+                return state
+
+        with self._queue.mutex:
+            for index, existing in enumerate(self._queue.queue):
+                state = replacement_state(existing)
+                if state == "replaced":
+                    self._queue.queue[index] = gap
+                    return state
+                if state == "gap":
+                    return state
+
+        for existing in self._overflow:
+            state = replacement_state(existing)
+            if state is not None:
+                return state
+        return "missing"
+
+    def _retain_new_gap_locked(self, gap: _BootstrapCapture) -> int:
+        """Retain a new gap and return its contribution to gap-range count."""
+
+        try:
+            self._queue.put_nowait(gap)
+            return 1
+        except BaseException:
+            if self._replace_pending_with_gap_locked(gap) == "gap":
+                # A hostile put implementation may insert and then raise.
+                return 1
+        if (
+            self._overflow
+            and self._overflow[-1].last_capture_seq + 1 == gap.capture_seq
+        ):
+            previous = self._overflow[-1]
+            causes = dict(previous.gap_cause_counts or {})
+            for cause, count in (gap.gap_cause_counts or {}).items():
+                causes[cause] = causes.get(cause, 0) + count
+            self._overflow[-1] = replace(
+                previous,
+                last_capture_seq=gap.last_capture_seq,
+                gap_cause_counts=MappingProxyType(causes),
+            )
+            return 0
+        self._overflow.append(gap)
+        return 1
+
+    def _record_gap_locked(self, capture_seq: int, cause: str) -> None:
+        gap = _BootstrapCapture(
+            capture_seq=capture_seq,
+            last_capture_seq=capture_seq,
+            hook=None,
+            detached_kwargs=None,
+            copy_stats=MappingProxyType({}),
+            gap_cause_counts=MappingProxyType({cause: 1}),
+        )
+        pending_state = self._replace_pending_with_gap_locked(gap)
+        if pending_state == "gap":
+            return
+        range_delta = (
+            1 if pending_state == "replaced" else self._retain_new_gap_locked(gap)
+        )
+        self._health = replace(
+            self._health,
+            trace_complete=False,
+            dropped_events=self._health.dropped_events + 1,
+            pending_gap_ranges=self._health.pending_gap_ranges + range_delta,
+        )
 
     def _notify_worker(self) -> None:
         try:
@@ -298,48 +453,6 @@ class _BootstrapCaptureBuffer:
             self.mark_worker_degraded(error)
         if self._start_worker_on_capture:
             self._start_worker()
-
-    def _record_gap_locked(self, capture_seq: int, cause: str) -> None:
-        self._health = replace(
-            self._health,
-            trace_complete=False,
-            dropped_events=self._health.dropped_events + 1,
-        )
-        capture = _BootstrapCapture(
-            capture_seq=capture_seq,
-            last_capture_seq=capture_seq,
-            hook=None,
-            detached_kwargs=None,
-            copy_stats=MappingProxyType({}),
-            gap_cause_counts=MappingProxyType({cause: 1}),
-        )
-        try:
-            self._queue.put_nowait(capture)
-            self._health = replace(
-                self._health,
-                pending_gap_ranges=self._health.pending_gap_ranges + 1,
-            )
-            return
-        except queue.Full:
-            pass
-        if (
-            self._overflow
-            and self._overflow[-1].last_capture_seq + 1 == capture_seq
-        ):
-            previous = self._overflow[-1]
-            causes = dict(previous.gap_cause_counts or {})
-            causes[cause] = causes.get(cause, 0) + 1
-            self._overflow[-1] = replace(
-                previous,
-                last_capture_seq=capture_seq,
-                gap_cause_counts=MappingProxyType(causes),
-            )
-        else:
-            self._overflow.append(capture)
-            self._health = replace(
-                self._health,
-                pending_gap_ranges=self._health.pending_gap_ranges + 1,
-            )
 
     def _start_worker(self) -> None:
         with self._worker_lock:
@@ -356,13 +469,10 @@ class _BootstrapCaptureBuffer:
                 worker.start()
             except BaseException as error:
                 self._worker = None
-                self._health = replace(
-                    self._health,
-                    degraded=True,
-                    last_error=type(error).__name__[:160],
-                )
+                self.mark_worker_degraded(error)
                 return
-            self._health = replace(self._health, worker_started=True)
+            with self._capture_lock:
+                self._health = replace(self._health, worker_started=True)
 
     def next_for_worker(self) -> _BootstrapCapture | None:
         with self._capture_lock:
@@ -396,16 +506,79 @@ class _BootstrapCaptureBuffer:
                 self._health,
                 pending_records=self._health.pending_records - capture.capture_count,
                 pending_gap_ranges=pending_gaps,
-                degraded=False,
-                last_error=None,
+                degraded=self._health.registration_failures > 0,
+                last_error=self._health.registration_error,
+                worker_error=None,
             )
 
     def mark_worker_degraded(self, error: BaseException) -> None:
-        self._health = replace(
-            self._health,
-            degraded=True,
-            last_error=type(error).__name__[:160],
-        )
+        error_name = type(error).__name__[:160]
+        with self._capture_lock:
+            self._health = replace(
+                self._health,
+                degraded=True,
+                last_error=error_name,
+                worker_error=error_name,
+            )
+
+    def record_registration_success(self) -> None:
+        """Record one complete context without erasing earlier partial installs."""
+
+        with self._capture_lock:
+            attempts = self._health.registration_attempts + 1
+            if self._health.registration_failures:
+                self._health = replace(
+                    self._health,
+                    registration_attempts=attempts,
+                )
+                return
+            self._health = replace(
+                self._health,
+                registration_attempts=attempts,
+                registration_complete=True,
+                registered_hook_count=len(APPROVED_HOOKS),
+                missing_hooks=(),
+                registration_error=None,
+            )
+
+    def record_registration_failure(
+        self,
+        registered_hook_count: int,
+        error: BaseException,
+    ) -> None:
+        """Persist bounded append-only hook coverage; this is not a trace gap."""
+
+        if not 0 <= registered_hook_count <= len(APPROVED_HOOKS):
+            raise ValueError("registered hook count is outside the approved range")
+        error_name = type(error).__name__[:160]
+        current_missing = APPROVED_HOOKS[registered_hook_count:]
+        with self._capture_lock:
+            health = self._health
+            if health.registration_failures:
+                confirmed_count = min(
+                    health.registered_hook_count,
+                    registered_hook_count,
+                )
+                missing_set = set(health.missing_hooks)
+                missing_set.update(current_missing)
+                missing_hooks = tuple(
+                    hook for hook in APPROVED_HOOKS if hook in missing_set
+                )
+            else:
+                confirmed_count = registered_hook_count
+                missing_hooks = current_missing
+            self._health = replace(
+                health,
+                trace_complete=False,
+                degraded=True,
+                last_error=health.worker_error or error_name,
+                registration_attempts=health.registration_attempts + 1,
+                registration_failures=health.registration_failures + 1,
+                registration_complete=False,
+                registered_hook_count=confirmed_count,
+                missing_hooks=missing_hooks,
+                registration_error=error_name,
+            )
 
     def wait(self, timeout: float) -> None:
         self._wake.wait(timeout)
@@ -483,18 +656,46 @@ def _lazy_dispatch(hook: str, kwargs: dict[str, Any]) -> str | None:
 
 
 def _safe_dispatch(hook: str, kwargs: dict[str, Any]) -> str | None:
+    missing = object()
+    previous = getattr(_DISPATCH_STATE, "attempt", missing)
+    attempt = _DispatchAttempt()
+    _DISPATCH_STATE.attempt = attempt
+    dispatch_buffer = _BOOTSTRAP
+    lock_acquired = False
     try:
+        dispatch_buffer._capture_lock.acquire()
+        lock_acquired = True
         return _lazy_dispatch(hook, kwargs)
     except BaseException:
         # Registered callbacks are observers and must never interrupt Hermes.
+        reservation = attempt.reservation
+        buffer = reservation.buffer if reservation is not None else _BOOTSTRAP
         try:
-            _BOOTSTRAP.record_dispatch_failure()
+            buffer.record_dispatch_failure(reservation)
             if hook == "pre_llm_call":
-                context = _BOOTSTRAP.read_context()
+                context = buffer.read_context()
                 return context if type(context) is str and context else None
         except BaseException:
             pass
         return None
+    finally:
+        if previous is missing:
+            with suppress(AttributeError):
+                del _DISPATCH_STATE.attempt
+        else:
+            _DISPATCH_STATE.attempt = previous
+        if lock_acquired:
+            dispatch_buffer._capture_lock.release()
+        notify_buffer = attempt.notify_buffer
+        if notify_buffer is not None:
+            if isinstance(previous, _DispatchAttempt):
+                previous.notify_buffer = notify_buffer
+            else:
+                try:
+                    notify_buffer._notify_worker()
+                except BaseException as error:
+                    with suppress(BaseException):
+                        notify_buffer.mark_worker_degraded(error)
 
 
 def on_session_start(**kwargs: Any) -> None:
@@ -718,9 +919,11 @@ def register(ctx: Any) -> None:
             raise RuntimeError("Hermes plugin context lacks registration callables")
 
         setattr(ctx, _REGISTRATION_STATE_ATTRIBUTE, "registering")
+        registered_hook_count = 0
         try:
             for hook_name in APPROVED_HOOKS:
                 register_hook(hook_name, HOOK_CALLBACKS[hook_name])
+                registered_hook_count += 1
             register_cli_command(
                 name="alice-brain",
                 help="Inspect and control the Alice-brain-Hermes runtime",
@@ -730,8 +933,18 @@ def register(ctx: Any) -> None:
             )
             setattr(ctx, _REGISTRATION_STATE_ATTRIBUTE, "registered")
         except BaseException as registration_error:
+            # Coverage diagnostics must not mask the host registration error.
+            with suppress(BaseException):
+                _BOOTSTRAP.record_registration_failure(
+                    registered_hook_count,
+                    registration_error,
+                )
             try:
                 setattr(ctx, _REGISTRATION_STATE_ATTRIBUTE, "failed")
             except BaseException as state_error:
                 raise registration_error from state_error
             raise
+        else:
+            # Registration remains valid even if health sampling is unavailable.
+            with suppress(BaseException):
+                _BOOTSTRAP.record_registration_success()

@@ -270,9 +270,7 @@ def test_callbacks_are_named_sync_immutable_and_have_exact_return_contract(
             assert signature.return_annotation in {None, "None"}
             assert callback(payload=hostile) is None
 
-    assert [hook for hook, _kwargs in dispatched] == list(
-        registration.APPROVED_HOOKS
-    )
+    assert [hook for hook, _kwargs in dispatched] == list(registration.APPROVED_HOOKS)
 
     with pytest.raises(TypeError):
         registration.HOOK_CALLBACKS["extra"] = lambda **_kwargs: None  # type: ignore[index]
@@ -540,8 +538,9 @@ def test_register_does_not_touch_io_provider_or_threads() -> None:
     assert result["operations"] == []
 
 
-def test_first_callback_only_starts_worker_without_operational_import_or_entropy(
-) -> None:
+def test_first_callback_only_starts_worker_without_operational_import_or_entropy() -> (
+    None
+):
     result = _run_first_callback_purity_probe()
 
     assert result == {
@@ -567,12 +566,15 @@ def test_bootstrap_shape_failure_reserves_exact_callback_internal_gap(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("shape")),
     )
 
-    assert registration.on_session_start(
-        telemetry_schema_version="hermes.observer.v1",
-        session_id="session",
-        model="model",
-        platform="cli",
-    ) is None
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+            model="model",
+            platform="cli",
+        )
+        is None
+    )
 
     (capture,) = bootstrap.pending_for_test()
     assert capture.capture_seq == 1
@@ -581,6 +583,388 @@ def test_bootstrap_shape_failure_reserves_exact_callback_internal_gap(
     assert health.trace_complete is False
     assert health.dropped_events == 1
     assert health.pending_records == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("copy failed"), KeyboardInterrupt(), MemoryError()],
+    ids=["exception", "keyboard-interrupt", "memory-error"],
+)
+def test_post_reservation_copy_failure_retains_one_gap_at_the_reserved_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+
+    def fail_copy(*_args: object, **_kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(registration, "_copy_bootstrap_value", fail_copy)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    (retained,) = bootstrap.pending_for_test()
+    assert (retained.capture_seq, retained.last_capture_seq) == (1, 1)
+    assert retained.gap_cause == "callback_internal"
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.pending_records == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "after_insert"),
+    [
+        (RuntimeError("put failed"), False),
+        (KeyboardInterrupt(), False),
+        (MemoryError(), False),
+        (RuntimeError("put failed after insert"), True),
+        (KeyboardInterrupt(), True),
+        (MemoryError(), True),
+    ],
+    ids=[
+        "exception-before-insert",
+        "keyboard-interrupt-before-insert",
+        "memory-error-before-insert",
+        "exception-after-insert",
+        "keyboard-interrupt-after-insert",
+        "memory-error-after-insert",
+    ],
+)
+def test_post_reservation_queue_failure_replaces_the_same_sequence_with_a_gap(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+    after_insert: bool,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    original_put = bootstrap._queue.put_nowait  # type: ignore[attr-defined]
+    calls = 0
+
+    def fail_put(item: object) -> None:
+        nonlocal calls
+        calls += 1
+        if after_insert and calls == 1:
+            original_put(item)
+        raise failure
+
+    monkeypatch.setattr(bootstrap._queue, "put_nowait", fail_put)  # type: ignore[attr-defined]
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    (retained,) = bootstrap.pending_for_test()
+    assert (retained.capture_seq, retained.last_capture_seq) == (1, 1)
+    assert retained.gap_cause == "callback_internal"
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.pending_records == 1
+    assert bootstrap.health.pending_gap_ranges == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("after reservation"), KeyboardInterrupt(), MemoryError()],
+    ids=["exception", "keyboard-interrupt", "memory-error"],
+)
+def test_lazy_dispatch_failure_after_capture_converts_that_reservation_only(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+
+    def capture_then_fail(hook: str, kwargs: dict[str, object]) -> str | None:
+        bootstrap.capture(hook, kwargs)
+        raise failure
+
+    monkeypatch.setattr(registration, "_lazy_dispatch", capture_then_fail)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    (retained,) = bootstrap.pending_for_test()
+    assert (retained.capture_seq, retained.last_capture_seq) == (1, 1)
+    assert retained.gap_cause == "callback_internal"
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.pending_records == 1
+
+    bootstrap.capture(
+        "on_session_end",
+        {
+            "telemetry_schema_version": "hermes.observer.v1",
+            "session_id": "next-callback",
+        },
+    )
+    first, second = bootstrap.pending_for_test()
+    assert first is retained
+    assert second.capture_seq == 2
+    assert second.gap_cause is None
+
+
+def test_worker_cannot_observe_a_reservation_before_its_callback_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    observation_staged = threading.Event()
+    release_callback = threading.Event()
+    worker_finished = threading.Event()
+    worker_result: list[object] = []
+
+    def capture_then_fail(hook: str, kwargs: dict[str, object]) -> str | None:
+        bootstrap.capture(hook, kwargs)
+        observation_staged.set()
+        assert release_callback.wait(2)
+        raise RuntimeError("post-capture failure")
+
+    monkeypatch.setattr(registration, "_lazy_dispatch", capture_then_fail)
+
+    callback = threading.Thread(
+        target=registration.on_session_start,
+        kwargs={
+            "telemetry_schema_version": "hermes.observer.v1",
+            "session_id": "session",
+        },
+    )
+
+    def read_for_worker() -> None:
+        worker_result.append(bootstrap.next_for_worker())
+        worker_finished.set()
+
+    worker = threading.Thread(target=read_for_worker)
+    callback.start()
+    assert observation_staged.wait(2)
+    worker.start()
+    assert worker_finished.wait(0.2) is False
+    release_callback.set()
+    callback.join(2)
+    worker.join(2)
+
+    assert not callback.is_alive()
+    assert not worker.is_alive()
+    (retained,) = worker_result
+    assert retained is not None
+    assert retained.capture_seq == 1
+    assert retained.gap_cause == "callback_internal"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("cache failed"), KeyboardInterrupt(), MemoryError()],
+    ids=["exception", "keyboard-interrupt", "memory-error"],
+)
+def test_pre_llm_cache_failure_converts_its_existing_reservation_to_one_gap(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+
+    def fail_read() -> str | None:
+        raise failure
+
+    monkeypatch.setattr(bootstrap, "read_context", fail_read)
+
+    assert (
+        registration.pre_llm_call(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    (retained,) = bootstrap.pending_for_test()
+    assert (retained.capture_seq, retained.last_capture_seq) == (1, 1)
+    assert retained.gap_cause == "callback_internal"
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.pending_records == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("notify failed"), KeyboardInterrupt(), MemoryError()],
+    ids=["exception", "keyboard-interrupt", "memory-error"],
+)
+def test_worker_notification_failure_never_escapes_the_public_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+
+    def fail_notification() -> None:
+        raise failure
+
+    monkeypatch.setattr(bootstrap, "_notify_worker", fail_notification)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    (retained,) = bootstrap.pending_for_test()
+    assert retained.capture_seq == 1
+    assert retained.gap_cause is None
+    assert bootstrap.health.degraded is True
+    assert bootstrap.health.last_error == type(failure).__name__
+
+
+def test_worker_degradation_and_capture_gap_health_updates_cannot_overwrite_each_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    original_replace = registration.replace
+    degradation_snapshot_taken = threading.Event()
+    release_degradation = threading.Event()
+    capture_finished = threading.Event()
+
+    def pause_degradation(instance: object, **changes: object) -> object:
+        if changes.get("degraded") is True and "last_error" in changes:
+            degradation_snapshot_taken.set()
+            assert release_degradation.wait(2)
+        return original_replace(instance, **changes)
+
+    monkeypatch.setattr(registration, "replace", pause_degradation)
+    degradation = threading.Thread(
+        target=bootstrap.mark_worker_degraded,
+        args=(RuntimeError("worker"),),
+    )
+
+    def capture_gap() -> None:
+        bootstrap.capture(
+            "on_session_start",
+            {"telemetry_schema_version": "invalid"},
+        )
+        capture_finished.set()
+
+    capture = threading.Thread(target=capture_gap)
+    degradation.start()
+    assert degradation_snapshot_taken.wait(2)
+    capture.start()
+    capture_finished.wait(0.2)
+    release_degradation.set()
+    degradation.join(2)
+    capture.join(2)
+
+    assert not degradation.is_alive()
+    assert not capture.is_alive()
+    assert bootstrap.health.degraded is True
+    assert bootstrap.health.last_error == "RuntimeError"
+    assert bootstrap.health.trace_complete is False
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.pending_records == 1
+
+
+def test_worker_start_failure_and_capture_gap_use_the_same_health_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    original_replace = registration.replace
+    real_thread = threading.Thread
+    degradation_snapshot_taken = threading.Event()
+    release_degradation = threading.Event()
+    capture_finished = threading.Event()
+
+    def pause_degradation(instance: object, **changes: object) -> object:
+        if changes.get("degraded") is True and "last_error" in changes:
+            degradation_snapshot_taken.set()
+            assert release_degradation.wait(2)
+        return original_replace(instance, **changes)
+
+    class FailedWorker:
+        def start(self) -> None:
+            raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(registration, "replace", pause_degradation)
+    monkeypatch.setattr(
+        registration.threading,
+        "Thread",
+        lambda **_kwargs: FailedWorker(),
+    )
+    starter = real_thread(target=bootstrap._start_worker)  # type: ignore[attr-defined]
+
+    def capture_gap() -> None:
+        bootstrap.capture(
+            "on_session_start",
+            {"telemetry_schema_version": "invalid"},
+        )
+        capture_finished.set()
+
+    capture = real_thread(target=capture_gap)
+    starter.start()
+    assert degradation_snapshot_taken.wait(2)
+    capture.start()
+    capture_finished.wait(0.2)
+    release_degradation.set()
+    starter.join(2)
+    capture.join(2)
+
+    assert not starter.is_alive()
+    assert not capture.is_alive()
+    assert bootstrap.health.worker_started is False
+    assert bootstrap.health.degraded is True
+    assert bootstrap.health.last_error == "RuntimeError"
+    assert bootstrap.health.trace_complete is False
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.pending_records == 1
 
 
 def test_bootstrap_copy_cost_is_bounded_for_hostile_nested_values(
@@ -601,17 +985,20 @@ def test_bootstrap_copy_cost_is_bounded_for_hostile_nested_values(
 
     tracemalloc.start()
     started = time.perf_counter()
-    assert registration.pre_tool_call(
-        telemetry_schema_version="hermes.observer.v1",
-        tool_name="terminal",
-        args=huge_mapping,
-        task_id="task",
-        session_id="session",
-        tool_call_id="tool",
-        turn_id="turn",
-        api_request_id="request",
-        middleware_trace=[],
-    ) is None
+    assert (
+        registration.pre_tool_call(
+            telemetry_schema_version="hermes.observer.v1",
+            tool_name="terminal",
+            args=huge_mapping,
+            task_id="task",
+            session_id="session",
+            tool_call_id="tool",
+            turn_id="turn",
+            api_request_id="request",
+            middleware_trace=[],
+        )
+        is None
+    )
     elapsed = time.perf_counter() - started
     _current, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
@@ -778,6 +1165,148 @@ def test_partial_registration_failure_poisons_only_that_context(
 
     assert (context.hooks, context.cli_calls, context.hook_attempts) == snapshot
     assert context._alice_brain_hermes_registration_v1 == "failed"
+
+
+def test_partial_registration_failure_reports_bounded_hook_coverage_without_a_fake_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.18.2")
+    context = EighthHookFailureContext()
+
+    with pytest.raises(ValueError, match="eighth hook"):
+        registration.register(context)
+
+    health = bootstrap.health
+    assert health.registration_attempts == 1
+    assert health.registration_failures == 1
+    assert health.registration_complete is False
+    assert health.registered_hook_count == 7
+    assert health.missing_hooks == registration.APPROVED_HOOKS[7:]
+    assert health.degraded is True
+    assert health.trace_complete is False
+    assert health.dropped_events == 0
+    assert health.pending_records == 0
+    assert bootstrap.pending_for_test() == ()
+
+    with pytest.raises(RuntimeError, match="previously failed"):
+        registration.register(context)
+    assert bootstrap.health == health
+
+    first_active_callback = context.hooks[0][1]
+    assert callable(first_active_callback)
+    assert (
+        first_active_callback(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="still-active",
+        )
+        is None
+    )
+    (retained,) = bootstrap.pending_for_test()
+    assert retained.hook == registration.APPROVED_HOOKS[0]
+    assert retained.gap_cause is None
+    assert bootstrap.health.registration_complete is False
+    assert bootstrap.health.trace_complete is False
+    assert bootstrap.health.degraded is True
+    assert bootstrap.health.dropped_events == 0
+
+    retained_for_worker = bootstrap.next_for_worker()
+    assert retained_for_worker is retained
+    bootstrap.mark_handed_off(retained)
+    assert bootstrap.health.registration_complete is False
+    assert bootstrap.health.trace_complete is False
+    assert bootstrap.health.degraded is True
+    assert bootstrap.health.last_error == "ValueError"
+
+
+def test_first_hook_registration_failure_reports_zero_confirmed_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.18.2")
+
+    class FirstHookFailureContext(RecordingContext):
+        def register_hook(self, hook_name: str, callback: object) -> None:
+            raise RuntimeError("first hook rejected")
+
+    with pytest.raises(RuntimeError, match="first hook"):
+        registration.register(FirstHookFailureContext())
+
+    assert bootstrap.health.registration_complete is False
+    assert bootstrap.health.registered_hook_count == 0
+    assert bootstrap.health.missing_hooks == registration.APPROVED_HOOKS
+    assert bootstrap.health.dropped_events == 0
+    assert bootstrap.pending_for_test() == ()
+
+
+def test_complete_registration_reports_all_hook_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.18.2")
+    context = RecordingContext()
+
+    registration.register(context)
+
+    health = bootstrap.health
+    assert health.registration_attempts == 1
+    assert health.registration_failures == 0
+    assert health.registration_complete is True
+    assert health.registered_hook_count == len(registration.APPROVED_HOOKS)
+    assert health.missing_hooks == ()
+    assert health.degraded is False
+    assert health.trace_complete is True
+    assert health.dropped_events == 0
+    assert bootstrap.pending_for_test() == ()
+
+    registration.register(context)
+    assert bootstrap.health == health
+
+
+def test_later_complete_context_does_not_erase_append_only_partial_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.18.2")
+    partial = EighthHookFailureContext()
+    with pytest.raises(ValueError, match="eighth hook"):
+        registration.register(partial)
+
+    registration.register(RecordingContext())
+
+    health = bootstrap.health
+    assert health.registration_attempts == 2
+    assert health.registration_failures == 1
+    assert health.registration_complete is False
+    assert health.registered_hook_count == 7
+    assert health.missing_hooks == registration.APPROVED_HOOKS[7:]
+    assert health.degraded is True
+    assert health.trace_complete is False
+    assert health.dropped_events == 0
 
 
 def test_fresh_context_registers_after_previous_context_failed(
