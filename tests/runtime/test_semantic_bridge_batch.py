@@ -248,6 +248,200 @@ def test_overlong_host_error_type_commits_raw_plus_gap_and_retries_exactly(
         assert action.receipt is None
 
 
+@pytest.mark.parametrize(
+    ("status", "error_type", "reason"),
+    [
+        pytest.param(
+            "unexpected",
+            None,
+            "unknown_post_tool_status",
+            id="unknown-status",
+        ),
+        pytest.param(
+            "ok",
+            "ImpossibleOkError",
+            "ok_with_error_type",
+            id="ok-with-error-type",
+        ),
+        pytest.param(
+            "timeout",
+            "thread_missing_result",
+            "misattributed_thread_missing_result",
+            id="timeout-reserved-error-type",
+        ),
+        pytest.param(
+            "cancelled",
+            "thread_missing_result",
+            "misattributed_thread_missing_result",
+            id="cancelled-reserved-error-type",
+        ),
+        pytest.param(
+            "blocked",
+            "thread_missing_result",
+            "misattributed_thread_missing_result",
+            id="blocked-reserved-error-type",
+        ),
+        pytest.param(
+            "error",
+            {"kind": "ExternalError"},
+            "invalid_post_tool_error_type",
+            id="non-string-error-type",
+        ),
+        pytest.param(
+            "error",
+            "   ",
+            "invalid_post_tool_error_type",
+            id="blank-error-type",
+        ),
+        pytest.param(
+            "error",
+            "X" * 161,
+            "invalid_post_tool_error_type",
+            id="overlong-error-type",
+        ),
+    ],
+)
+def test_matched_terminal_mapper_gap_closes_span_without_later_action_claims(
+    tmp_path: Path,
+    status: str,
+    error_type: object,
+    reason: str,
+) -> None:
+    from alice_brain_hermes.runtime.engine import ConsciousEngine
+    from alice_brain_hermes.runtime.store import SQLiteLedger
+
+    ledger, engine, instance = make_engine(tmp_path)
+    database = ledger.path
+    brain_id = engine.brain_id
+    invalid_record = tool_observation(
+        instance,
+        2,
+        hook="post_tool_call",
+        status=status,
+        error_type=error_type,
+    )
+    later_record = tool_observation(
+        instance,
+        3,
+        hook="post_tool_call",
+        status="ok",
+    )
+    with ledger:
+        engine.commit_bridge_record(
+            instance,
+            tool_observation(instance, 1, hook="pre_tool_call"),
+        )
+
+        accepted = engine.commit_bridge_record(instance, invalid_record)
+        duplicate = engine.commit_bridge_record(instance, invalid_record)
+
+        assert duplicate.canonical_json() == accepted.canonical_json()
+        assert accepted.semantic_status == "gap"
+        assert accepted.derived_event_count == 1
+        assert ledger.list_events(brain_id)[-1].payload["reason"] == reason
+        [closed_capture_seq] = ledger._connection.execute(
+            "SELECT closed_capture_seq FROM hermes_span"
+        ).fetchone()
+        assert closed_capture_seq == 2
+        [action] = engine.state.action_records
+        assert action.phase is ActionPhase.PREPARED
+        assert ActionPhase.DISPATCHED not in action.phase_history
+        assert ActionPhase.RECEIPT not in action.phase_history
+        assert action.execution_confirmed is None
+        assert action.outcome is None
+        assert action.effect_confirmed is None
+        assert action.receipt is None
+        assert action.receipt_history == ()
+        snapshot = ledger.observability_snapshot(brain_id)
+        assert snapshot.semantic_records == 2
+        assert snapshot.semantic_gap_records == 1
+        assert snapshot.trace_complete is False
+        assert snapshot.semantic_complete is False
+        before_conflict = (
+            engine.state,
+            tuple(ledger.list_events(brain_id)),
+            ledger.bridge_stream_state(instance),
+            snapshot,
+            tuple(ledger._connection.execute("SELECT * FROM hermes_span").fetchall()),
+        )
+
+        changed_values = invalid_record.model_dump(mode="python")
+        changed_values["payload"]["result"] = {"body_conflict": True}
+        with pytest.raises(IdempotencyConflictError):
+            engine.commit_bridge_record(
+                instance,
+                validate_observation(changed_values),
+            )
+        assert (
+            engine.state,
+            tuple(ledger.list_events(brain_id)),
+            ledger.bridge_stream_state(instance),
+            ledger.observability_snapshot(brain_id),
+            tuple(ledger._connection.execute("SELECT * FROM hermes_span").fetchall()),
+        ) == before_conflict
+
+    with SQLiteLedger.open(database) as reopened:
+        restarted = ConsciousEngine(reopened, brain_id, actor_id=brain_id)
+        duplicate_after_restart = restarted.commit_bridge_record(
+            instance, invalid_record
+        )
+        late = restarted.commit_bridge_record(instance, later_record)
+        late_duplicate = restarted.commit_bridge_record(instance, later_record)
+
+        assert duplicate_after_restart.canonical_json() == accepted.canonical_json()
+        assert late_duplicate.canonical_json() == late.canonical_json()
+        assert late.semantic_status == "gap"
+        assert late.derived_event_count == 1
+        assert reopened.list_events(brain_id)[-1].payload["reason"] == (
+            "late_action_state_mismatch"
+        )
+        assert reopened.bridge_stream_state(instance).next_capture_seq == 4
+        [closed_capture_seq] = reopened._connection.execute(
+            "SELECT closed_capture_seq FROM hermes_span"
+        ).fetchone()
+        assert closed_capture_seq == 2
+        [action] = restarted.state.action_records
+        assert action.phase is ActionPhase.PREPARED
+        assert ActionPhase.DISPATCHED not in action.phase_history
+        assert ActionPhase.RECEIPT not in action.phase_history
+        assert action.execution_confirmed is None
+        assert action.outcome is None
+        assert action.effect_confirmed is None
+        assert action.receipt is None
+        assert action.receipt_history == ()
+        assert not any(
+            event.event_type in {"action.dispatched", "action.receipt"}
+            for event in reopened.list_events(brain_id)
+        )
+        snapshot = reopened.observability_snapshot(brain_id)
+        assert snapshot.semantic_records == 3
+        assert snapshot.semantic_gap_records == 2
+        assert snapshot.trace_complete is False
+        assert snapshot.semantic_complete is False
+
+    with SQLiteLedger.open(database) as reopened_again:
+        restarted_again = ConsciousEngine(
+            reopened_again,
+            brain_id,
+            actor_id=brain_id,
+        )
+        duplicate_after_second_restart = restarted_again.commit_bridge_record(
+            instance, later_record
+        )
+
+        assert duplicate_after_second_restart.canonical_json() == late.canonical_json()
+        [action] = restarted_again.state.action_records
+        assert action.phase is ActionPhase.PREPARED
+        assert ActionPhase.DISPATCHED not in action.phase_history
+        assert ActionPhase.RECEIPT not in action.phase_history
+        assert action.outcome is None
+        assert action.effect_confirmed is None
+        [closed_capture_seq] = reopened_again._connection.execute(
+            "SELECT closed_capture_seq FROM hermes_span"
+        ).fetchone()
+        assert closed_capture_seq == 2
+
+
 def test_late_receipt_matches_latest_closed_occurrence_without_redispatch(
     tmp_path: Path,
 ) -> None:
@@ -661,6 +855,58 @@ def test_unmatched_post_tool_commits_raw_plus_semantic_gap(tmp_path: Path) -> No
             "hermes.observer.post_tool_call",
             "semantic.gap",
         ]
+
+
+def test_unmatched_terminal_does_not_close_an_unrelated_open_span(
+    tmp_path: Path,
+) -> None:
+    ledger, engine, instance = make_engine(tmp_path)
+    with ledger:
+        engine.commit_bridge_record(
+            instance,
+            tool_observation(
+                instance,
+                1,
+                hook="pre_tool_call",
+                tool_call_id="expected-tool",
+            ),
+        )
+
+        unmatched = engine.commit_bridge_record(
+            instance,
+            tool_observation(
+                instance,
+                2,
+                hook="post_tool_call",
+                tool_call_id="unrelated-tool",
+            ),
+        )
+
+        assert unmatched.semantic_status == "gap"
+        [span] = ledger._connection.execute(
+            "SELECT external_id, closed_capture_seq FROM hermes_span"
+        ).fetchall()
+        assert tuple(span) == ("expected-tool", None)
+
+        matched = engine.commit_bridge_record(
+            instance,
+            tool_observation(
+                instance,
+                3,
+                hook="post_tool_call",
+                tool_call_id="expected-tool",
+            ),
+        )
+
+        assert matched.semantic_status == "applied"
+        [span] = ledger._connection.execute(
+            "SELECT external_id, closed_capture_seq FROM hermes_span"
+        ).fetchall()
+        assert tuple(span) == ("expected-tool", 3)
+        [action] = engine.state.action_records
+        assert action.phase is ActionPhase.RECEIPT
+        assert action.execution_confirmed is True
+        assert action.outcome is ActionOutcome.SUCCESS
 
 
 def test_lost_ack_retry_returns_exact_ack_without_reapplying_span_or_batch(

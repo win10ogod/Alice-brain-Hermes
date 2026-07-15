@@ -453,6 +453,18 @@ def _post_tool_plan(
     if matched_span.action_id is None:
         raise ValueError("matched tool span is missing its action identity")
     action_id = matched_span.action_id
+
+    def matched_terminal_gap(reason: str) -> SemanticPlan:
+        return _semantic_gap(
+            stream,
+            record,
+            raw_event,
+            reason=reason,
+            span_close=(
+                matched_span if matched_span.closed_capture_seq is None else None
+            ),
+        )
+
     raw_status = record.payload.status
     raw_error_type = record.payload.error_type
     if raw_error_type is not None and (
@@ -460,18 +472,11 @@ def _post_tool_plan(
         or not raw_error_type.strip()
         or len(raw_error_type) > MAX_ACTION_SOURCE_ERROR_TYPE_LENGTH
     ):
-        return _semantic_gap(
-            stream, record, raw_event, reason="invalid_post_tool_error_type"
-        )
+        return matched_terminal_gap("invalid_post_tool_error_type")
     if raw_status == "ok" and raw_error_type is not None:
-        return _semantic_gap(stream, record, raw_event, reason="ok_with_error_type")
+        return matched_terminal_gap("ok_with_error_type")
     if raw_status != "error" and raw_error_type == "thread_missing_result":
-        return _semantic_gap(
-            stream,
-            record,
-            raw_event,
-            reason="misattributed_thread_missing_result",
-        )
+        return matched_terminal_gap("misattributed_thread_missing_result")
     if raw_status == "ok":
         receipt_status, execution, outcome = "success", True, "success"
     elif raw_status == "error" and raw_error_type == "thread_missing_result":
@@ -483,15 +488,13 @@ def _post_tool_plan(
     elif raw_status == "blocked":
         receipt_status, execution, outcome = "blocked", False, None
     else:
-        return _semantic_gap(
-            stream, record, raw_event, reason="unknown_post_tool_status"
-        )
+        return matched_terminal_gap("unknown_post_tool_status")
     result_sha256 = _json_fingerprint(record.payload.result)
     error_type_sha256 = _json_fingerprint(record.payload.error_type)
     error_message_sha256 = _json_fingerprint(record.payload.error_message)
     late = matched_span.closed_capture_seq is not None
     if late and raw_status == "blocked":
-        return _semantic_gap(stream, record, raw_event, reason="late_blocked_status")
+        return matched_terminal_gap("late_blocked_status")
     evidence = {
         "action_id": action_id,
         "duration_ms": record.payload.duration_ms,
