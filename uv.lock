@@ -7,6 +7,7 @@ name = "alice-brain-hermes"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "packaging" },
     { name = "psutil" },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -20,6 +21,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "packaging", specifier = ">=24,<27" },
     { name = "psutil", specifier = ">=7,<8" },
     { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9,<10" },

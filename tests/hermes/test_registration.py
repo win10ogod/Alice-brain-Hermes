@@ -1,0 +1,1005 @@
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import inspect
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import textwrap
+import threading
+import tomllib
+from concurrent.futures import ThreadPoolExecutor
+from email.parser import BytesParser
+from email.policy import compat32
+from importlib import metadata
+from pathlib import Path
+from types import MappingProxyType, ModuleType, SimpleNamespace
+from typing import Any
+from zipfile import ZipFile
+
+import pytest
+import yaml
+from packaging.requirements import Requirement
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+INTEGRATION_ROOT = PROJECT_ROOT / "integration" / "alice-brain"
+ENTRY_POINT_GROUP = "hermes_agent.plugins"
+PLUGIN_NAME = "alice-brain"
+
+
+def _alice_entry_point() -> metadata.EntryPoint:
+    matches = [
+        entry_point
+        for entry_point in metadata.entry_points(group=ENTRY_POINT_GROUP)
+        if entry_point.name == PLUGIN_NAME
+        and entry_point.dist is not None
+        and entry_point.dist.name == "alice-brain-hermes"
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _load_directory_shim() -> ModuleType:
+    init_file = INTEGRATION_ROOT / "__init__.py"
+    module_name = "task5_test_directory_plugin"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        init_file,
+        submodule_search_locations=[str(INTEGRATION_ROOT)],
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+    return module
+
+
+def _manifest() -> dict[str, object]:
+    with (INTEGRATION_ROOT / "plugin.yaml").open(encoding="utf-8") as stream:
+        loaded = yaml.safe_load(stream)
+    assert isinstance(loaded, dict)
+    return loaded
+
+
+def test_pip_entry_point_loads_module_with_sync_register() -> None:
+    entry_point = _alice_entry_point()
+    module = entry_point.load()
+
+    assert isinstance(module, ModuleType)
+    assert module.__name__ == "alice_brain_hermes.hermes_plugin"
+    assert callable(module.register)
+    assert not inspect.iscoroutinefunction(module.register)
+    assert module.__all__ == ["register"]
+
+
+def test_manifest_has_exact_schema_and_dual_hook_lists() -> None:
+    from alice_brain_hermes.hermes.registration import APPROVED_HOOKS
+
+    manifest = _manifest()
+
+    assert manifest == {
+        "manifest_version": 1,
+        "name": "alice-brain",
+        "version": "0.1.0",
+        "description": "Independent Alice-brain-Hermes consciousness runtime plugin",
+        "author": "Alice-brain-Hermes",
+        "kind": "standalone",
+        "hooks": list(APPROVED_HOOKS),
+        "provides_hooks": list(APPROVED_HOOKS),
+    }
+
+
+def test_directory_shim_reexports_the_same_register() -> None:
+    pip_module = _alice_entry_point().load()
+    directory_module = _load_directory_shim()
+
+    assert directory_module.register is pip_module.register
+    assert directory_module.__all__ == ["register"]
+
+
+def test_manifest_and_registered_hook_constant_cannot_drift() -> None:
+    from alice_brain_hermes.hermes.registration import APPROVED_HOOKS
+
+    manifest = _manifest()
+
+    assert tuple(manifest["hooks"]) == APPROVED_HOOKS
+    assert tuple(manifest["provides_hooks"]) == APPROVED_HOOKS
+
+
+class RecordingContext:
+    def __init__(self) -> None:
+        self.hooks: list[tuple[str, object]] = []
+        self.cli_calls: list[dict[str, object]] = []
+
+    @property
+    def llm(self) -> object:
+        raise AssertionError("registration must not access ctx.llm")
+
+    def register_hook(self, hook_name: str, callback: object) -> None:
+        self.hooks.append((hook_name, callback))
+
+    def register_cli_command(self, **kwargs: object) -> None:
+        self.cli_calls.append(kwargs)
+
+
+@pytest.mark.parametrize(
+    ("version", "accepted"),
+    [
+        ("0.17.9", False),
+        ("0.18.0rc1", False),
+        ("0.18.2", True),
+        ("0.19.0", False),
+        (None, False),
+        ("not-a-version", False),
+    ],
+)
+def test_version_gate_accepts_only_018_release_line(
+    version: str | None,
+    accepted: bool,
+) -> None:
+    from alice_brain_hermes.hermes.registration import require_supported_hermes
+
+    if accepted:
+        assert require_supported_hermes(version) == version
+    else:
+        with pytest.raises(RuntimeError, match="Hermes"):
+            require_supported_hermes(version)
+
+
+def test_resolve_version_uses_module_fallback_when_metadata_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    def metadata_absent(distribution: str) -> str:
+        assert distribution == "hermes-agent"
+        raise metadata.PackageNotFoundError(distribution)
+
+    monkeypatch.setattr(registration.metadata, "version", metadata_absent)
+    monkeypatch.setattr(
+        registration,
+        "import_module",
+        lambda name: (
+            SimpleNamespace(__version__="0.18.2") if name == "hermes_cli" else None
+        ),
+    )
+
+    assert registration.resolve_hermes_version() == "0.18.2"
+
+
+def test_resolve_version_rejects_metadata_module_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    monkeypatch.setattr(registration.metadata, "version", lambda _name: "0.18.2")
+    monkeypatch.setattr(
+        registration,
+        "import_module",
+        lambda _name: SimpleNamespace(__version__="0.18.1"),
+    )
+
+    with pytest.raises(RuntimeError, match="mismatch"):
+        registration.resolve_hermes_version()
+
+
+def test_resolve_version_rejects_missing_or_invalid_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    def metadata_absent(distribution: str) -> str:
+        raise metadata.PackageNotFoundError(distribution)
+
+    def module_absent(name: str) -> object:
+        raise ModuleNotFoundError(name=name)
+
+    monkeypatch.setattr(registration.metadata, "version", metadata_absent)
+    monkeypatch.setattr(registration, "import_module", module_absent)
+    with pytest.raises(RuntimeError, match="not installed"):
+        registration.resolve_hermes_version()
+
+    monkeypatch.setattr(
+        registration,
+        "import_module",
+        lambda _name: SimpleNamespace(__version__="invalid"),
+    )
+    with pytest.raises(RuntimeError, match="invalid"):
+        registration.resolve_hermes_version()
+
+
+def test_register_adds_exact_hooks_and_cli_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.18.2")
+    context = RecordingContext()
+
+    registration.register(context)
+
+    assert [name for name, _callback in context.hooks] == list(
+        registration.APPROVED_HOOKS
+    )
+    assert context.cli_calls == [
+        {
+            "name": "alice-brain",
+            "help": "Inspect and control the Alice-brain-Hermes runtime",
+            "setup_fn": registration.setup_alice_brain_cli,
+            "handler_fn": registration.handle_alice_brain_cli,
+            "description": "Alice-brain-Hermes consciousness runtime commands",
+        }
+    ]
+
+
+def test_callbacks_are_named_sync_immutable_and_return_none() -> None:
+    from alice_brain_hermes.hermes import registration
+
+    assert isinstance(registration.HOOK_CALLBACKS, MappingProxyType)
+    assert tuple(registration.HOOK_CALLBACKS) == registration.APPROVED_HOOKS
+
+    hostile = object()
+    for name, callback in registration.HOOK_CALLBACKS.items():
+        signature = inspect.signature(callback)
+        assert callback.__name__ == name
+        assert not inspect.iscoroutinefunction(callback)
+        assert list(signature.parameters) == ["kwargs"]
+        assert signature.parameters["kwargs"].kind is inspect.Parameter.VAR_KEYWORD
+        assert signature.parameters["kwargs"].annotation in {Any, "Any"}
+        assert signature.return_annotation in {None, "None"}
+        assert callback(payload=hostile) is None
+
+    with pytest.raises(TypeError):
+        registration.HOOK_CALLBACKS["extra"] = lambda **_kwargs: None  # type: ignore[index]
+
+
+def test_packaging_is_a_direct_bounded_runtime_dependency() -> None:
+    with (PROJECT_ROOT / "pyproject.toml").open("rb") as stream:
+        dependencies = tomllib.load(stream)["project"]["dependencies"]
+
+    assert "packaging>=24,<27" in dependencies
+
+
+def _run_inert_registration_probe() -> dict[str, Any]:
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import builtins
+        import importlib.metadata
+        import json
+        import socket
+        import sqlite3
+        import subprocess
+        import sys
+        import threading
+        import types
+
+        forbidden_prefixes = (
+            "alice_brain_hermes.runtime",
+            "alice_brain_hermes.protocol",
+            "alice_brain_hermes.hermes.bridge",
+            "alice_brain_hermes.projections",
+        )
+        operations = []
+
+        def forbidden(label):
+            def fail(*args, **kwargs):
+                operations.append(label)
+                raise AssertionError(label)
+            return fail
+
+        real_import = builtins.__import__
+        def guarded_import(name, *args, **kwargs):
+            if name.startswith(forbidden_prefixes):
+                return forbidden("import:" + name)()
+            return real_import(name, *args, **kwargs)
+
+        sqlite3.connect = forbidden("sqlite3.connect")
+        socket.socket = forbidden("socket.socket")
+        socket.create_connection = forbidden("socket.create_connection")
+        subprocess.Popen = forbidden("subprocess.Popen")
+        asyncio.create_task = forbidden("asyncio.create_task")
+        threading.Thread.start = forbidden("thread.start")
+        threading.Thread.join = forbidden("thread.join")
+        builtins.__import__ = guarded_import
+
+        host = types.ModuleType("hermes_cli")
+        host.__version__ = "0.18.2"
+        sys.modules["hermes_cli"] = host
+
+        class Context:
+            def __init__(self):
+                self.hooks = []
+                self.cli = []
+            @property
+            def llm(self):
+                return forbidden("ctx.llm")()
+            def register_hook(self, name, callback):
+                self.hooks.append((name, callback))
+            def register_cli_command(self, **kwargs):
+                self.cli.append(kwargs)
+
+        entry_points = [
+            item
+            for item in importlib.metadata.entry_points(
+                group="hermes_agent.plugins"
+            )
+            if item.name == "alice-brain"
+            and item.dist is not None
+            and item.dist.name == "alice-brain-hermes"
+        ]
+        module = entry_points[0].load()
+        context = Context()
+        module.register(context)
+        result = {
+            "hook_count": len(context.hooks),
+            "cli_count": len(context.cli),
+            "operations": operations,
+            "operational_modules": sorted(
+                name for name in sys.modules
+                if name.startswith(forbidden_prefixes)
+            ),
+        }
+        print(json.dumps(result, sort_keys=True))
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+def test_register_does_not_import_operational_modules() -> None:
+    result = _run_inert_registration_probe()
+
+    assert result["hook_count"] == 16
+    assert result["cli_count"] == 1
+    assert result["operational_modules"] == []
+
+
+def test_register_does_not_touch_io_provider_or_threads() -> None:
+    result = _run_inert_registration_probe()
+
+    assert result["hook_count"] == 16
+    assert result["cli_count"] == 1
+    assert result["operations"] == []
+
+
+def test_same_context_registers_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.18.2")
+    context = RecordingContext()
+    registration.register(context)
+
+    def unexpected_resolution() -> str:
+        raise AssertionError("registered context must return before version resolution")
+
+    monkeypatch.setattr(registration, "resolve_hermes_version", unexpected_resolution)
+    registration.register(context)
+
+    assert len(context.hooks) == 16
+    assert len(context.cli_calls) == 1
+    assert context._alice_brain_hermes_registration_v1 == "registered"
+
+
+def test_concurrent_same_context_registers_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    caller_count = 12
+    barrier = threading.Barrier(caller_count)
+    resolution_count = 0
+    resolution_lock = threading.Lock()
+
+    def resolve() -> str:
+        nonlocal resolution_count
+        with resolution_lock:
+            resolution_count += 1
+        return "0.18.2"
+
+    monkeypatch.setattr(registration, "resolve_hermes_version", resolve)
+    context = RecordingContext()
+
+    def call_register() -> None:
+        barrier.wait()
+        registration.register(context)
+
+    with ThreadPoolExecutor(max_workers=caller_count) as executor:
+        futures = [executor.submit(call_register) for _ in range(caller_count)]
+        for future in futures:
+            future.result()
+
+    assert resolution_count == 1
+    assert [name for name, _callback in context.hooks] == list(
+        registration.APPROVED_HOOKS
+    )
+    assert len(context.cli_calls) == 1
+
+
+def test_reentrant_registration_fails_visibly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.18.2")
+
+    class ReentrantContext(RecordingContext):
+        attempted = False
+
+        def register_hook(self, hook_name: str, callback: object) -> None:
+            if not self.attempted:
+                self.attempted = True
+                registration.register(self)
+            super().register_hook(hook_name, callback)
+
+    context = ReentrantContext()
+    with pytest.raises(RuntimeError, match="re-entrant"):
+        registration.register(context)
+
+    assert context.hooks == []
+    assert context.cli_calls == []
+    assert context._alice_brain_hermes_registration_v1 == "failed"
+
+
+class EighthHookFailureContext(RecordingContext):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hook_attempts = 0
+
+    def register_hook(self, hook_name: str, callback: object) -> None:
+        self.hook_attempts += 1
+        if self.hook_attempts == 8:
+            raise ValueError("eighth hook rejected")
+        super().register_hook(hook_name, callback)
+
+
+def test_partial_registration_failure_poisons_only_that_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.18.2")
+    context = EighthHookFailureContext()
+
+    with pytest.raises(ValueError, match="eighth hook"):
+        registration.register(context)
+    snapshot = (list(context.hooks), list(context.cli_calls), context.hook_attempts)
+
+    with pytest.raises(RuntimeError, match="previously failed"):
+        registration.register(context)
+
+    assert (context.hooks, context.cli_calls, context.hook_attempts) == snapshot
+    assert context._alice_brain_hermes_registration_v1 == "failed"
+
+
+def test_fresh_context_registers_after_previous_context_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.18.2")
+    failed = EighthHookFailureContext()
+    with pytest.raises(ValueError, match="eighth hook"):
+        registration.register(failed)
+
+    fresh = RecordingContext()
+    registration.register(fresh)
+
+    assert len(fresh.hooks) == 16
+    assert len(fresh.cli_calls) == 1
+    assert fresh._alice_brain_hermes_registration_v1 == "registered"
+    assert failed._alice_brain_hermes_registration_v1 == "failed"
+
+
+def test_context_is_validated_before_registration_state_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.18.2")
+    context = SimpleNamespace(register_hook=lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="callables"):
+        registration.register(context)
+
+    assert not hasattr(context, "_alice_brain_hermes_registration_v1")
+
+
+def test_host_version_is_validated_before_registration_state_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.19.0")
+    context = RecordingContext()
+
+    with pytest.raises(RuntimeError, match="unsupported"):
+        registration.register(context)
+
+    assert context.hooks == []
+    assert context.cli_calls == []
+    assert not hasattr(context, "_alice_brain_hermes_registration_v1")
+
+
+def test_final_state_transition_failure_marks_context_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.18.2")
+
+    class FinalTransitionFailureContext(RecordingContext):
+        def __setattr__(self, name: str, value: object) -> None:
+            if name == "_alice_brain_hermes_registration_v1" and value == "registered":
+                raise ValueError("registered transition rejected")
+            super().__setattr__(name, value)
+
+    context = FinalTransitionFailureContext()
+    with pytest.raises(ValueError, match="registered transition"):
+        registration.register(context)
+
+    assert len(context.hooks) == 16
+    assert len(context.cli_calls) == 1
+    assert context._alice_brain_hermes_registration_v1 == "failed"
+
+
+def test_failed_state_transition_does_not_mask_registration_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    monkeypatch.setattr(registration, "resolve_hermes_version", lambda: "0.18.2")
+
+    class FailedTransitionFailureContext(RecordingContext):
+        def __setattr__(self, name: str, value: object) -> None:
+            if name == "_alice_brain_hermes_registration_v1" and value == "failed":
+                raise RuntimeError("failed transition rejected")
+            super().__setattr__(name, value)
+
+        def register_hook(self, hook_name: str, callback: object) -> None:
+            raise ValueError("primary registration failure")
+
+    context = FailedTransitionFailureContext()
+    with pytest.raises(ValueError, match="primary registration failure") as captured:
+        registration.register(context)
+
+    assert isinstance(captured.value.__cause__, RuntimeError)
+    assert str(captured.value.__cause__) == "failed transition rejected"
+
+
+def _real_host_plugins() -> ModuleType:
+    return pytest.importorskip(
+        "hermes_cli.plugins",
+        reason="real Hermes integration requires the local hermes-agent checkout",
+    )
+
+
+def _write_enabled_config(home: Path) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"enabled": ["alice-brain"]}}),
+        encoding="utf-8",
+    )
+
+
+def _assert_real_manager_surface(manager: object, host: ModuleType) -> None:
+    from alice_brain_hermes.hermes.registration import APPROVED_HOOKS
+
+    loaded = manager._plugins["alice-brain"]  # type: ignore[attr-defined]
+    assert loaded.enabled is True
+    assert loaded.error is None
+    assert loaded.hooks_registered == list(APPROVED_HOOKS)
+    assert tuple(manager._hooks) == APPROVED_HOOKS  # type: ignore[attr-defined]
+    assert all(
+        len(manager._hooks[name]) == 1  # type: ignore[attr-defined]
+        for name in APPROVED_HOOKS
+    )
+    assert set(manager._cli_commands) == {"alice-brain"}  # type: ignore[attr-defined]
+    assert manager._cli_commands["alice-brain"] == {  # type: ignore[attr-defined]
+        "name": "alice-brain",
+        "help": "Inspect and control the Alice-brain-Hermes runtime",
+        "setup_fn": loaded.module.register.__globals__["setup_alice_brain_cli"],
+        "handler_fn": loaded.module.register.__globals__["handle_alice_brain_cli"],
+        "description": "Alice-brain-Hermes consciousness runtime commands",
+        "plugin": "alice-brain",
+    }
+    for hook_name in APPROVED_HOOKS:
+        assert manager.invoke_hook(hook_name, payload=object()) == []  # type: ignore[attr-defined]
+    assert host.__name__ == "hermes_cli.plugins"
+
+
+def test_disabled_entrypoint_is_discovered_but_not_imported(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    host = _real_host_plugins()
+    home = tmp_path / "Hermes Home 未啟用"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = host.PluginManager()
+    monkeypatch.setattr(manager, "_scan_directory", lambda *_args, **_kwargs: [])
+    load_attempts: list[str] = []
+
+    def reject_load(manifest: object) -> ModuleType:
+        load_attempts.append(manifest.name)
+        raise AssertionError("disabled entry point was imported")
+
+    monkeypatch.setattr(manager, "_load_entrypoint_module", reject_load)
+    manager.discover_and_load()
+
+    loaded = manager._plugins["alice-brain"]
+    assert loaded.enabled is False
+    assert loaded.module is None
+    assert load_attempts == []
+    assert manager._hooks == {}
+    assert manager._cli_commands == {}
+
+
+def test_enabled_entrypoint_loads_exact_hooks_and_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    host = _real_host_plugins()
+    home = tmp_path / "Hermes Home 入口點"
+    _write_enabled_config(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = host.PluginManager()
+    monkeypatch.setattr(manager, "_scan_directory", lambda *_args, **_kwargs: [])
+    operational_before = set(sys.modules)
+
+    manager.discover_and_load()
+
+    _assert_real_manager_surface(manager, host)
+    operational_after = {
+        name
+        for name in set(sys.modules) - operational_before
+        if name.startswith(
+            (
+                "alice_brain_hermes.runtime",
+                "alice_brain_hermes.protocol",
+                "alice_brain_hermes.hermes.bridge",
+                "alice_brain_hermes.projections",
+            )
+        )
+    }
+    assert operational_after == set()
+
+
+def test_enabled_directory_plugin_loads_exact_hooks_and_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    host = _real_host_plugins()
+    home = tmp_path / "Hermes Home 目錄插件"
+    _write_enabled_config(home)
+    plugin_directory = home / "plugins" / "alice-brain"
+    shutil.copytree(INTEGRATION_ROOT, plugin_directory)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(host, "get_bundled_plugins_dir", lambda: tmp_path / "none")
+    manager = host.PluginManager()
+    monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
+    operational_before = set(sys.modules)
+
+    manager.discover_and_load()
+
+    loaded = manager._plugins["alice-brain"]
+    assert loaded.manifest.source == "user"
+    assert loaded.manifest.provides_hooks == list(
+        __import__(
+            "alice_brain_hermes.hermes.registration",
+            fromlist=["APPROVED_HOOKS"],
+        ).APPROVED_HOOKS
+    )
+    _assert_real_manager_surface(manager, host)
+    operational_after = {
+        name
+        for name in set(sys.modules) - operational_before
+        if name.startswith(
+            (
+                "alice_brain_hermes.runtime",
+                "alice_brain_hermes.protocol",
+                "alice_brain_hermes.hermes.bridge",
+                "alice_brain_hermes.projections",
+            )
+        )
+    }
+    assert operational_after == set()
+
+
+def test_entrypoint_and_directory_paths_are_tested_in_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    host = _real_host_plugins()
+
+    entry_home = tmp_path / "entry-only"
+    _write_enabled_config(entry_home)
+    monkeypatch.setenv("HERMES_HOME", str(entry_home))
+    entry_manager = host.PluginManager()
+    monkeypatch.setattr(
+        entry_manager,
+        "_scan_directory",
+        lambda *_args, **_kwargs: [],
+    )
+    entry_manager.discover_and_load()
+
+    directory_home = tmp_path / "directory-only"
+    _write_enabled_config(directory_home)
+    shutil.copytree(
+        INTEGRATION_ROOT,
+        directory_home / "plugins" / "alice-brain",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(directory_home))
+    monkeypatch.setattr(host, "get_bundled_plugins_dir", lambda: tmp_path / "none")
+    directory_manager = host.PluginManager()
+    monkeypatch.setattr(directory_manager, "_scan_entry_points", lambda: [])
+    directory_manager.discover_and_load()
+
+    assert entry_manager._plugins["alice-brain"].manifest.source == "entrypoint"
+    assert directory_manager._plugins["alice-brain"].manifest.source == "user"
+    _assert_real_manager_surface(entry_manager, host)
+    _assert_real_manager_surface(directory_manager, host)
+
+
+def test_fresh_context_registers_after_force_discovery_clears_manager(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    host = _real_host_plugins()
+    home = tmp_path / "Hermes Home force"
+    _write_enabled_config(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = host.PluginManager()
+    monkeypatch.setattr(manager, "_scan_directory", lambda *_args, **_kwargs: [])
+    manager.discover_and_load()
+    first_callbacks = {
+        name: manager._hooks[name][0]
+        for name in manager._plugins["alice-brain"].hooks_registered
+    }
+
+    manager.discover_and_load(force=True)
+
+    _assert_real_manager_surface(manager, host)
+    assert {
+        name: manager._hooks[name][0]
+        for name in manager._plugins["alice-brain"].hooks_registered
+    } == first_callbacks
+
+
+def _run_real_hermes_cli(
+    tmp_path: Path,
+    *arguments: str,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    pytest.importorskip(
+        "hermes_cli.main",
+        reason="real Hermes CLI requires the local hermes-agent checkout",
+    )
+    home = tmp_path / "Hermes Home CLI 測試"
+    alice_home = tmp_path / "Alice runtime 不應出現"
+    _write_enabled_config(home)
+    environment = os.environ.copy()
+    environment["HERMES_HOME"] = str(home)
+    environment["ALICE_BRAIN_HERMES_HOME"] = str(alice_home)
+    completed = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", *arguments],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return completed, alice_home
+
+
+def test_bare_hermes_help_does_not_need_plugin_discovery(tmp_path: Path) -> None:
+    completed, alice_home = _run_real_hermes_cli(tmp_path, "--help")
+
+    assert completed.returncode == 0
+    assert "alice-brain" not in completed.stdout
+    assert "Traceback" not in completed.stdout + completed.stderr
+    assert not alice_home.exists()
+
+
+def test_enabled_hermes_alice_brain_help_uses_lazy_cli(tmp_path: Path) -> None:
+    help_result, alice_home = _run_real_hermes_cli(
+        tmp_path,
+        "alice-brain",
+        "--help",
+    )
+    handler_result, handler_alice_home = _run_real_hermes_cli(
+        tmp_path,
+        "alice-brain",
+    )
+
+    assert help_result.returncode == 0
+    assert handler_result.returncode == 0
+    for result in (help_result, handler_result):
+        combined = result.stdout + result.stderr
+        assert "alice-brain" in result.stdout
+        assert "Alice-brain-Hermes consciousness runtime commands" in result.stdout
+        assert "Traceback" not in combined
+    assert not alice_home.exists()
+    assert not handler_alice_home.exists()
+
+
+def test_lazy_cli_handler_prints_stored_parser_help(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from alice_brain_hermes.hermes.registration import (
+        handle_alice_brain_cli,
+        setup_alice_brain_cli,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="hermes alice-brain",
+        description="Alice-brain-Hermes consciousness runtime commands",
+    )
+    setup_alice_brain_cli(parser)
+    args = parser.parse_args([])
+
+    assert handle_alice_brain_cli(args) == 0
+    output = capsys.readouterr().out
+    assert "usage: hermes alice-brain" in output
+    assert "Alice-brain-Hermes consciousness runtime commands" in output
+
+
+@pytest.fixture(scope="module")
+def task5_release_artifacts(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Path, Path]:
+    output_directory = tmp_path_factory.mktemp("task5-release-artifacts")
+    completed = subprocess.run(
+        ["uv", "build", "--out-dir", str(output_directory)],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+    wheels = list(output_directory.glob("*.whl"))
+    source_distributions = list(output_directory.glob("*.tar.gz"))
+    assert len(wheels) == 1
+    assert len(source_distributions) == 1
+    return wheels[0], source_distributions[0]
+
+
+def test_wheel_contains_entrypoint_and_package_modules(
+    task5_release_artifacts: tuple[Path, Path],
+) -> None:
+    wheel, _source_distribution = task5_release_artifacts
+
+    with ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+        entry_points_names = [
+            name for name in names if name.endswith(".dist-info/entry_points.txt")
+        ]
+        assert "alice_brain_hermes/hermes_plugin.py" in names
+        assert "alice_brain_hermes/hermes/__init__.py" in names
+        assert "alice_brain_hermes/hermes/registration.py" in names
+        assert len(entry_points_names) == 1
+        entry_points_text = archive.read(entry_points_names[0]).decode("utf-8")
+        assert "[hermes_agent.plugins]" in entry_points_text
+        assert "alice-brain = alice_brain_hermes.hermes_plugin" in entry_points_text
+
+
+def test_wheel_entrypoint_loads_outside_checkout(
+    task5_release_artifacts: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    wheel, _source_distribution = task5_release_artifacts
+    environment = tmp_path / "wheel-only-environment"
+    create_result = subprocess.run(
+        ["uv", "venv", "--python", sys.executable, str(environment)],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert create_result.returncode == 0, create_result.stderr
+    python_executable = (
+        environment / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else environment / "bin" / "python"
+    )
+    install_result = subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(python_executable),
+            str(wheel),
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert install_result.returncode == 0, install_result.stderr
+    probe = textwrap.dedent(
+        """
+        import inspect
+        from importlib import metadata
+        from types import ModuleType
+
+        matches = [
+            item
+            for item in metadata.entry_points(group="hermes_agent.plugins")
+            if item.name == "alice-brain"
+            and item.dist is not None
+            and item.dist.name == "alice-brain-hermes"
+        ]
+        assert len(matches) == 1
+        module = matches[0].load()
+        assert isinstance(module, ModuleType)
+        assert module.__name__ == "alice_brain_hermes.hermes_plugin"
+        assert callable(module.register)
+        assert not inspect.iscoroutinefunction(module.register)
+        """
+    )
+    probe_result = subprocess.run(
+        [str(python_executable), "-I", "-c", probe],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert probe_result.returncode == 0, probe_result.stderr
+
+
+def test_sdist_contains_directory_integration_artifact(
+    task5_release_artifacts: tuple[Path, Path],
+) -> None:
+    _wheel, source_distribution = task5_release_artifacts
+
+    with tarfile.open(source_distribution, mode="r:gz") as archive:
+        names = {member.name for member in archive.getmembers()}
+        assert any(
+            name.endswith("/integration/alice-brain/plugin.yaml") for name in names
+        )
+        assert any(
+            name.endswith("/integration/alice-brain/__init__.py") for name in names
+        )
+
+
+def test_wheel_has_no_separate_alice_brain_dependency(
+    task5_release_artifacts: tuple[Path, Path],
+) -> None:
+    wheel, _source_distribution = task5_release_artifacts
+
+    with ZipFile(wheel) as archive:
+        metadata_names = [
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        ]
+        assert len(metadata_names) == 1
+        message = BytesParser(policy=compat32).parsebytes(
+            archive.read(metadata_names[0])
+        )
+        requirements = [
+            Requirement(value) for value in message.get_all("Requires-Dist", [])
+        ]
+
+    normalized_names = {
+        requirement.name.lower().replace("_", "-") for requirement in requirements
+    }
+    assert "packaging" in normalized_names
+    assert "alice-brain" not in normalized_names
