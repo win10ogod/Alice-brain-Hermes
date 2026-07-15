@@ -17,10 +17,16 @@ from pathlib import Path
 from typing import Literal, NoReturn
 
 import psutil
+from pydantic import ValidationError
 
 from alice_brain_hermes import __version__
 from alice_brain_hermes.errors import DaemonClientError, DaemonRpcError
 from alice_brain_hermes.protocol.client import DaemonClient
+from alice_brain_hermes.protocol.diagnostics import (
+    TRACE_MAX_PAGE_SIZE,
+    IdentitySnapshotV1,
+    TracePageV1,
+)
 from alice_brain_hermes.runtime.discovery import (
     _private_home,
     load_discovery_and_credential,
@@ -117,6 +123,30 @@ def _timeout(value: str) -> float:
     return result
 
 
+def _nonnegative_sequence(value: str) -> int:
+    try:
+        result = int(value, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "after-sequence must be an integer"
+        ) from error
+    if result < 0:
+        raise argparse.ArgumentTypeError("after-sequence cannot be negative")
+    return result
+
+
+def _trace_limit(value: str) -> int:
+    try:
+        result = int(value, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("limit must be an integer") from error
+    if not 1 <= result <= TRACE_MAX_PAGE_SIZE:
+        raise argparse.ArgumentTypeError(
+            f"limit must be between 1 and {TRACE_MAX_PAGE_SIZE}"
+        )
+    return result
+
+
 def _runtime_home(explicit: str | None) -> Path:
     if explicit is not None:
         if not explicit:
@@ -133,11 +163,11 @@ def _runtime_home(explicit: str | None) -> Path:
     return Path(selected).expanduser().absolute()
 
 
-def _parser() -> _MachineArgumentParser:
-    parser = _MachineArgumentParser(
-        prog="alice-brain-hermes",
-        description="Inspect and control the Alice-brain-Hermes consciousness runtime",
-    )
+def configure_control_parser(
+    parser: argparse.ArgumentParser,
+) -> argparse.ArgumentParser:
+    """Build the shared Python command surface without contacting the runtime."""
+
     parser.add_argument(
         "--home",
         help=(
@@ -151,10 +181,12 @@ def _parser() -> _MachineArgumentParser:
         default=_DEFAULT_TIMEOUT_SECONDS,
         help="bounded startup, RPC, and shutdown timeout in seconds",
     )
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(dest="alice_brain_command", required=True)
 
     daemon = commands.add_parser("daemon", help="run or control the private daemon")
-    daemon_commands = daemon.add_subparsers(dest="daemon_command", required=True)
+    daemon_commands = daemon.add_subparsers(
+        dest="alice_brain_daemon_command", required=True
+    )
     daemon_commands.add_parser("run", help="run the daemon in the foreground")
     daemon_commands.add_parser("start", help="start the daemon in the background")
     daemon_commands.add_parser("stop", help="request authenticated daemon shutdown")
@@ -162,6 +194,51 @@ def _parser() -> _MachineArgumentParser:
 
     commands.add_parser("status", help="alias for 'daemon status'")
     commands.add_parser("doctor", help="diagnose package, home, and daemon health")
+    identity = commands.add_parser(
+        "identity", help="inspect replay-derived self identity"
+    )
+    identity_commands = identity.add_subparsers(
+        dest="alice_brain_identity_command", required=True
+    )
+    identity_get = identity_commands.add_parser(
+        "get", help="read one exact persisted identity"
+    )
+    identity_get.add_argument(
+        "--brain-id",
+        help="brain UUID; optional only when exactly one brain exists",
+    )
+    trace = commands.add_parser("trace", help="inspect the ordered event trace")
+    trace_commands = trace.add_subparsers(
+        dest="alice_brain_trace_command", required=True
+    )
+    trace_list = trace_commands.add_parser(
+        "list", help="read a bounded event page after a sequence cursor"
+    )
+    trace_list.add_argument(
+        "--brain-id",
+        help="brain UUID; optional only when exactly one brain exists",
+    )
+    trace_list.add_argument(
+        "--after-sequence",
+        type=_nonnegative_sequence,
+        default=0,
+        help="exclusive non-negative event sequence cursor",
+    )
+    trace_list.add_argument(
+        "--limit",
+        type=_trace_limit,
+        default=100,
+        help=f"maximum events to return (1-{TRACE_MAX_PAGE_SIZE})",
+    )
+    return parser
+
+
+def _parser() -> _MachineArgumentParser:
+    parser = _MachineArgumentParser(
+        prog="alice-brain-hermes",
+        description="Inspect and control the Alice-brain-Hermes consciousness runtime",
+    )
+    configure_control_parser(parser)
     return parser
 
 
@@ -301,6 +378,78 @@ def _live_status(
             "daemon_unreachable",
             "daemon stopped responding during status inspection",
             exit_code=3,
+        ) from error
+    finally:
+        with suppress(BaseException):
+            client.close()
+
+
+def _typed_read_rpc(
+    home: Path,
+    *,
+    timeout_seconds: float,
+    method: str,
+    params: dict[str, object],
+    response_model: type[IdentitySnapshotV1] | type[TracePageV1],
+) -> dict[str, object]:
+    if not _home_exists(home):
+        raise _CliFailure(
+            "daemon_not_running",
+            "Alice-brain-Hermes daemon is not running",
+            exit_code=3,
+        )
+    _validate_existing_home(home)
+    if not _discovery_exists(home):
+        raise _CliFailure(
+            "daemon_not_running",
+            "Alice-brain-Hermes daemon is not running",
+            exit_code=3,
+        )
+    _load_discovery(home)
+    try:
+        client = DaemonClient.connect(home, timeout_seconds=timeout_seconds)
+    except DaemonRpcError as error:
+        raise _CliFailure(
+            error.code,
+            error.message,
+            data=error.data if isinstance(error.data, dict) else None,
+            exit_code=5,
+        ) from error
+    except DaemonClientError as error:
+        raise _CliFailure(
+            "daemon_unreachable",
+            "daemon discovery exists but its live identity is unreachable",
+            exit_code=3,
+        ) from error
+    try:
+        raw = client.call(method, params)
+        encoded = json.dumps(
+            raw,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        result = response_model.model_validate_json(encoded, strict=True)
+        return result.model_dump(mode="json")
+    except DaemonRpcError as error:
+        raise _CliFailure(
+            error.code,
+            error.message,
+            data=error.data if isinstance(error.data, dict) else None,
+            exit_code=5,
+        ) from error
+    except DaemonClientError as error:
+        raise _CliFailure(
+            "daemon_unreachable",
+            "daemon stopped responding during diagnostic inspection",
+            exit_code=3,
+        ) from error
+    except (ValidationError, TypeError, ValueError) as error:
+        raise _CliFailure(
+            "daemon_response_invalid",
+            "daemon returned an invalid typed diagnostic payload",
+            exit_code=5,
         ) from error
     finally:
         with suppress(BaseException):
@@ -858,46 +1007,80 @@ def _run_foreground(home: Path) -> int:
 def _dispatch(arguments: argparse.Namespace) -> int:
     home = _runtime_home(arguments.home)
     timeout_seconds = arguments.timeout
-    if arguments.command == "status" or (
-        arguments.command == "daemon" and arguments.daemon_command == "status"
+    command = arguments.alice_brain_command
+    if command == "status" or (
+        command == "daemon"
+        and arguments.alice_brain_daemon_command == "status"
     ):
         _write_success(
             "daemon.status",
             _status(home, timeout_seconds=timeout_seconds),
         )
         return 0
-    if arguments.command == "doctor":
+    if command == "doctor":
         data, exit_code = _doctor(home, timeout_seconds=timeout_seconds)
         _write_success("doctor", data)
         return exit_code
-    if arguments.command == "daemon" and arguments.daemon_command == "start":
+    if command == "identity" and arguments.alice_brain_identity_command == "get":
+        params = (
+            {}
+            if arguments.brain_id is None
+            else {"brain_id": arguments.brain_id}
+        )
+        _write_success(
+            "identity.get",
+            _typed_read_rpc(
+                home,
+                timeout_seconds=timeout_seconds,
+                method="identity.get",
+                params=params,
+                response_model=IdentitySnapshotV1,
+            ),
+        )
+        return 0
+    if command == "trace" and arguments.alice_brain_trace_command == "list":
+        params: dict[str, object] = {
+            "after_sequence": arguments.after_sequence,
+            "limit": arguments.limit,
+        }
+        if arguments.brain_id is not None:
+            params["brain_id"] = arguments.brain_id
+        _write_success(
+            "trace.list",
+            _typed_read_rpc(
+                home,
+                timeout_seconds=timeout_seconds,
+                method="trace.list",
+                params=params,
+                response_model=TracePageV1,
+            ),
+        )
+        return 0
+    if (
+        command == "daemon"
+        and arguments.alice_brain_daemon_command == "start"
+    ):
         _write_success(
             "daemon.start",
             _start(home, timeout_seconds=timeout_seconds),
         )
         return 0
-    if arguments.command == "daemon" and arguments.daemon_command == "stop":
+    if command == "daemon" and arguments.alice_brain_daemon_command == "stop":
         _write_success(
             "daemon.stop",
             _stop(home, timeout_seconds=timeout_seconds),
         )
         return 0
-    if arguments.command == "daemon" and arguments.daemon_command == "run":
+    if command == "daemon" and arguments.alice_brain_daemon_command == "run":
         return _run_foreground(home)
     raise AssertionError("argparse accepted an unknown command")
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def run_control_namespace(arguments: argparse.Namespace) -> int:
+    """Execute one parsed standalone or Hermes plugin namespace."""
+
     try:
-        arguments = _parser().parse_args(argv)
         return _dispatch(arguments)
-    except _UsageError as error:
-        failure = _CliFailure(
-            "usage_error",
-            "command arguments are invalid",
-            data={"detail": str(error)},
-            exit_code=2,
-        )
     except _CliFailure as error:
         failure = error
     except KeyboardInterrupt:
@@ -914,6 +1097,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     _write_error(failure)
     return failure.exit_code
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        arguments = _parser().parse_args(argv)
+    except _UsageError as error:
+        failure = _CliFailure(
+            "usage_error",
+            "command arguments are invalid",
+            data={"detail": str(error)},
+            exit_code=2,
+        )
+        _write_error(failure)
+        return failure.exit_code
+    return run_control_namespace(arguments)
 
 
 if __name__ == "__main__":

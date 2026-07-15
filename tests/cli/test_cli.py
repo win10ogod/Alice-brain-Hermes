@@ -112,7 +112,38 @@ def test_help_is_human_readable_and_does_not_create_runtime_home(
     assert result.stderr == ""
     assert "daemon" in result.stdout
     assert "doctor" in result.stdout
+    assert "identity" in result.stdout
+    assert "trace" in result.stdout
     assert not home.exists()
+
+
+def test_shared_control_parser_builds_the_standalone_command_surface() -> None:
+    from alice_brain_hermes import cli
+
+    parser = cli._MachineArgumentParser(prog="hermes alice-brain")
+    returned = cli.configure_control_parser(parser)
+
+    assert returned is parser
+    identity = parser.parse_args(["identity", "get", "--brain-id", "brain"])
+    trace = parser.parse_args(
+        [
+            "trace",
+            "list",
+            "--brain-id",
+            "brain",
+            "--after-sequence",
+            "4",
+            "--limit",
+            "25",
+        ]
+    )
+    assert identity.alice_brain_command == "identity"
+    assert identity.alice_brain_identity_command == "get"
+    assert identity.brain_id == "brain"
+    assert trace.alice_brain_command == "trace"
+    assert trace.alice_brain_trace_command == "list"
+    assert trace.after_sequence == 4
+    assert trace.limit == 25
 
 
 def test_usage_error_is_machine_json_and_does_not_create_home(tmp_path: Path) -> None:
@@ -318,6 +349,63 @@ def test_start_is_idempotent_status_is_live_and_stop_is_authenticated(
             "status": "stopped",
             "stop_requested": False,
         }
+    finally:
+        _stop_if_running(home)
+
+
+@POSIX_ONLY
+def test_identity_and_trace_commands_use_the_live_typed_rpc(tmp_path: Path) -> None:
+    from alice_brain_hermes.protocol.client import DaemonClient
+
+    home = tmp_path / "runtime"
+    try:
+        _success(_run_cli(home, "daemon", "start"))
+        client = DaemonClient.connect(home, timeout_seconds=10.0)
+        try:
+            created = client.call("brain.create", {"name": "Mira"})
+        finally:
+            client.close()
+
+        identity = _success(
+            _run_cli(home, "identity", "get", "--brain-id", created["brain_id"])
+        )
+        first = _success(
+            _run_cli(
+                home,
+                "trace",
+                "list",
+                "--brain-id",
+                created["brain_id"],
+                "--limit",
+                "1",
+            )
+        )
+        second = _success(
+            _run_cli(
+                home,
+                "trace",
+                "list",
+                "--brain-id",
+                created["brain_id"],
+                "--after-sequence",
+                str(first["data"]["next_after_sequence"]),
+                "--limit",
+                "10",
+            )
+        )
+
+        assert identity["command"] == "identity.get"
+        assert identity["data"]["brain_id"] == created["brain_id"]
+        assert identity["data"]["name"] == "Mira"
+        assert first["command"] == "trace.list"
+        assert first["data"]["returned_count"] == 1
+        assert first["data"]["events"][0]["sequence"] == 1
+        assert type(first["data"]["has_more"]) is bool
+        assert all(
+            event["sequence"] > first["data"]["next_after_sequence"]
+            for event in second["data"]["events"]
+        )
+        assert type(second["data"]["has_more"]) is bool
     finally:
         _stop_if_running(home)
 

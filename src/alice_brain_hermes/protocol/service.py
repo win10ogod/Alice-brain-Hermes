@@ -28,6 +28,11 @@ from alice_brain_hermes.errors import (
     ResponseSizeError,
 )
 from alice_brain_hermes.ids import new_id, validate_id
+from alice_brain_hermes.protocol.diagnostics import (
+    TRACE_MAX_PAGE_SIZE,
+    IdentitySnapshotV1,
+    build_trace_page,
+)
 from alice_brain_hermes.protocol.models import (
     PROTOCOL_VERSION,
     SERVER_ADAPTER_ID,
@@ -403,6 +408,31 @@ class ProtocolConnection:
                 "invalid_binding", "bridge binding is invalid"
             ) from None
 
+    def _selected_brain_id(self, value: object) -> str:
+        brain_ids = self.service.runtime.brain_ids
+        if value is None:
+            if not brain_ids:
+                raise ProtocolFault(
+                    "not_found",
+                    "no persisted brain identity is available",
+                    {"brain_count": 0},
+                )
+            if len(brain_ids) != 1:
+                raise ProtocolFault(
+                    "brain_id_required",
+                    "brain_id is required when multiple brains exist",
+                    {"brain_count": len(brain_ids)},
+                )
+            return brain_ids[0]
+        brain_id = validate_id(value)  # type: ignore[arg-type]
+        if brain_id not in brain_ids:
+            raise ProtocolFault(
+                "not_found",
+                "requested brain identity was not found",
+                {"brain_id": brain_id},
+            )
+        return brain_id
+
     def _dispatch(
         self,
         method: str,
@@ -467,6 +497,48 @@ class ProtocolConnection:
                 "scheduler_count": self.service.runtime.scheduler_count,
                 "continuous_runtime": True,
             }
+        if method == "identity.get":
+            self._only(params, {"brain_id"})
+            brain_id = self._selected_brain_id(params.get("brain_id"))
+            state = self.service.runtime.engine(brain_id).state
+            snapshot = IdentitySnapshotV1(
+                brain_id=brain_id,
+                self_actor_id=state.identity.self_actor_id,
+                name=state.identity.name,
+                state_sequence=state.last_sequence,
+                actors=state.identity.actors,
+                authorizations=state.identity.authorizations,
+            )
+            return snapshot.model_dump(mode="json")
+        if method == "trace.list":
+            self._only(params, {"brain_id", "after_sequence", "limit"})
+            brain_id = self._selected_brain_id(params.get("brain_id"))
+            after_sequence = params.get("after_sequence", 0)
+            limit = params.get("limit", 100)
+            if (
+                isinstance(after_sequence, bool)
+                or not isinstance(after_sequence, int)
+                or after_sequence < 0
+                or isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or not 1 <= limit <= TRACE_MAX_PAGE_SIZE
+            ):
+                raise ProtocolFault(
+                    "invalid_params", "request params are invalid"
+                )
+            events = self.service.runtime.ledger.list_events(
+                brain_id,
+                after_sequence=after_sequence,
+                limit=limit + 1,
+            )
+            page = build_trace_page(
+                events,
+                brain_id=brain_id,
+                after_sequence=after_sequence,
+                requested_limit=limit,
+                max_result_bytes=max_result_bytes,
+            )
+            return page.model_dump(mode="json")
         if method == "brain.create":
             self._only(params, {"name"})
             name = params.get("name")
