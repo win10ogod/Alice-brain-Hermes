@@ -45,6 +45,7 @@ DEFAULT_QUEUE_CAPACITY = 256
 DEFAULT_RECONNECT_DELAY_SECONDS = 0.25
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 1.0
 DEFAULT_FRAME_REFRESH_SECONDS = 1.0
+_WORKER_CONTROL_POLL_SECONDS = 0.05
 MAX_COPY_DEPTH = 6
 MAX_COPY_NODES = 1_024
 MAX_COPY_CONTAINER_ITEMS = 64
@@ -504,6 +505,7 @@ class HookBridge:
         self._capture_lock = threading.Lock()
         self._health_lock = threading.Lock()
         self._worker_lock = threading.Lock()
+        self._wake_lock = threading.Lock()
         self._next_capture_seq = 1
         self._gap_spans: deque[_GapSpan] = deque()
         self._health = BridgeHealth()
@@ -524,6 +526,7 @@ class HookBridge:
         self._retained_attempted = False
         self._exact_retry_pending = False
         self._stop_requested = False
+        self._wake_requested = False
         self._close_requested = False
         self._close_sealed = False
         self._close_final_capture_seq: int | None = None
@@ -621,12 +624,35 @@ class HookBridge:
             self._mark_emergency_failure(error)
             return
         if produced:
-            try:
-                self._wake_event.set()
-                if self._start_worker_on_capture:
+            self._notify_worker()
+
+    def _notify_worker(self, *, force_start: bool = False) -> None:
+        try:
+            with self._wake_lock:
+                self._wake_requested = True
+        except BaseException as error:
+            self._mark_emergency_failure(error)
+        try:
+            self._wake_event.set()
+        except BaseException as error:
+            self._mark_emergency_failure(error)
+        finally:
+            if force_start or self._start_worker_on_capture:
+                try:
                     self.start_worker()
-            except BaseException as error:
-                self._mark_emergency_failure(error)
+                except BaseException as error:
+                    self._mark_emergency_failure(error)
+
+    def _consume_worker_wake(self) -> bool:
+        try:
+            with self._wake_lock:
+                if not self._wake_requested:
+                    return False
+                self._wake_requested = False
+                return True
+        except BaseException as error:
+            self._mark_emergency_failure(error)
+            return False
 
     def _capture_atomic(self, hook: str, kwargs: dict[str, Any]) -> bool:
         with self._capture_lock, self._health_lock:
@@ -830,9 +856,7 @@ class HookBridge:
                 self._next_capture_seq = next_capture_seq
                 self._ever_had_capture = True
                 self._last_bootstrap_reservation = receipt
-        self._wake_event.set()
-        if self._start_worker_on_capture:
-            self.start_worker()
+        self._notify_worker()
 
     def _publish_observation_or_gap_locked(
         self,
@@ -1098,6 +1122,7 @@ class HookBridge:
                 try:
                     if self._worker_stop_requested():
                         return
+                    self._consume_worker_wake()
                     try:
                         record = self._select_next_record()
                     except BaseException as error:
@@ -1631,30 +1656,37 @@ class HookBridge:
         self._wait_for_worker(self._reconnect_delay_seconds)
 
     def _wait_for_worker(self, timeout: float) -> None:
-        failed = False
-        try:
-            self._wake_event.wait(timeout)
-        except BaseException as error:
-            failed = True
-            self._mark_emergency_failure(error)
-        try:
-            self._wake_event.clear()
-        except BaseException as error:
-            failed = True
-            self._mark_emergency_failure(error)
-        if failed:
-            # A persistently hostile event probe must not turn the retry loop
-            # into an unbounded CPU spin while its stop event remains usable.
-            with suppress(BaseException):
-                time.sleep(min(timeout, 0.05))
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._worker_stop_requested() or self._consume_worker_wake():
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            wait_seconds = min(remaining, _WORKER_CONTROL_POLL_SECONDS)
+            failed = False
+            started = time.monotonic()
+            try:
+                self._wake_event.wait(wait_seconds)
+            except BaseException as error:
+                failed = True
+                self._mark_emergency_failure(error)
+            try:
+                self._wake_event.clear()
+            except BaseException as error:
+                failed = True
+                self._mark_emergency_failure(error)
+            if failed:
+                elapsed = time.monotonic() - started
+                with suppress(BaseException):
+                    time.sleep(max(0.0, wait_seconds - elapsed))
 
     def request_clean_close(self) -> None:
         """Request a typed stream close; this never stops the daemon."""
 
         with self._capture_lock:
             self._close_requested = True
-        self._wake_event.set()
-        self.start_worker()
+        self._notify_worker(force_start=True)
 
     def _seal_close_if_ready(self) -> bool:
         with self._capture_lock:

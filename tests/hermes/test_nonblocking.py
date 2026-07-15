@@ -66,6 +66,7 @@ class _FaultingEvent:
         self.failures = failures
         self.calls = 0
         self.fault_observed = threading.Event()
+        self.wait_entered = threading.Event()
 
     def _fault(self, method: str) -> None:
         if method != self.method:
@@ -84,6 +85,7 @@ class _FaultingEvent:
         self.delegate.set()
 
     def wait(self, timeout: float | None = None) -> bool:
+        self.wait_entered.set()
         self._fault("wait")
         return self.delegate.wait(timeout)
 
@@ -897,6 +899,147 @@ def test_worker_survives_persistent_wait_memoryerror_and_still_commits(
     bridge.stop_worker_for_test()
     assert bridge.worker_started is False
     assert bridge.health.worker_started is False
+
+
+def test_persistent_wake_set_failure_starts_worker_and_commits_once(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    committed = threading.Event()
+
+    class CommitProbe(_FakeClient):
+        def call(
+            self,
+            method: str,
+            params: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            result = super().call(method, params)
+            if method == "bridge.commit":
+                committed.set()
+            return result
+
+    bridge = HookBridge(
+        tmp_path,
+        bridge_instance_id=new_id(),
+        reconnect_delay_seconds=0.01,
+        client_factory=lambda *_args, **_kwargs: CommitProbe(calls),
+    )
+    delegate = bridge._wake_event  # type: ignore[attr-defined]
+    faulting = _FaultingEvent(delegate, method="set", failures=None)
+    bridge._wake_event = faulting  # type: ignore[attr-defined]
+
+    try:
+        _session_start(HermesHooks(bridge))
+        assert faulting.fault_observed.wait(1)
+        assert committed.wait(1)
+    finally:
+        bridge._wake_event = delegate  # type: ignore[attr-defined]
+        delegate.set()
+        bridge.stop_worker_for_test()
+
+    commits = [params for method, params in calls if method == "bridge.commit"]
+    assert len(commits) == 1
+    assert commits[0]["record"]["capture_seq"] == 1  # type: ignore[index]
+    assert bridge.last_ack is not None
+    assert bridge.last_ack.through_capture_seq == 1
+    assert bridge.retained_record is None
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_error == "MemoryError"
+
+
+def test_persistent_wake_set_failure_interrupts_sixty_second_idle_wait(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    committed = threading.Event()
+
+    class CommitProbe(_FakeClient):
+        def call(
+            self,
+            method: str,
+            params: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            result = super().call(method, params)
+            if method == "bridge.commit":
+                committed.set()
+            return result
+
+    client = CommitProbe(calls)
+    bridge = HookBridge(
+        tmp_path,
+        bridge_instance_id=new_id(),
+        reconnect_delay_seconds=60,
+        client_factory=lambda *_args, **_kwargs: client,
+        start_worker_on_capture=False,
+    )
+    delegate = bridge._wake_event  # type: ignore[attr-defined]
+    faulting = _FaultingEvent(delegate, method="set", failures=None)
+    bridge._wake_event = faulting  # type: ignore[attr-defined]
+    bridge.start_worker()
+    worker = bridge._worker  # type: ignore[attr-defined]
+
+    try:
+        assert worker is not None
+        assert faulting.wait_entered.wait(1)
+        _session_start(HermesHooks(bridge))
+        assert faulting.fault_observed.wait(1)
+        assert committed.wait(1)
+    finally:
+        try:
+            bridge.stop_worker_for_test()
+        except BaseException:
+            bridge._wake_event = delegate  # type: ignore[attr-defined]
+            bridge._stop_requested = True  # type: ignore[attr-defined]
+            bridge._stop_event.set()  # type: ignore[attr-defined]
+            delegate.set()
+            worker.join(timeout=2)
+        else:
+            bridge._wake_event = delegate  # type: ignore[attr-defined]
+
+    commits = [params for method, params in calls if method == "bridge.commit"]
+    assert len(commits) == 1
+    assert commits[0]["record"]["capture_seq"] == 1  # type: ignore[index]
+    assert bridge.last_ack is not None
+    assert bridge.last_ack.through_capture_seq == 1
+    assert bridge.retained_record is None
+    assert bridge._worker is None  # type: ignore[attr-defined]
+
+
+def test_persistent_wait_failure_preserves_sixty_second_reconnect_deadline(
+    tmp_path: Path,
+) -> None:
+    connect_attempts = 0
+
+    def fail_connect(*_args: object, **_kwargs: object) -> None:
+        nonlocal connect_attempts
+        connect_attempts += 1
+        raise DaemonClientError("daemon unavailable")
+
+    bridge = HookBridge(
+        tmp_path,
+        reconnect_delay_seconds=60,
+        client_factory=fail_connect,
+        start_worker_on_capture=False,
+    )
+    _session_start(HermesHooks(bridge))
+    faulting = _FaultingEvent(
+        bridge._wake_event,  # type: ignore[attr-defined]
+        method="wait",
+        failures=None,
+    )
+    bridge._wake_event = faulting  # type: ignore[attr-defined]
+    bridge.start_worker()
+
+    try:
+        assert faulting.fault_observed.wait(1)
+        time.sleep(0.2)
+        assert connect_attempts == 1
+    finally:
+        bridge.stop_worker_for_test()
+
+    assert bridge._worker is None  # type: ignore[attr-defined]
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_error == "MemoryError"
 
 
 def test_worker_survives_persistent_stop_probe_commits_once_and_stops(
@@ -1829,6 +1972,54 @@ def _closed_stream(
         "last_seen": timestamp,
         "closed_final_seq": final_capture_seq,
     }
+
+
+def test_clean_close_starts_worker_when_wake_set_persistently_fails(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class ClosingClient(_FakeClient):
+        def call(
+            self,
+            method: str,
+            params: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            if method == "bridge.close":
+                assert params is not None
+                self.calls.append((method, dict(params)))
+                return _closed_stream(bridge, self, int(params["final_capture_seq"]))
+            return super().call(method, params)
+
+    client = ClosingClient(calls)
+    bridge = HookBridge(
+        tmp_path,
+        bridge_instance_id=new_id(),
+        reconnect_delay_seconds=0.01,
+        client_factory=lambda *_args, **_kwargs: client,
+        start_worker_on_capture=False,
+    )
+    delegate = bridge._wake_event  # type: ignore[attr-defined]
+    faulting = _FaultingEvent(delegate, method="set", failures=None)
+    bridge._wake_event = faulting  # type: ignore[attr-defined]
+
+    try:
+        bridge.request_clean_close()
+        assert faulting.fault_observed.wait(1)
+        _wait_until(lambda: any(method == "bridge.close" for method, _ in calls))
+        _wait_until(lambda: bridge._worker is None)  # type: ignore[attr-defined]
+    finally:
+        bridge._wake_event = delegate  # type: ignore[attr-defined]
+        delegate.set()
+        bridge.stop_worker_for_test()
+
+    closes = [params for method, params in calls if method == "bridge.close"]
+    assert closes == [{"binding": closes[0]["binding"], "final_capture_seq": 0}]
+    assert not any(method == "bridge.commit" for method, _ in calls)
+    assert bridge.last_ack is None
+    assert bridge.stop_requested is True
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_error == "MemoryError"
 
 
 def test_clean_closed_worker_cannot_be_restarted(
