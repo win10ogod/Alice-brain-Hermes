@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import queue
 import threading
+import time
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -251,6 +252,7 @@ class _BootstrapCaptureBuffer:
         self._queue_head: _BootstrapCapture | None = None
         self._worker_retained: _BootstrapCapture | None = None
         self._worker: threading.Thread | None = None
+        self._stop_event = threading.Event()
         self._start_worker_on_capture = start_worker_on_capture
         self._health = _BootstrapHealth()
         self._handed_off_dropped_events = 0
@@ -264,10 +266,12 @@ class _BootstrapCaptureBuffer:
     def health(self) -> _BootstrapHealth:
         with self._capture_lock:
             health = self._health
+            worker_started = self.worker_started
             if (
                 not self._health_reconciliation_required
                 and not self._emergency_trace_incomplete
                 and not self._emergency_degraded
+                and health.worker_started is worker_started
             ):
                 return health
             if self._health_reconciliation_required:
@@ -289,7 +293,7 @@ class _BootstrapCaptureBuffer:
                 dropped_events=dropped_events,
                 pending_records=health.pending_records,
                 pending_gap_ranges=pending_gap_ranges,
-                worker_started=health.worker_started,
+                worker_started=worker_started,
                 degraded=(
                     health.degraded
                     or self._health_reconciliation_required
@@ -591,31 +595,60 @@ class _BootstrapCaptureBuffer:
 
     def _start_worker(self) -> None:
         with self._worker_lock:
-            if self._worker is not None:
-                return
+            existing = self._worker
+            if existing is not None:
+                try:
+                    if existing.is_alive():
+                        return
+                except BaseException as error:
+                    self.mark_unrepresented_callback(error)
+                    return
+                self._worker = None
             try:
                 with self._capture_lock:
                     previous_health = self._health
                     updated_health = replace(self._health, worker_started=True)
                     worker = threading.Thread(
-                        target=_bootstrap_worker_main,
+                        target=_bootstrap_worker_entry,
                         args=(self,),
                         name="alice-brain-hermes-bootstrap",
                         daemon=True,
                     )
-                    self._health = updated_health
                     self._worker = worker
                     try:
                         worker.start()
-                    except BaseException:
-                        self._worker = None
-                        self._health = previous_health
-                        raise
+                    except BaseException as start_error:
+                        try:
+                            started = worker.is_alive()
+                        except BaseException as probe_error:
+                            self._worker = None
+                            self._health = previous_health
+                            raise start_error from probe_error
+                        if not started:
+                            self._worker = None
+                            self._health = previous_health
+                            raise
+                        self._health = updated_health
+                        self.mark_unrepresented_callback(start_error)
+                        self.mark_worker_degraded(start_error)
+                        return
+                    self._health = updated_health
             except BaseException as error:
                 with self._capture_lock:
                     self.mark_unrepresented_callback(error)
                 self.mark_worker_degraded(error)
                 return
+
+    @property
+    def worker_started(self) -> bool:
+        worker = self._worker
+        if worker is None:
+            return False
+        try:
+            return worker.is_alive()
+        except BaseException as error:
+            self.mark_unrepresented_callback(error)
+            return False
 
     def next_for_worker(self) -> _BootstrapCapture | None:
         with self._capture_lock:
@@ -753,8 +786,44 @@ class _BootstrapCaptureBuffer:
             )
 
     def wait(self, timeout: float) -> None:
-        self._wake.wait(timeout)
-        self._wake.clear()
+        failed = False
+        try:
+            self._wake.wait(timeout)
+        except BaseException as error:
+            failed = True
+            self.mark_worker_degraded(error)
+        try:
+            self._wake.clear()
+        except BaseException as error:
+            failed = True
+            self.mark_worker_degraded(error)
+        if failed:
+            with suppress(BaseException):
+                time.sleep(min(timeout, 0.05))
+
+    def worker_stop_requested(self) -> bool:
+        return self._stop_event.is_set()
+
+    def _publish_worker_exit(self, worker: threading.Thread) -> None:
+        try:
+            with self._worker_lock:
+                if self._worker is worker:
+                    self._worker = None
+                with self._capture_lock:
+                    self._health = replace(self._health, worker_started=False)
+        except BaseException as error:
+            self.mark_unrepresented_callback(error)
+
+    def stop_worker_for_test(self) -> None:
+        self._stop_event.set()
+        self._wake.set()
+        worker = self._worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=2.0)
+            if worker.is_alive():
+                raise RuntimeError(
+                    "bootstrap worker did not stop within the test bound"
+                )
 
     def pending_for_test(self) -> tuple[_BootstrapCapture, ...]:
         with self._capture_lock, self._queue.mutex:
@@ -769,58 +838,78 @@ class _BootstrapCaptureBuffer:
             return tuple(sorted(items, key=lambda item: item.capture_seq))
 
 
+def _bootstrap_worker_entry(buffer: _BootstrapCaptureBuffer) -> None:
+    worker = buffer._worker
+    if worker is None:
+        buffer.mark_unrepresented_callback(
+            RuntimeError("bootstrap worker started without a published identity")
+        )
+        return
+    try:
+        _bootstrap_worker_main(buffer)
+    finally:
+        buffer._publish_worker_exit(worker)
+
+
 def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
     bridge: Any | None = None
     while True:
-        if bridge is None:
-            try:
-                from alice_brain_hermes.hermes.bridge import (
-                    HookBridge,
-                    default_runtime_home,
-                )
+        try:
+            stop_probe = getattr(buffer, "worker_stop_requested", None)
+            if stop_probe is not None and stop_probe():
+                return
+            if bridge is None:
+                try:
+                    from alice_brain_hermes.hermes.bridge import (
+                        HookBridge,
+                        default_runtime_home,
+                    )
 
-                candidate = HookBridge(
-                    default_runtime_home(),
-                    start_worker_on_capture=False,
-                    context_sink=buffer.publish_context,
+                    candidate = HookBridge(
+                        default_runtime_home(),
+                        start_worker_on_capture=False,
+                        context_sink=buffer.publish_context,
+                    )
+                    candidate.start_worker()
+                    if not candidate.worker_started:
+                        raise RuntimeError("Hermes bridge worker did not start")
+                    bridge = candidate
+                except BaseException as error:
+                    bridge = None
+                    buffer.mark_worker_degraded(error)
+                    buffer.wait(0.1)
+                    continue
+            capture = buffer.next_for_worker()
+            if capture is None:
+                buffer.publish_context(bridge.projections.read_context())
+                buffer.wait(0.05)
+                continue
+            try:
+                bridge.capture_reserved(
+                    hook=capture.hook,
+                    detached_kwargs=capture.detached_kwargs,
+                    first_capture_seq=capture.capture_seq,
+                    last_capture_seq=capture.last_capture_seq,
+                    gap_cause_counts=capture.gap_cause_counts,
+                    copy_stats=capture.copy_stats,
                 )
-                candidate.start_worker()
-                if not candidate.worker_started:
-                    raise RuntimeError("Hermes bridge worker did not start")
-                bridge = candidate
             except BaseException as error:
-                bridge = None
                 buffer.mark_worker_degraded(error)
                 buffer.wait(0.1)
                 continue
-        capture = buffer.next_for_worker()
-        if capture is None:
-            buffer.publish_context(bridge.projections.read_context())
-            buffer.wait(0.05)
-            continue
-        try:
-            bridge.capture_reserved(
-                hook=capture.hook,
-                detached_kwargs=capture.detached_kwargs,
-                first_capture_seq=capture.capture_seq,
-                last_capture_seq=capture.last_capture_seq,
-                gap_cause_counts=capture.gap_cause_counts,
-                copy_stats=capture.copy_stats,
-            )
+            try:
+                buffer.mark_handed_off(capture)
+            except BaseException as error:
+                buffer.mark_worker_degraded(error)
+                buffer.wait(0.1)
+                continue
+            try:
+                buffer.publish_context(bridge.projections.read_context())
+            except BaseException as error:
+                buffer.mark_worker_degraded(error)
         except BaseException as error:
             buffer.mark_worker_degraded(error)
             buffer.wait(0.1)
-            continue
-        try:
-            buffer.mark_handed_off(capture)
-        except BaseException as error:
-            buffer.mark_worker_degraded(error)
-            buffer.wait(0.1)
-            continue
-        try:
-            buffer.publish_context(bridge.projections.read_context())
-        except BaseException as error:
-            buffer.mark_worker_degraded(error)
 
 
 _BOOTSTRAP = _BootstrapCaptureBuffer()

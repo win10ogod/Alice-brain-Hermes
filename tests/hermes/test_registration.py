@@ -1435,9 +1435,6 @@ def test_bootstrap_worker_retries_a_bridge_whose_worker_did_not_start(
     from alice_brain_hermes.hermes import bridge as bridge_module
     from alice_brain_hermes.hermes import registration
 
-    class StopProbe(BaseException):
-        pass
-
     bridges: list[FakeBridge] = []
     next_calls = 0
 
@@ -1456,6 +1453,12 @@ def test_bootstrap_worker_retries_a_bridge_whose_worker_did_not_start(
             self.worker_started = len(bridges) >= 2
 
     class FakeBuffer:
+        def __init__(self) -> None:
+            self.stop_requested = False
+
+        def worker_stop_requested(self) -> bool:
+            return self.stop_requested
+
         @staticmethod
         def mark_worker_degraded(_error: BaseException) -> None:
             return None
@@ -1468,19 +1471,17 @@ def test_bootstrap_worker_retries_a_bridge_whose_worker_did_not_start(
         def publish_context(_context: object) -> None:
             return None
 
-        @staticmethod
-        def next_for_worker() -> None:
+        def next_for_worker(self) -> None:
             nonlocal next_calls
             next_calls += 1
             if len(bridges) >= 2 or next_calls >= 3:
-                raise StopProbe
+                self.stop_requested = True
             return None
 
     monkeypatch.setattr(bridge_module, "HookBridge", FakeBridge)
     monkeypatch.setattr(bridge_module, "default_runtime_home", lambda: "unused")
 
-    with pytest.raises(StopProbe):
-        registration._bootstrap_worker_main(FakeBuffer())  # type: ignore[arg-type,attr-defined]
+    registration._bootstrap_worker_main(FakeBuffer())  # type: ignore[arg-type,attr-defined]
 
     assert len(bridges) == 2
     assert bridges[0].worker_started is False
@@ -1492,9 +1493,6 @@ def test_bootstrap_worker_retries_baseexception_and_handoff_without_sleep(
 ) -> None:
     from alice_brain_hermes.hermes import bridge as bridge_module
     from alice_brain_hermes.hermes import registration
-
-    class StopProbe(BaseException):
-        pass
 
     capture_calls = 0
     handoff_calls = 0
@@ -1537,6 +1535,12 @@ def test_bootstrap_worker_retries_baseexception_and_handoff_without_sleep(
     retained = FakeCapture()
 
     class FakeBuffer:
+        def __init__(self) -> None:
+            self.stop_requested = False
+
+        def worker_stop_requested(self) -> bool:
+            return self.stop_requested
+
         @staticmethod
         def mark_worker_degraded(_error: BaseException) -> None:
             return None
@@ -1549,10 +1553,10 @@ def test_bootstrap_worker_retries_baseexception_and_handoff_without_sleep(
         def publish_context(_context: object) -> None:
             return None
 
-        @staticmethod
-        def next_for_worker() -> object:
+        def next_for_worker(self) -> object | None:
             if handoff_calls >= 2:
-                raise StopProbe
+                self.stop_requested = True
+                return None
             return retained
 
         @staticmethod
@@ -1566,8 +1570,7 @@ def test_bootstrap_worker_retries_baseexception_and_handoff_without_sleep(
     monkeypatch.setattr(bridge_module, "HookBridge", FakeBridge)
     monkeypatch.setattr(bridge_module, "default_runtime_home", lambda: "unused")
 
-    with pytest.raises(StopProbe):
-        registration._bootstrap_worker_main(FakeBuffer())  # type: ignore[arg-type,attr-defined]
+    registration._bootstrap_worker_main(FakeBuffer())  # type: ignore[arg-type,attr-defined]
 
     assert capture_calls == 3
     assert handoff_calls == 2
@@ -1770,9 +1773,15 @@ def test_bootstrap_worker_health_allocation_failure_does_not_publish_a_thread(
     starts = 0
 
     class FakeThread:
+        alive = False
+
         def start(self) -> None:
             nonlocal starts
             starts += 1
+            self.alive = True
+
+        def is_alive(self) -> bool:
+            return self.alive
 
     monkeypatch.setattr(
         registration.threading,
@@ -1801,6 +1810,136 @@ def test_bootstrap_worker_health_allocation_failure_does_not_publish_a_thread(
     bootstrap._start_worker()  # type: ignore[attr-defined]
     assert bootstrap._worker is not None  # type: ignore[attr-defined]
     assert starts == 1
+
+
+def test_bootstrap_start_failure_after_spawn_keeps_the_only_live_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    real_thread = threading.Thread
+    release = threading.Event()
+    spawned: list[threading.Thread] = []
+
+    class RaiseAfterSpawn:
+        def __init__(self, **_kwargs: object) -> None:
+            self.thread = real_thread(target=release.wait, daemon=True)
+
+        def start(self) -> None:
+            self.thread.start()
+            spawned.append(self.thread)
+            raise MemoryError("bootstrap thread.start failed after spawning")
+
+        def is_alive(self) -> bool:
+            return self.thread.is_alive()
+
+        def join(self, timeout: float | None = None) -> None:
+            self.thread.join(timeout)
+
+    monkeypatch.setattr(registration.threading, "Thread", RaiseAfterSpawn)
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+    try:
+        assert len(spawned) == 1
+        assert bootstrap._worker is not None  # type: ignore[attr-defined]
+        assert bootstrap.worker_started is True
+        assert bootstrap.health.worker_started is True
+        assert bootstrap.health.trace_complete is False
+        assert bootstrap.health.last_error == "MemoryError"
+
+        bootstrap._start_worker()  # type: ignore[attr-defined]
+        assert len(spawned) == 1
+    finally:
+        release.set()
+        bootstrap.stop_worker_for_test()
+
+    assert spawned[0].is_alive() is False
+    assert bootstrap.worker_started is False
+
+
+def test_bootstrap_worker_survives_wait_memoryerror_and_hands_off_exact_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+    from alice_brain_hermes.hermes import registration
+
+    handed_off = threading.Event()
+    wait_failed = threading.Event()
+    captures: list[dict[str, object]] = []
+
+    class FakeProjections:
+        @staticmethod
+        def read_context() -> None:
+            return None
+
+    class FakeBridge:
+        worker_started = True
+        projections = FakeProjections()
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        @staticmethod
+        def start_worker() -> None:
+            return None
+
+        @staticmethod
+        def capture_reserved(**reservation: object) -> None:
+            captures.append(reservation)
+            handed_off.set()
+
+    class OneShotWaitFailure:
+        def __init__(self, delegate: threading.Event) -> None:
+            self.delegate = delegate
+            self.failed = False
+
+        def set(self) -> None:
+            self.delegate.set()
+
+        def clear(self) -> None:
+            self.delegate.clear()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            if not self.failed:
+                self.failed = True
+                wait_failed.set()
+                raise MemoryError("bootstrap wait failed")
+            return self.delegate.wait(timeout)
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    bootstrap._wake = OneShotWaitFailure(bootstrap._wake)  # type: ignore[attr-defined]
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    monkeypatch.setattr(bridge_module, "HookBridge", FakeBridge)
+    monkeypatch.setattr(bridge_module, "default_runtime_home", lambda: "unused")
+
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+    try:
+        assert wait_failed.wait(2)
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        assert handed_off.wait(2)
+        assert len(captures) == 1
+        assert captures[0]["first_capture_seq"] == 1
+        assert captures[0]["last_capture_seq"] == 1
+        assert bootstrap.pending_for_test() == ()
+        assert bootstrap.health.pending_records == 0
+        assert bootstrap.health.trace_complete is True
+        assert bootstrap.health.worker_started is True
+    finally:
+        stop = getattr(bootstrap, "stop_worker_for_test", None)
+        if stop is not None:
+            stop()
+
+    assert bootstrap.health.worker_started is False
 
 
 def test_bootstrap_copy_cost_is_bounded_for_hostile_nested_values(

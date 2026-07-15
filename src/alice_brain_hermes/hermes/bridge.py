@@ -550,7 +550,11 @@ class HookBridge:
     @property
     def health(self) -> BridgeHealth:
         health = self._health
-        if not self._emergency_trace_incomplete:
+        worker_started = self.worker_started
+        if (
+            not self._emergency_trace_incomplete
+            and health.worker_started is worker_started
+        ):
             return health
         return BridgeHealth(
             connection=(
@@ -563,7 +567,7 @@ class HookBridge:
             pending_gap_ranges=health.pending_gap_ranges,
             last_capture_seq=health.last_capture_seq,
             through_capture_seq=health.through_capture_seq,
-            worker_started=health.worker_started,
+            worker_started=worker_started,
             last_error=self._emergency_last_error or health.last_error,
             abandoned_streams=health.abandoned_streams,
             abandoned_local_records=health.abandoned_local_records,
@@ -583,7 +587,14 @@ class HookBridge:
 
     @property
     def worker_started(self) -> bool:
-        return self._worker is not None
+        worker = self._worker
+        if worker is None:
+            return False
+        try:
+            return worker.is_alive()
+        except BaseException as error:
+            self._mark_emergency_failure(error)
+            return False
 
     @property
     def retained_record(self) -> BridgeRecordV1 | None:
@@ -1015,8 +1026,15 @@ class HookBridge:
 
     def start_worker(self) -> None:
         with self._worker_lock:
-            if self._worker is not None:
-                return
+            existing = self._worker
+            if existing is not None:
+                try:
+                    if existing.is_alive():
+                        return
+                except BaseException as error:
+                    self._mark_emergency_failure(error)
+                    return
+                self._worker = None
             try:
                 with self._health_lock:
                     previous_health = self._health
@@ -1026,57 +1044,96 @@ class HookBridge:
                         name="alice-brain-hermes-bridge",
                         daemon=True,
                     )
-                    self._health = updated_health
                     self._worker = worker
                     try:
                         worker.start()
-                    except BaseException:
-                        self._worker = None
-                        self._health = previous_health
-                        raise
+                    except BaseException as start_error:
+                        try:
+                            started = worker.is_alive()
+                        except BaseException as probe_error:
+                            self._worker = None
+                            self._health = previous_health
+                            raise start_error from probe_error
+                        if not started:
+                            self._worker = None
+                            self._health = previous_health
+                            raise
+                        self._health = updated_health
+                        self._mark_emergency_failure(start_error)
+                        return
+                    self._health = updated_health
             except BaseException as error:
                 self._mark_emergency_failure(error)
                 return
 
     def _run_worker(self) -> None:
+        current_worker = self._worker
+        if current_worker is None:
+            self._mark_emergency_failure(
+                RuntimeError("bridge worker started without a published identity")
+            )
+            return
         try:
-            while not self._stop_event.is_set():
+            while True:
                 try:
-                    record = self._select_next_record()
-                except BaseException as error:
-                    self._mark_emergency_failure(error)
-                    self._disconnect_client(error=self._error_label(error))
-                    self._wait_reconnect()
-                    continue
-                if record is None:
-                    if self._close_requested and self._seal_close_if_ready():
-                        if self._client is None and not self._connect():
-                            self._wait_reconnect()
-                            continue
-                        if self._close_stream():
-                            return
-                    elif self._client is None and self._ever_had_capture:
-                        if not self._connect():
-                            self._wait_reconnect()
-                            continue
-                    elif (
-                        self._client is not None
-                        and time.monotonic() - self._last_frame_refresh_monotonic
-                        >= self._frame_refresh_seconds
-                        and not self._refresh_frame()
-                    ):
+                    if self._stop_event.is_set():
+                        return
+                    try:
+                        record = self._select_next_record()
+                    except BaseException as error:
+                        self._mark_emergency_failure(error)
+                        self._disconnect_client(error=self._error_label(error))
                         self._wait_reconnect()
                         continue
-                    self._wake_event.wait(self._reconnect_delay_seconds)
-                    self._wake_event.clear()
-                    continue
-                if self._client is None and not self._connect():
-                    self._wait_reconnect()
-                    continue
-                if not self._commit_retained(record):
+                    if record is None:
+                        if self._close_requested and self._seal_close_if_ready():
+                            if self._client is None and not self._connect():
+                                self._wait_reconnect()
+                                continue
+                            if self._close_stream():
+                                return
+                        elif self._client is None and self._ever_had_capture:
+                            if not self._connect():
+                                self._wait_reconnect()
+                                continue
+                        elif (
+                            self._client is not None
+                            and time.monotonic() - self._last_frame_refresh_monotonic
+                            >= self._frame_refresh_seconds
+                            and not self._refresh_frame()
+                        ):
+                            self._wait_reconnect()
+                            continue
+                        self._wait_for_worker(self._reconnect_delay_seconds)
+                        continue
+                    if self._client is None and not self._connect():
+                        self._wait_reconnect()
+                        continue
+                    if not self._commit_retained(record):
+                        self._wait_reconnect()
+                except BaseException as error:
+                    self._mark_emergency_failure(error)
+                    try:
+                        self._disconnect_client(error=self._error_label(error))
+                    except BaseException as disconnect_error:
+                        self._mark_emergency_failure(disconnect_error)
                     self._wait_reconnect()
         finally:
-            self._disconnect_client()
+            try:
+                self._disconnect_client()
+            except BaseException as error:
+                self._mark_emergency_failure(error)
+            self._publish_worker_exit(current_worker)
+
+    def _publish_worker_exit(self, worker: threading.Thread) -> None:
+        try:
+            with self._worker_lock:
+                if self._worker is worker:
+                    self._worker = None
+                with self._health_lock:
+                    self._health = replace(self._health, worker_started=False)
+        except BaseException as error:
+            self._mark_emergency_failure(error)
 
     def _select_next_record(self) -> BridgeRecordV1 | None:
         if self._retained is not None:
@@ -1551,8 +1608,25 @@ class HookBridge:
         self._publish_connection("disconnected", error=error)
 
     def _wait_reconnect(self) -> None:
-        self._wake_event.wait(self._reconnect_delay_seconds)
-        self._wake_event.clear()
+        self._wait_for_worker(self._reconnect_delay_seconds)
+
+    def _wait_for_worker(self, timeout: float) -> None:
+        failed = False
+        try:
+            self._wake_event.wait(timeout)
+        except BaseException as error:
+            failed = True
+            self._mark_emergency_failure(error)
+        try:
+            self._wake_event.clear()
+        except BaseException as error:
+            failed = True
+            self._mark_emergency_failure(error)
+        if failed:
+            # A persistently hostile event probe must not turn the retry loop
+            # into an unbounded CPU spin while its stop event remains usable.
+            with suppress(BaseException):
+                time.sleep(min(timeout, 0.05))
 
     def request_clean_close(self) -> None:
         """Request a typed stream close; this never stops the daemon."""
