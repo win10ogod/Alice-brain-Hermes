@@ -687,7 +687,7 @@ def test_database_uses_wal_foreign_keys_and_explicit_schema_version(
         assert ledger.schema_version == SQLITE_SCHEMA_VERSION
 
 
-def test_existing_v3_reopen_rejects_tampered_sequence_allocator(
+def test_existing_v4_reopen_rejects_tampered_sequence_allocator(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "allocator.db"
@@ -712,7 +712,7 @@ def test_existing_v3_reopen_rejects_tampered_sequence_allocator(
         "CREATE TRIGGER unexpected_object AFTER UPDATE ON brains BEGIN SELECT 1; END",
     ],
 )
-def test_existing_v3_reopen_rejects_every_extra_schema_object(
+def test_existing_v4_reopen_rejects_every_extra_schema_object(
     tmp_path: Path, extra_sql: str
 ) -> None:
     database = tmp_path / "extra-schema.db"
@@ -725,7 +725,7 @@ def test_existing_v3_reopen_rejects_every_extra_schema_object(
         SQLiteLedger.open(database)
 
 
-def test_existing_v3_reopen_replays_before_snapshot_and_rejects_false_cache(
+def test_existing_v4_reopen_replays_before_snapshot_and_rejects_false_cache(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "false-cache.db"
@@ -753,7 +753,7 @@ def test_existing_v3_reopen_replays_before_snapshot_and_rejects_false_cache(
         SQLiteLedger.open(database)
 
 
-def test_existing_v3_reopen_rejects_canonical_event_sequence_hole(
+def test_existing_v4_reopen_rejects_canonical_event_sequence_hole(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "sequence-hole.db"
@@ -903,7 +903,7 @@ def test_legacy_v1_rate_free_snapshot_is_a_cache_and_can_be_replaced(
                 ),
             )
 
-        assert STATE_SCHEMA_VERSION == 3
+        assert STATE_SCHEMA_VERSION == 4
         assert ledger.load_snapshot(BRAIN) is None
         replayed = ledger.replay(BRAIN)
         assert replayed == full
@@ -920,7 +920,7 @@ def test_legacy_v1_rate_free_snapshot_is_a_cache_and_can_be_replaced(
         assert ledger.load_snapshot(BRAIN) == full
 
 
-def test_v2_snapshot_is_fingerprint_checked_replay_only_and_replaced_by_v3(
+def test_v2_snapshot_is_fingerprint_checked_replay_only_and_replaced_by_v4(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "legacy-v2.db"
@@ -968,7 +968,7 @@ def test_v2_snapshot_is_fingerprint_checked_replay_only_and_replaced_by_v3(
             "WHERE brain_id = ? AND sequence = ?",
             (BRAIN, full.last_sequence),
         ).fetchone()
-        assert row["schema_version"] == 3
+        assert row["schema_version"] == 4
         assert '"working_set"' in row["state_json"]
 
 

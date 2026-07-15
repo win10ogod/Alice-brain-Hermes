@@ -58,10 +58,12 @@ from alice_brain_hermes.protocol.models import (
 )
 from alice_brain_hermes.runtime.lease import RetainedSQLiteFiles, RuntimeLease
 
-SQLITE_SCHEMA_VERSION = 3
+SQLITE_SCHEMA_VERSION = 4
 MAX_PAGE_SIZE = 10_000
 DEFAULT_MAX_FRAME_BYTES = 65_536
 DEFAULT_MAX_ACK_BYTES = 4_194_304
+_LEGACY_STATE_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+_SQLITE_BRIDGE_SCHEMA_VERSIONS = frozenset({3, SQLITE_SCHEMA_VERSION})
 
 _SQLITE_MUTATION_ACTIONS = frozenset(
     {
@@ -537,6 +539,23 @@ class SQLiteLedger:
                 )
                 self._validate_schema_metadata(SQLITE_SCHEMA_VERSION)
                 return
+            if version == 3:
+                self._validate_schema_metadata(3)
+                self._startup_audited_final_states = self._validate_schema_contract(
+                    3, validate_data=True
+                )
+                self._connection.execute(
+                    "UPDATE schema_metadata SET value = ? WHERE key = ?",
+                    (str(SQLITE_SCHEMA_VERSION), "schema_version"),
+                )
+                self._connection.execute(
+                    f"PRAGMA user_version = {SQLITE_SCHEMA_VERSION}"
+                )
+                self._startup_audited_final_states = self._validate_schema_contract(
+                    SQLITE_SCHEMA_VERSION, validate_data=True
+                )
+                self._validate_schema_metadata(SQLITE_SCHEMA_VERSION)
+                return
             if version != SQLITE_SCHEMA_VERSION:
                 raise SchemaVersionError(
                     f"unsupported SQLite schema version {version}; "
@@ -610,15 +629,16 @@ class SQLiteLedger:
             raise SchemaVersionError(
                 f"SQLite v{version} replay or snapshot data integrity check failed"
             ) from error
-        if version == SQLITE_SCHEMA_VERSION:
+        if version in _SQLITE_BRIDGE_SCHEMA_VERSIONS:
             try:
-                self._validate_v3_rows_in_transaction(
+                self._validate_bridge_profile_rows_in_transaction(
                     historical_states=historical_states,
                     final_states=final_states,
+                    migrate_legacy_action_frames=(version == 3),
                 )
             except Exception as error:
                 raise SchemaVersionError(
-                    "SQLite v3 bridge or profile data integrity check failed"
+                    f"SQLite v{version} bridge or profile data integrity check failed"
                 ) from error
         return final_states
 
@@ -1225,6 +1245,7 @@ class SQLiteLedger:
         *,
         historical_states: Mapping[int, BrainState] | None = None,
         final_state: BrainState | None = None,
+        migrate_legacy_action_frames: bool = False,
     ) -> BrainState:
         rows = self._connection.execute(
             "SELECT bridge_instance_id, first_capture_seq, last_capture_seq, "
@@ -1284,6 +1305,7 @@ class SQLiteLedger:
                     requested_json=record.canonical_json(),
                     requested_fingerprint=record.fingerprint(),
                     historical_state=historical_state,
+                    migrate_legacy_action_frame=migrate_legacy_action_frames,
                 )
             except IdempotencyConflictError as error:
                 raise LedgerIntegrityError(
@@ -1475,11 +1497,12 @@ class SQLiteLedger:
                 )
         return latest
 
-    def _validate_v3_rows_in_transaction(
+    def _validate_bridge_profile_rows_in_transaction(
         self,
         *,
         historical_states: Mapping[str, Mapping[int, BrainState]],
         final_states: Mapping[str, BrainState],
+        migrate_legacy_action_frames: bool,
     ) -> None:
         self._validated_profile_rows_in_transaction()
         rows = self._connection.execute(
@@ -1504,6 +1527,7 @@ class SQLiteLedger:
                 stream,
                 historical_states=brain_history,
                 final_state=final_state,
+                migrate_legacy_action_frames=migrate_legacy_action_frames,
             )
         self._validate_abandonment_history_in_transaction(streams)
 
@@ -1530,7 +1554,7 @@ class SQLiteLedger:
                 raise LedgerIntegrityError("snapshot references an unknown brain")
             if row["schema_version"] == STATE_SCHEMA_VERSION:
                 target_sequences[brain_id].add(int(row["sequence"]))
-        if version == SQLITE_SCHEMA_VERSION:
+        if version in _SQLITE_BRIDGE_SCHEMA_VERSIONS:
             bridge_targets = self._connection.execute(
                 "SELECT stream.brain_id, record.ledger_sequence "
                 "FROM bridge_record AS record JOIN bridge_stream AS stream "
@@ -1565,7 +1589,7 @@ class SQLiteLedger:
                 raise LedgerIntegrityError(
                     "snapshot sequence points beyond authoritative replay"
                 )
-            if row["schema_version"] in {1, 2}:
+            if row["schema_version"] in _LEGACY_STATE_SCHEMA_VERSIONS:
                 if self._snapshot_fingerprint(row["state_json"]) != row["fingerprint"]:
                     raise LedgerIntegrityError(
                         "legacy snapshot fingerprint does not match"
@@ -2718,6 +2742,37 @@ class SQLiteLedger:
             },
         )
 
+    @staticmethod
+    def _legacy_v3_action_frame(
+        frame: ConsciousnessFrameV2,
+        state: BrainState,
+    ) -> ConsciousnessFrameV2:
+        """Reconstruct the exact pre-outcome action projection for migration."""
+        values = frame.model_dump(mode="json")
+        projected_ids = {
+            item["action_id"] for item in values["a"]["actions"]
+        }
+        failure_ids = {
+            action.action_id
+            for action in state.action_records
+            if action.action_id in projected_ids
+            and action.receipt is not None
+            and action.receipt.get("status") == "failure"
+        }
+        for section in ("rd", "a"):
+            for action in values[section]["actions"]:
+                if action["action_id"] in failure_ids:
+                    action["execution_confirmed"] = False
+
+        retained_omitted = len(state.action_records) - len(projected_ids)
+        legacy_node_delta = retained_omitted * 2
+        for section in ("rd", "a"):
+            node_count = values["omission_counts"][section]["fields"][
+                "omitted_record_json_nodes"
+            ]
+            node_count["omitted"] -= legacy_node_delta
+        return ConsciousnessFrameV2.model_validate(values)
+
     def project_bridge_frame(
         self,
         bridge_instance_id: str,
@@ -2845,6 +2900,7 @@ class SQLiteLedger:
         requested_fingerprint: str,
         historical_state: BrainState | None = None,
         event_row: Mapping[str, Any] | None = None,
+        migrate_legacy_action_frame: bool = False,
     ) -> BridgeCommitAckV1:
         if (
             row["record_fingerprint"] != requested_fingerprint
@@ -2967,6 +3023,20 @@ class SQLiteLedger:
             and ack.frame.freshness.stream_connection == "connected"
             and ack.frame.capture_coverage == self._record_capture_coverage(persisted)
         )
+        frame_matches = expected_frame is None or ack.frame == expected_frame
+        migrate_frame = False
+        if (
+            not frame_matches
+            and migrate_legacy_action_frame
+            and expected_frame is not None
+            and historical_state is not None
+        ):
+            legacy_frame = self._legacy_v3_action_frame(
+                expected_frame,
+                historical_state,
+            )
+            frame_matches = ack.frame == legacy_frame
+            migrate_frame = frame_matches
         if (
             ack.record_fingerprint != requested_fingerprint
             or ack.duplicate is not False
@@ -2974,11 +3044,39 @@ class SQLiteLedger:
             or ack.event_sequence != event.sequence
             or ack.through_capture_seq != persisted.last_capture_seq
             or not bounded_frame_relations_match
-            or (expected_frame is not None and ack.frame != expected_frame)
+            or not frame_matches
         ):
             raise LedgerIntegrityError(
                 "persisted bridge acknowledgement does not match replay"
             )
+        if migrate_frame:
+            if expected_frame is None:
+                raise AssertionError("legacy frame migration requires replay")
+            migrated = BridgeCommitAckV1(
+                record_fingerprint=ack.record_fingerprint,
+                duplicate=ack.duplicate,
+                event_id=ack.event_id,
+                event_sequence=ack.event_sequence,
+                frame=expected_frame,
+                through_capture_seq=ack.through_capture_seq,
+            )
+            migrated_json = migrated.canonical_json()
+            updated = self._connection.execute(
+                "UPDATE bridge_record SET ack_json = ? "
+                "WHERE bridge_instance_id = ? AND first_capture_seq = ? "
+                "AND ack_json = ?",
+                (
+                    migrated_json,
+                    requested.bridge_instance_id,
+                    requested.first_capture_seq,
+                    row["ack_json"],
+                ),
+            )
+            if updated.rowcount != 1:
+                raise LedgerIntegrityError(
+                    "legacy bridge acknowledgement migration lost its row"
+                )
+            ack = migrated
         return ack
 
     def commit_bridge_record(
@@ -3405,7 +3503,7 @@ class SQLiteLedger:
             "WHERE brain_id = ? ORDER BY schema_version",
             (brain_id,),
         ).fetchall()
-        supported = {1, 2, STATE_SCHEMA_VERSION}
+        supported = {*_LEGACY_STATE_SCHEMA_VERSIONS, STATE_SCHEMA_VERSION}
         for row in rows:
             schema_version = row["schema_version"]
             if (
@@ -3448,8 +3546,7 @@ class SQLiteLedger:
                 (state.brain_id,),
             ).fetchone()
             if latest is not None and latest["schema_version"] not in {
-                1,
-                2,
+                *_LEGACY_STATE_SCHEMA_VERSIONS,
                 STATE_SCHEMA_VERSION,
             }:
                 raise SchemaVersionError(
@@ -3480,7 +3577,7 @@ class SQLiteLedger:
                     )
                 if latest["schema_version"] == STATE_SCHEMA_VERSION:
                     return self._decode_snapshot(latest, state.brain_id)
-                if latest["schema_version"] not in {1, 2}:
+                if latest["schema_version"] not in _LEGACY_STATE_SCHEMA_VERSIONS:
                     raise SchemaVersionError(
                         f"unsupported snapshot schema {latest['schema_version']}"
                     )
@@ -3537,7 +3634,7 @@ class SQLiteLedger:
             "FROM snapshots WHERE brain_id = ? ORDER BY sequence DESC LIMIT 1",
             (brain_id,),
         ).fetchone()
-        if row is None or row["schema_version"] in {1, 2}:
+        if row is None or row["schema_version"] in _LEGACY_STATE_SCHEMA_VERSIONS:
             return None
         return self._decode_snapshot(row, brain_id)
 

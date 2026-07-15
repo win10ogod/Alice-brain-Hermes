@@ -27,6 +27,11 @@ class ActionPhase(StrEnum):
     RECONSTRUCTED = "reconstructed"
 
 
+class ActionOutcome(StrEnum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+
 class ThoughtBranch(BaseModel):
     """An isolated counterfactual ST branch; never an observed fact."""
 
@@ -76,6 +81,7 @@ class ActionRecord(BaseModel):
     rd_phase: RDPhase
     prepared_branch_id: str | None = Field(default=None, max_length=256)
     execution_confirmed: bool | None = None
+    outcome: ActionOutcome | None = None
     effect_confirmed: bool | None = None
     receipt: FrozenJsonDict | None = None
     reconstruction: FrozenJsonDict | None = None
@@ -266,9 +272,8 @@ def reduce_actions(
             raise DomainInvariantError(
                 "receipt status must be success, failure or unknown"
             )
-        execution = (
-            True if status == "success" else False if status == "failure" else None
-        )
+        execution = True if status in {"success", "failure"} else None
+        outcome = ActionOutcome(status) if execution is True else None
         grounded_ids = _receipt_grounded_ids(event, trusted=trusted_provenance)
         action = _transition(
             action,
@@ -278,19 +283,20 @@ def reduce_actions(
             rd_phase=RDPhase.PREPARE,
             updates={
                 "execution_confirmed": execution,
+                "outcome": outcome,
                 "effect_confirmed": True if grounded_ids else None,
                 "receipt": FrozenJsonDict(event.payload),
             },
         )
     elif event.event_type == "action.reconstructed":
-        outcome = _mapping(event.payload, field="reconstruction")
+        reconstruction = _mapping(event.payload, field="reconstruction")
         action = _transition(
             action,
             event,
             required=ActionPhase.RECEIPT,
             phase=ActionPhase.RECONSTRUCTED,
             rd_phase=RDPhase.RECONSTRUCT,
-            updates={"reconstruction": FrozenJsonDict(outcome)},
+            updates={"reconstruction": FrozenJsonDict(reconstruction)},
         )
     else:
         return actions, frozenset()
@@ -298,6 +304,7 @@ def reduce_actions(
 
 
 __all__ = [
+    "ActionOutcome",
     "ActionPhase",
     "ActionRecord",
     "RDPhase",

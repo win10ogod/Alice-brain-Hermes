@@ -1102,13 +1102,13 @@ def test_malformed_v2_schema_rolls_back_the_whole_migration(tmp_path: Path) -> N
         connection.close()
 
 
-def test_existing_v3_rejects_extra_schema_metadata_rows(tmp_path: Path) -> None:
-    database = tmp_path / "extra-v3-metadata.db"
+def test_existing_v4_rejects_extra_schema_metadata_rows(tmp_path: Path) -> None:
+    database = tmp_path / "extra-v4-metadata.db"
     with SQLiteLedger.open(database):
         pass
     with sqlite3.connect(database) as connection:
         connection.execute(
-            "INSERT INTO schema_metadata(key, value) VALUES ('unexpected', '3')"
+            "INSERT INTO schema_metadata(key, value) VALUES ('unexpected', '4')"
         )
 
     with pytest.raises(SchemaVersionError, match="metadata"):
@@ -1117,7 +1117,7 @@ def test_existing_v3_rejects_extra_schema_metadata_rows(tmp_path: Path) -> None:
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT key, value FROM schema_metadata ORDER BY key"
-        ).fetchall() == [("schema_version", "3"), ("unexpected", "3")]
+        ).fetchall() == [("schema_version", "4"), ("unexpected", "4")]
 
 
 def test_v2_extra_schema_metadata_row_fails_without_partial_migration(
@@ -1154,7 +1154,7 @@ def test_v2_extra_schema_metadata_row_fails_without_partial_migration(
         ).fetchall() == [("schema_version", "2"), ("unexpected", "2")]
 
 
-def test_existing_v3_reopen_rejects_unused_profile_tampering(
+def test_existing_v4_reopen_rejects_unused_profile_tampering(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "profile-tamper.db"
@@ -1186,7 +1186,7 @@ def test_recovery_digest_database_constraint_rejects_null(tmp_path: Path) -> Non
     ["x" * 32, sqlite3.Binary(b"x" * 31), sqlite3.Binary(b"x" * 33)],
     ids=["text", "31-bytes", "33-bytes"],
 )
-def test_existing_v3_reopen_rejects_invalid_recovery_digest_storage(
+def test_existing_v4_reopen_rejects_invalid_recovery_digest_storage(
     tmp_path: Path,
     tampered_digest: object,
 ) -> None:
@@ -1216,7 +1216,7 @@ def test_existing_v3_reopen_rejects_invalid_recovery_digest_storage(
         "disconnected_at = last_seen, closed_final_seq = NULL",
     ],
 )
-def test_existing_v3_reopen_rejects_unattached_bridge_row_tampering(
+def test_existing_v4_reopen_rejects_unattached_bridge_row_tampering(
     tmp_path: Path, tamper_sql: str
 ) -> None:
     database = tmp_path / "bridge-tamper.db"
@@ -1242,7 +1242,7 @@ def test_existing_v3_reopen_rejects_unattached_bridge_row_tampering(
         SQLiteLedger.open(database)
 
 
-def test_v2_migration_with_extra_object_rolls_back_without_partial_v3(
+def test_v2_migration_with_extra_object_rolls_back_without_partial_v4(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "extra-v2.db"
