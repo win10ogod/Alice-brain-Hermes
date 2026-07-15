@@ -523,9 +523,7 @@ class ProtocolConnection:
                 or not isinstance(limit, int)
                 or not 1 <= limit <= TRACE_MAX_PAGE_SIZE
             ):
-                raise ProtocolFault(
-                    "invalid_params", "request params are invalid"
-                )
+                raise ProtocolFault("invalid_params", "request params are invalid")
             events = self.service.runtime.ledger.list_events(
                 brain_id,
                 after_sequence=after_sequence,

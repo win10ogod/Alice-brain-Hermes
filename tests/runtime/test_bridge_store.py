@@ -1671,9 +1671,7 @@ def test_reopen_rejects_malformed_reserved_abandonment_gap(
 ) -> None:
     ledger, engine, _instance = make_engine(tmp_path)
     database = ledger.path
-    ledger.append(
-        new_event("trace.gap", engine.brain_id, engine.actor_id, payload)
-    )
+    ledger.append(new_event("trace.gap", engine.brain_id, engine.actor_id, payload))
     ledger.close()
 
     with pytest.raises(SchemaVersionError, match="bridge or profile"):

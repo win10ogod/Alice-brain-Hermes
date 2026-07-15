@@ -1402,9 +1402,7 @@ class SQLiteLedger:
                     raise LedgerIntegrityError(
                         "reserved abandonment gap cannot be a bridge record"
                     )
-                if event.sequence <= last_record_sequences.get(
-                    bridge_instance_id, 0
-                ):
+                if event.sequence <= last_record_sequences.get(bridge_instance_id, 0):
                     raise LedgerIntegrityError(
                         "reserved abandonment gap precedes bridge history"
                     )
@@ -2749,9 +2747,7 @@ class SQLiteLedger:
     ) -> ConsciousnessFrameV2:
         """Reconstruct the exact pre-outcome action projection for migration."""
         values = frame.model_dump(mode="json")
-        projected_ids = {
-            item["action_id"] for item in values["a"]["actions"]
-        }
+        projected_ids = {item["action_id"] for item in values["a"]["actions"]}
         failure_ids = {
             action.action_id
             for action in state.action_records

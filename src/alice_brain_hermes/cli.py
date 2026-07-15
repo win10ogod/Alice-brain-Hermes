@@ -127,9 +127,7 @@ def _nonnegative_sequence(value: str) -> int:
     try:
         result = int(value, 10)
     except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            "after-sequence must be an integer"
-        ) from error
+        raise argparse.ArgumentTypeError("after-sequence must be an integer") from error
     if result < 0:
         raise argparse.ArgumentTypeError("after-sequence cannot be negative")
     return result
@@ -305,8 +303,7 @@ def _validate_status_payloads(
         for field in ("instance_nonce", "process_marker")
     )
     valid = valid and all(
-        type(health.get(field)) is bool
-        for field in ("shutting_down", "runtime_ready")
+        type(health.get(field)) is bool for field in ("shutting_down", "runtime_ready")
     )
     count_fields = (
         "brain_count",
@@ -333,9 +330,7 @@ def _validate_status_payloads(
     valid = valid and type(health.get("protocol_version")) is int
     valid = valid and health.get("brain_count") == len(brain_ids or [])
     valid = valid and health.get("engine_count") == runtime.get("engine_count")
-    valid = valid and health.get("scheduler_count") == runtime.get(
-        "scheduler_count"
-    )
+    valid = valid and health.get("scheduler_count") == runtime.get("scheduler_count")
     if not valid:
         raise _CliFailure(
             "daemon_status_invalid",
@@ -526,10 +521,7 @@ def _read_readiness(
     def read_once() -> None:
         try:
             first = process.stdout.readline(_MAX_READINESS_BYTES + 1)
-            if (
-                len(first) <= _MAX_READINESS_BYTES
-                and first.endswith(b"\n")
-            ):
+            if len(first) <= _MAX_READINESS_BYTES and first.endswith(b"\n"):
                 # The daemon consumes and closes its one-shot readiness
                 # descriptor after the line.  Reading one more byte proves
                 # there is no second record or trailing garbage.
@@ -587,6 +579,7 @@ def _decode_readiness(payload: bytes) -> dict[str, object]:
             "daemon returned an invalid readiness signal",
             exit_code=5,
         )
+
     def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
         for key, item in pairs:
@@ -623,8 +616,7 @@ def _decode_readiness(payload: bytes) -> dict[str, object]:
             and isinstance(nonce, str)
             and 1 <= len(nonce) <= 128
             and all(
-                character.isascii()
-                and (character.isalnum() or character in "_-")
+                character.isascii() and (character.isalnum() or character in "_-")
                 for character in nonce
             )
         )
@@ -669,9 +661,8 @@ def _spawn_daemon(home: Path) -> subprocess.Popen[bytes]:
     creationflags = 0
     start_new_session = os.name == "posix"
     if os.name == "nt":
-        creationflags = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+            subprocess, "DETACHED_PROCESS", 0
         )
     return subprocess.Popen(
         [
@@ -1013,8 +1004,7 @@ def _dispatch(arguments: argparse.Namespace) -> int:
     timeout_seconds = arguments.timeout
     command = arguments.alice_brain_command
     if command == "status" or (
-        command == "daemon"
-        and arguments.alice_brain_daemon_command == "status"
+        command == "daemon" and arguments.alice_brain_daemon_command == "status"
     ):
         _write_success(
             "daemon.status",
@@ -1026,11 +1016,7 @@ def _dispatch(arguments: argparse.Namespace) -> int:
         _write_success("doctor", data)
         return exit_code
     if command == "identity" and arguments.alice_brain_identity_command == "get":
-        params = (
-            {}
-            if arguments.brain_id is None
-            else {"brain_id": arguments.brain_id}
-        )
+        params = {} if arguments.brain_id is None else {"brain_id": arguments.brain_id}
         _write_success(
             "identity.get",
             _typed_read_rpc(

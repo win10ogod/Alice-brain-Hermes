@@ -168,9 +168,7 @@ def build_trace_page(
             after_sequence=after_sequence,
             requested_limit=requested_limit,
             returned_count=len(selected),
-            next_after_sequence=(
-                selected[-1].sequence if selected else after_sequence
-            ),
+            next_after_sequence=(selected[-1].sequence if selected else after_sequence),
             has_more=count_has_more or byte_limited,
             byte_limited=byte_limited,
             blocked_event_sequence=blocked_sequence,

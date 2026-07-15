@@ -74,9 +74,7 @@ def _initialized(service: ProtocolService):
 
 def _create_brain(connection, request_id: int, name: str | None = None) -> str:
     response = _decode(
-        connection.handle_frame(
-            _request(request_id, "brain.create", {"name": name})
-        )
+        connection.handle_frame(_request(request_id, "brain.create", {"name": name}))
     )
     return response["result"]["brain_id"]
 
@@ -127,14 +125,10 @@ def test_identity_get_requires_selection_for_multiple_brains(
 
     ambiguous = _decode(connection.handle_frame(_request(4, "identity.get")))
     selected = _decode(
-        connection.handle_frame(
-            _request(5, "identity.get", {"brain_id": second})
-        )
+        connection.handle_frame(_request(5, "identity.get", {"brain_id": second}))
     )
     missing = _decode(
-        connection.handle_frame(
-            _request(6, "identity.get", {"brain_id": new_id()})
-        )
+        connection.handle_frame(_request(6, "identity.get", {"brain_id": new_id()}))
     )
 
     assert ambiguous["error"]["code"] == "brain_id_required"
@@ -276,12 +270,16 @@ def test_trace_list_reports_a_single_unreturnable_event_without_advancing_cursor
 ) -> None:
     connection = _initialized(service)
     brain_id = _create_brain(connection, 2, None)
-    event = new_event(
-        "capabilities.reported",
-        brain_id,
-        brain_id,
-        {"capabilities": {"large": "x" * 20_000}},
-    ).model_copy(update={"sequence": 1}).revalidated()
+    event = (
+        new_event(
+            "capabilities.reported",
+            brain_id,
+            brain_id,
+            {"capabilities": {"large": "x" * 20_000}},
+        )
+        .model_copy(update={"sequence": 1})
+        .revalidated()
+    )
 
     monkeypatch.setattr(
         service.runtime.ledger,

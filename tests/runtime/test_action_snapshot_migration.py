@@ -168,8 +168,7 @@ def legacy_action_ack_database(database: Path, *, mark_sqlite_v3: bool):
         )
         if mark_sqlite_v3:
             connection.execute(
-                "UPDATE schema_metadata SET value = '3' "
-                "WHERE key = 'schema_version'"
+                "UPDATE schema_metadata SET value = '3' WHERE key = 'schema_version'"
             )
             connection.execute("PRAGMA user_version = 3")
     return brain_id, bridge_instance_id, gap, current_ack
