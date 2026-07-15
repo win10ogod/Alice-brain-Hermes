@@ -28,6 +28,7 @@ from alice_brain_hermes.protocol.models import (
     GAP_CAUSES,
     MAX_BRIDGE_INTEGER,
     MAX_BRIDGE_STRING_BYTES,
+    MAX_CAPTURE_SEQUENCE,
     MIN_BRIDGE_INTEGER,
     BrainProfileV1,
     BridgeCommitAckV2,
@@ -629,6 +630,13 @@ class HookBridge:
                 self._health = updated_health
                 return False
             capture_seq = self._next_capture_seq
+            if capture_seq > MAX_CAPTURE_SEQUENCE:
+                self._health = replace(
+                    self._health,
+                    trace_complete=False,
+                    last_error="capture_sequence_capacity_exhausted",
+                )
+                return False
             next_capture_seq = capture_seq + 1
             if kwargs.get("telemetry_schema_version") != SOURCE_SCHEMA_VERSION:
                 prepared_gap = self._prepare_gap_publication_locked(
@@ -676,6 +684,8 @@ class HookBridge:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive exact int")
+            if value > MAX_CAPTURE_SEQUENCE:
+                raise ValueError("capture sequence capacity is exhausted")
         if last_capture_seq < first_capture_seq:
             raise ValueError("reserved capture interval is reversed")
         validated_stats: dict[str, int] = {}

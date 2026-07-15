@@ -45,6 +45,10 @@ _BOOTSTRAP_MAX_DEPTH = 6
 _BOOTSTRAP_MAX_NODES = 1_024
 _BOOTSTRAP_MAX_ITEMS = 64
 _BOOTSTRAP_MAX_STRING_BYTES = 16_384
+# The runtime persists the successor cursor in a signed SQLite INTEGER.  The
+# final int64 value is therefore reserved for ``next_capture_seq``.  Keep this
+# stdlib-only registration boundary inert instead of importing runtime models.
+_BOOTSTRAP_MAX_CAPTURE_SEQUENCE = 2**63 - 2
 _EMPTY_BOOTSTRAP_COPY_STATS: MappingProxyType[str, int] = MappingProxyType({})
 
 
@@ -313,6 +317,9 @@ class _BootstrapCaptureBuffer:
 
     def capture(self, hook: str, kwargs: dict[str, Any]) -> None:
         with self._capture_lock:
+            if self._next_capture_seq > _BOOTSTRAP_MAX_CAPTURE_SEQUENCE:
+                self._mark_capture_capacity_exhausted_locked()
+                return
             reservation = self._reserve_locked()
             capture_seq = reservation.capture_seq
             try:
@@ -368,6 +375,9 @@ class _BootstrapCaptureBuffer:
         self._defer_or_notify_worker()
 
     def _reserve_locked(self) -> _DispatchReservation:
+        if self._next_capture_seq > _BOOTSTRAP_MAX_CAPTURE_SEQUENCE:
+            self._mark_capture_capacity_exhausted_locked()
+            raise OverflowError("bootstrap capture sequence capacity is exhausted")
         attempt = _active_dispatch_attempt()
         if attempt is not None and attempt.reservation is not None:
             raise RuntimeError("one Hermes callback may reserve only one capture")
@@ -386,6 +396,13 @@ class _BootstrapCaptureBuffer:
         if attempt is not None:
             attempt.notify_buffer = self
         return reservation
+
+    def _mark_capture_capacity_exhausted_locked(self) -> None:
+        """Publish an exact fail-closed latch without reserving a false record."""
+
+        self._emergency_trace_incomplete = True
+        self._emergency_degraded = True
+        self._emergency_last_error = "capture_sequence_capacity_exhausted"
 
     def record_dispatch_failure(
         self,
