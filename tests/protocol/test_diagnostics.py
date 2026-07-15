@@ -4,15 +4,24 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from alice_brain_hermes.core.events import new_event
+from alice_brain_hermes.core.identity import ActorKind, ActorRecord
 from alice_brain_hermes.ids import new_id
+from alice_brain_hermes.protocol import diagnostics as diagnostics_protocol
+from alice_brain_hermes.protocol.client import _validate_response_tree
+from alice_brain_hermes.protocol.diagnostics import (
+    IdentitySnapshotV1,
+    build_trace_page,
+)
 from alice_brain_hermes.protocol.models import (
     PROTOCOL_VERSION,
     ProtocolLimitsV1,
 )
 from alice_brain_hermes.protocol.service import ProtocolService
 from alice_brain_hermes.runtime.daemon import HermesDaemonRuntime
+from alice_brain_hermes.runtime.store import SQLiteLedger
 
 TOKEN = "d" * 64
 
@@ -136,6 +145,48 @@ def test_identity_get_requires_selection_for_multiple_brains(
     assert selected["result"]["brain_id"] == second
     assert selected["result"]["brain_id"] != first
     assert missing["error"]["code"] == "not_found"
+
+
+def test_identity_snapshot_rejects_every_additional_self_actor() -> None:
+    brain_id = new_id()
+    with pytest.raises(ValidationError, match="self actor"):
+        IdentitySnapshotV1(
+            brain_id=brain_id,
+            self_actor_id=brain_id,
+            name=None,
+            state_sequence=1,
+            actors=(
+                ActorRecord(actor_id=brain_id, kind=ActorKind.SELF),
+                ActorRecord(actor_id=new_id(), kind=ActorKind.SELF),
+            ),
+            authorizations=(),
+        )
+
+
+def test_identity_get_reports_a_valid_zero_event_brain(tmp_path: Path) -> None:
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    brain_id = new_id()
+    with SQLiteLedger.open(home / "runtime.db") as ledger:
+        ledger.ensure_brain(brain_id)
+
+    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
+    protocol = ProtocolService(
+        runtime,
+        credential=TOKEN,
+        instance_nonce=runtime.lease.instance_nonce,
+    )
+    try:
+        connection = _initialized(protocol)
+        response = _decode(
+            connection.handle_frame(_request(2, "identity.get", {"brain_id": brain_id}))
+        )
+
+        assert response["result"]["brain_id"] == brain_id
+        assert response["result"]["state_sequence"] == 0
+        assert response["result"]["name"] is None
+    finally:
+        runtime.close()
 
 
 def test_trace_list_is_ordered_cursor_paged_and_truthful(
@@ -304,3 +355,151 @@ def test_trace_list_reports_a_single_unreturnable_event_without_advancing_cursor
     assert page["has_more"] is True
     assert page["byte_limited"] is True
     assert page["blocked_event_sequence"] == 1
+
+
+def test_trace_list_obeys_the_full_response_node_budget_without_skipping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits = ProtocolLimitsV1(
+        max_response_bytes=1_048_576,
+        max_nodes=20_000,
+        max_depth=128,
+    )
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
+    service = ProtocolService(
+        runtime,
+        credential=TOKEN,
+        instance_nonce=runtime.lease.instance_nonce,
+        limits=limits,
+    )
+    try:
+        connection = _initialized(service)
+        brain_id = _create_brain(connection, 2, None)
+        events = [
+            new_event(
+                "custom.observed",
+                brain_id,
+                brain_id,
+                {"values": [0] * 128},
+            )
+            .model_copy(update={"sequence": sequence})
+            .revalidated()
+            for sequence in range(1, 301)
+        ]
+        monkeypatch.setattr(
+            runtime.ledger,
+            "list_events",
+            lambda *_args, **_kwargs: events,
+        )
+        wire = connection.handle_frame(
+            _request(3, "trace.list", {"brain_id": brain_id, "limit": 1_000})
+        )
+    finally:
+        runtime.close()
+
+    response = _decode(wire)
+    _validate_response_tree(response, limits)
+    page = response["result"]
+    assert len(wire) <= limits.max_response_bytes
+    assert 0 < page["returned_count"] < len(events)
+    assert page["byte_limited"] is False
+    assert page["node_limited"] is True
+    assert page["depth_limited"] is False
+    assert page["blocked_event_sequence"] == page["next_after_sequence"] + 1
+    assert [event["sequence"] for event in page["events"]] == list(
+        range(1, page["next_after_sequence"] + 1)
+    )
+
+
+def test_trace_list_reports_a_depth_blocked_first_event_without_poisoning_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits = ProtocolLimitsV1(
+        max_response_bytes=1_048_576,
+        max_nodes=20_000,
+        max_depth=128,
+    )
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
+    service = ProtocolService(
+        runtime,
+        credential=TOKEN,
+        instance_nonce=runtime.lease.instance_nonce,
+        limits=limits,
+    )
+    try:
+        connection = _initialized(service)
+        brain_id = _create_brain(connection, 2, None)
+        nested: object = "leaf"
+        for _ in range(124):
+            nested = [nested]
+        event = (
+            new_event("custom.observed", brain_id, brain_id, {"nested": nested})
+            .model_copy(update={"sequence": 1})
+            .revalidated()
+        )
+        monkeypatch.setattr(
+            runtime.ledger,
+            "list_events",
+            lambda *_args, **_kwargs: [event],
+        )
+        wire = connection.handle_frame(
+            _request(3, "trace.list", {"brain_id": brain_id, "limit": 1})
+        )
+    finally:
+        runtime.close()
+
+    response = _decode(wire)
+    _validate_response_tree(response, limits)
+    page = response["result"]
+    assert page["events"] == []
+    assert page["next_after_sequence"] == 0
+    assert page["blocked_event_sequence"] == 1
+    assert page["byte_limited"] is False
+    assert page["node_limited"] is False
+    assert page["depth_limited"] is True
+
+
+def test_trace_page_uses_bounded_candidate_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    brain_id = new_id()
+    events = [
+        new_event(
+            "custom.observed",
+            brain_id,
+            brain_id,
+            {"values": [0] * 128},
+        )
+        .model_copy(update={"sequence": sequence})
+        .revalidated()
+        for sequence in range(1, 257)
+    ]
+    checks = 0
+    original = diagnostics_protocol._page_limit_violations
+
+    def counted(*args, **kwargs):
+        nonlocal checks
+        checks += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(diagnostics_protocol, "_page_limit_violations", counted)
+
+    page = build_trace_page(
+        events,
+        brain_id=brain_id,
+        after_sequence=0,
+        requested_limit=256,
+        max_result_bytes=1_048_500,
+        max_result_nodes=5_000,
+        max_result_depth=127,
+    )
+
+    assert page.node_limited is True
+    assert page.blocked_event_sequence == page.next_after_sequence + 1
+    assert checks <= 16

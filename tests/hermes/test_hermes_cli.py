@@ -56,11 +56,23 @@ def test_hermes_handler_delegates_to_shared_python_control_layer(
         ]
     )
 
-    assert hermes_cli.handle_alice_brain_cli(arguments) == 17
+    with pytest.raises(SystemExit) as stopped:
+        hermes_cli.handle_alice_brain_cli(arguments)
+
+    assert stopped.value.code == 17
     assert captured == [arguments]
     assert arguments.alice_brain_command == "trace"
     assert arguments.after_sequence == 4
     assert arguments.limit == 7
+
+
+def test_hermes_handler_returns_normally_for_shared_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hermes_cli, "run_control_namespace", lambda _arguments: 0)
+    arguments = parser().parse_args(["status"])
+
+    assert hermes_cli.handle_alice_brain_cli(arguments) == 0
 
 
 def test_status_does_not_autostart_or_create_the_runtime_home(

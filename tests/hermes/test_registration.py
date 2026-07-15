@@ -837,6 +837,23 @@ def test_enabled_hermes_alice_brain_help_uses_lazy_cli(tmp_path: Path) -> None:
     assert not handler_alice_home.exists()
 
 
+def test_enabled_hermes_alice_brain_propagates_machine_failure_exit(
+    tmp_path: Path,
+) -> None:
+    completed, alice_home = _run_real_hermes_cli(
+        tmp_path,
+        "alice-brain",
+        "identity",
+    )
+
+    assert completed.returncode == 3
+    assert completed.stdout == ""
+    payload = json.loads(completed.stderr)
+    assert payload["code"] == "daemon_not_running"
+    assert payload["ok"] is False
+    assert not alice_home.exists()
+
+
 def test_lazy_cli_handler_prints_stored_parser_help(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

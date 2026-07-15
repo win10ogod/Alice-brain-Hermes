@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from alice_brain_hermes.core.action import ActionPhase, RDPhase
 from alice_brain_hermes.core.cognition import LocalCognitionPort, result_payload
 from alice_brain_hermes.core.events import new_event
+from alice_brain_hermes.core.identity import ActorKind, ActorRecord, IdentityState
 from alice_brain_hermes.core.personality import EnergyVector
 from alice_brain_hermes.core.reducer import reduce_many, reduce_state
 from alice_brain_hermes.core.state import BrainState
@@ -140,6 +141,27 @@ def test_identity_keeps_self_and_external_actor_attribution_separate() -> None:
     assert state.identity.self_actor_id == BRAIN
     assert state.identity.actor(OTHER_ACTOR).kind.value == "external_agent"
     assert state.identity.actor(OTHER_ACTOR).actor_id != state.identity.self_actor_id
+
+
+def test_identity_reducer_rejects_a_second_self_actor() -> None:
+    forged = event(
+        "identity.actor_registered",
+        {"actor_id": OTHER_ACTOR, "kind": "self"},
+    )
+
+    with pytest.raises(DomainInvariantError, match="self actor"):
+        reduce_state(BrainState.genesis(BRAIN), forged)
+
+
+def test_identity_model_rejects_a_legacy_second_self_actor() -> None:
+    with pytest.raises(ValidationError, match="self actor"):
+        IdentityState(
+            self_actor_id=BRAIN,
+            actors=(
+                ActorRecord(actor_id=BRAIN, kind=ActorKind.SELF),
+                ActorRecord(actor_id=OTHER_ACTOR, kind=ActorKind.SELF),
+            ),
+        )
 
 
 def test_only_self_authority_can_add_trusted_provenance() -> None:

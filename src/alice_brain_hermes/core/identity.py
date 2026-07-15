@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict
 from alice_brain_hermes.core.limits import (
@@ -95,6 +95,24 @@ class IdentityState(BaseModel):
     def _json_arrays_to_tuples(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
 
+    @model_validator(mode="after")
+    def _exact_self_actor_boundary(self) -> IdentityState:
+        self_id_records = tuple(
+            actor for actor in self.actors if actor.actor_id == self.self_actor_id
+        )
+        self_kind_records = tuple(
+            actor for actor in self.actors if actor.kind is ActorKind.SELF
+        )
+        if (
+            len(self_id_records) != 1
+            or len(self_kind_records) != 1
+            or self_id_records[0] != self_kind_records[0]
+        ):
+            raise ValueError(
+                "identity must contain exactly one self actor at self_actor_id"
+            )
+        return self
+
     @classmethod
     def genesis(cls, brain_id: str) -> IdentityState:
         validate_id(brain_id)
@@ -154,6 +172,8 @@ def reduce_identity(identity: IdentityState, event: EventEnvelope) -> IdentitySt
             and actor.kind is not ActorKind.SELF
         ):
             raise DomainInvariantError("the self actor kind cannot be replaced")
+        if actor.kind is ActorKind.SELF and actor.actor_id != identity.self_actor_id:
+            raise DomainInvariantError("a second self actor cannot be registered")
         if actor.parent_actor_id == actor.actor_id:
             raise DomainInvariantError("an actor cannot be its own parent")
         if (

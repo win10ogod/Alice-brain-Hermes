@@ -13,6 +13,7 @@ from alice_brain_hermes.core.events import EventEnvelope, new_event
 from alice_brain_hermes.core.reducer import reduce_many
 from alice_brain_hermes.core.state import STATE_SCHEMA_VERSION, BrainState
 from alice_brain_hermes.errors import (
+    DomainInvariantError,
     EventConflictError,
     LedgerClosedError,
     LedgerIntegrityError,
@@ -46,6 +47,25 @@ def test_snapshot_requires_a_brain_while_bootstrap_preserves_genesis_creation(
             ledger._connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
             == 0
         )
+
+
+def test_replay_rejects_a_legacy_event_with_a_second_self_actor(
+    tmp_path: Path,
+) -> None:
+    brain_id = new_id()
+    with SQLiteLedger.open(tmp_path / "hermes.db") as ledger:
+        ledger.ensure_brain(brain_id)
+        ledger.append(
+            new_event(
+                "identity.actor_registered",
+                brain_id,
+                brain_id,
+                {"actor_id": new_id(), "kind": "self"},
+            )
+        )
+
+        with pytest.raises(DomainInvariantError, match="self actor"):
+            ledger.replay(brain_id, use_snapshot=False)
 
 
 def test_dynamic_compensation_validates_profile_payload_and_rolls_back_delete(

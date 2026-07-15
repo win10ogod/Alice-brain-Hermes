@@ -70,6 +70,13 @@ class _Binding:
     bridge_instance_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class _ResultBudget:
+    bytes: int
+    nodes: int
+    depth: int
+
+
 def _pairs(items: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in items:
@@ -115,7 +122,13 @@ def _request_id(value: object) -> int | str:
     raise ValueError("request id must be a bounded string or integer")
 
 
-def _success_result_budget(request_id: int | str, *, max_response_bytes: int) -> int:
+def _success_result_budget(
+    request_id: int | str,
+    *,
+    max_response_bytes: int,
+    max_response_nodes: int,
+    max_response_depth: int,
+) -> _ResultBudget:
     empty = json.dumps(
         {"jsonrpc": "2.0", "id": request_id, "result": {}},
         ensure_ascii=False,
@@ -123,7 +136,14 @@ def _success_result_budget(request_id: int | str, *, max_response_bytes: int) ->
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    return max_response_bytes - (len(empty) - len(b"{}"))
+    return _ResultBudget(
+        bytes=max_response_bytes - (len(empty) - len(b"{}")),
+        # A success envelope contributes its root, three keys, and the
+        # jsonrpc/id values outside the result subtree.
+        nodes=max_response_nodes - 6,
+        # The result object is nested one level below the response root.
+        depth=max_response_depth - 1,
+    )
 
 
 class ProtocolService:
@@ -310,6 +330,8 @@ class ProtocolConnection:
                 _success_result_budget(
                     request_id,
                     max_response_bytes=self.service.limits.max_response_bytes,
+                    max_response_nodes=self.service.limits.max_nodes,
+                    max_response_depth=self.service.limits.max_depth,
                 ),
             )
             return self._success(request_id, result)
@@ -437,7 +459,7 @@ class ProtocolConnection:
         self,
         method: str,
         params: Mapping[str, object],
-        max_result_bytes: int,
+        result_budget: _ResultBudget,
     ) -> Mapping[str, object]:
         if method == "health":
             self._only(params, set())
@@ -534,7 +556,9 @@ class ProtocolConnection:
                 brain_id=brain_id,
                 after_sequence=after_sequence,
                 requested_limit=limit,
-                max_result_bytes=max_result_bytes,
+                max_result_bytes=result_budget.bytes,
+                max_result_nodes=result_budget.nodes,
+                max_result_depth=result_budget.depth,
             )
             return page.model_dump(mode="json")
         if method == "brain.create":
@@ -627,7 +651,7 @@ class ProtocolConnection:
                 record,
                 connected_nonce=self.connection_nonce,
                 max_frame_bytes=self.service.limits.max_frame_bytes,
-                max_ack_bytes=max_result_bytes,
+                max_ack_bytes=result_budget.bytes,
             )
             return ack.model_dump(mode="json")
         if method == "bridge.close":

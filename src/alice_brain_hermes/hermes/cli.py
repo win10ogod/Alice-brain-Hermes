@@ -28,7 +28,10 @@ def handle_alice_brain_cli(arguments: argparse.Namespace) -> int:
             raise RuntimeError("Alice-brain-Hermes CLI parser is unavailable")
         parser.print_help()
         return 0
-    return run_control_namespace(arguments)
+    exit_code = run_control_namespace(arguments)
+    if exit_code != 0:
+        raise SystemExit(exit_code)
+    return 0
 
 
 __all__ = ["handle_alice_brain_cli", "setup_alice_brain_cli"]
