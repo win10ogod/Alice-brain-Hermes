@@ -10,6 +10,8 @@ from enum import StrEnum
 from typing import Literal, Protocol
 
 from alice_brain_hermes.protocol.identity import (
+    IDENTITY_NAME_MAX_CODEPOINTS,
+    IDENTITY_REASON_MAX_CODEPOINTS,
     IdentityChoiceV1,
     IdentityNamingLeaseV1,
 )
@@ -30,8 +32,16 @@ def _identity_choice_schema() -> dict[str, object]:
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "name": {"type": "string", "minLength": 1, "maxLength": 160},
-            "reason": {"type": "string", "minLength": 1, "maxLength": 512},
+            "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": IDENTITY_NAME_MAX_CODEPOINTS,
+            },
+            "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": IDENTITY_REASON_MAX_CODEPOINTS,
+            },
         },
         "required": ["name", "reason"],
     }

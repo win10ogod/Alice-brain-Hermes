@@ -180,6 +180,11 @@ def test_worker_uses_host_defaults_and_commits_only_exact_structured_choice() ->
         {"name": " Alice ", "reason": "why"},
         {"name": "", "reason": "why"},
         {"name": "Mira", "reason": ""},
+        {"name": "Å", "reason": "not already normalized"},
+        {"name": "Mi\x00ra", "reason": "contains a control"},
+        {"name": "Mira\ufdd0", "reason": "contains a noncharacter"},
+        {"name": "😀" * 129, "reason": "exceeds the UTF-8 byte bound"},
+        {"name": "Mira", "reason": "line one\nline two"},
     ],
 )
 def test_invalid_structured_choice_is_failed_without_default_name(
@@ -197,6 +202,13 @@ def test_invalid_structured_choice_is_failed_without_default_name(
     assert worker.run_once() is NamingRunResult.FAILED
     assert port.completed == []
     assert port.failed == [(active.lease_id, "invalid_structured_choice")]
+
+
+def test_identity_choice_accepts_an_exact_normalized_utf8_boundary() -> None:
+    choice = IdentityChoiceV1(name="😀" * 128, reason="chosen")
+
+    assert choice.name == "😀" * 128
+    assert len(choice.name.encode("utf-8")) == 512
 
 
 def test_provider_failure_records_only_sanitized_type_not_message() -> None:
