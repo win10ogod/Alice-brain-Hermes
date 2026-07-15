@@ -23,6 +23,94 @@ from alice_brain_hermes.protocol.models import (
 )
 
 
+def test_semantic_batch_uses_versioned_protocol_and_frame_contract() -> None:
+    assert models_module.PROTOCOL_VERSION == 2
+    assert models_module.FRAME_SCHEMA_VERSION == 3
+
+
+def _empty_frame_v3(*, brain_id: str, state_sequence: int) -> object:
+    return models_module.ConsciousnessFrameV3(
+        brain_id=brain_id,
+        state_sequence=state_sequence,
+        through_capture_seq=1,
+        logical_clock=0.0,
+        trace_complete=True,
+        runtime_health="healthy",
+        c0_tick=0,
+        pc={},
+        energy={},
+        st={},
+        rd={},
+        a={},
+        world={},
+        self_boundary={},
+        memory={},
+        capabilities={},
+        semantic_context={},
+        unresolved_evidence=False,
+        capture_coverage={},
+        freshness={
+            "projected_at_state_sequence": state_sequence,
+            "scheduler_tick": 0,
+            "scheduler_sample": "not_sampled",
+            "stream_connection": "connected",
+        },
+    )
+
+
+def test_ack_v2_binds_raw_and_bounded_contiguous_derived_batch() -> None:
+    brain_id = new_id()
+    raw_event_id = new_id()
+    derived_ids = (new_id(), new_id())
+    ack = models_module.BridgeCommitAckV2(
+        record_fingerprint="a" * 64,
+        raw_event_id=raw_event_id,
+        raw_event_sequence=4,
+        derived_event_ids=derived_ids,
+        derived_event_count=2,
+        last_event_sequence=6,
+        semantic_status="applied",
+        semantic_complete=True,
+        semantic_fingerprint="b" * 64,
+        frame=_empty_frame_v3(brain_id=brain_id, state_sequence=6),
+        through_capture_seq=1,
+    )
+
+    assert ack.schema_version == 2
+    assert ack.event_id == raw_event_id
+    assert ack.event_sequence == 4
+    assert ack.frame.state_sequence == ack.last_event_sequence
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"derived_event_count": 1}, "derived event count"),
+        ({"last_event_sequence": 5}, "contiguous"),
+        ({"semantic_complete": False}, "semantic completeness"),
+    ],
+)
+def test_ack_v2_rejects_inconsistent_semantic_batch(
+    updates: dict[str, object], message: str
+) -> None:
+    values = {
+        "record_fingerprint": "a" * 64,
+        "raw_event_id": new_id(),
+        "raw_event_sequence": 4,
+        "derived_event_ids": (new_id(), new_id()),
+        "derived_event_count": 2,
+        "last_event_sequence": 6,
+        "semantic_status": "applied",
+        "semantic_complete": True,
+        "semantic_fingerprint": "b" * 64,
+        "frame": _empty_frame_v3(brain_id=new_id(), state_sequence=6),
+        "through_capture_seq": 1,
+    }
+    values.update(updates)
+    with pytest.raises(ValidationError, match=message):
+        models_module.BridgeCommitAckV2(**values)
+
+
 def _coverage() -> dict[str, object]:
     return CoverageV1(
         policy_version="copy-v1",
@@ -582,6 +670,16 @@ def test_capabilities_report_unobserved_streams_and_transport_limits() -> None:
     assert capabilities["chunk_capture"] == "unobserved"
     assert capabilities["reasoning_capture"] == "unobserved"
     assert capabilities["bridge_close_recovery"] == "opaque_token_v1"
+    assert capabilities["limits"]["max_response_bytes"] == 1_048_576
+    assert capabilities["limits"]["max_response_bytes"] <= models_module.MAX_PROTOCOL_BYTES
+    assert capabilities["limits"]["max_request_bytes"] == (
+        models_module.TASK6_MAX_DETACHED_RECORD_BYTES
+        + models_module.MAX_BRIDGE_COMMIT_ENVELOPE_BYTES
+    )
+    assert capabilities["limits"]["max_record_bytes"] == (
+        models_module.TASK6_MAX_DETACHED_RECORD_BYTES
+    )
+    assert capabilities["limits"]["max_frame_bytes"] == 65_536
     assert capabilities["limits"]["max_concurrent_connections"] == 64
     assert capabilities["limits"]["unauthenticated_idle_timeout_ms"] == 5_000
 

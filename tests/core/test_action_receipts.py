@@ -39,6 +39,19 @@ def dispatched_state() -> BrainState:
     )
 
 
+def prepared_state() -> BrainState:
+    return reduce_many(
+        BrainState.genesis(BRAIN),
+        [
+            action_event(
+                "action.proposed",
+                {"action_id": "action-1", "intent": {"operation": "test"}},
+            ),
+            action_event("action.prepared", {"action_id": "action-1"}),
+        ],
+    )
+
+
 def state_with_receipt(status: str) -> BrainState:
     return reduce_many(
         dispatched_state(),
@@ -75,6 +88,31 @@ def test_unknown_receipt_keeps_execution_and_outcome_unknown() -> None:
 
     assert action.execution_confirmed is None
     assert action.outcome is None
+
+
+def test_blocked_action_records_non_dispatch_without_fabricating_outcome_or_effect() -> None:
+    state = reduce_many(
+        prepared_state(),
+        [
+            action_event(
+                "action.blocked",
+                {
+                    "action_id": "action-1",
+                    "status": "blocked",
+                    "execution_confirmed": False,
+                    "outcome": None,
+                    "effect_confirmed": None,
+                },
+            )
+        ],
+    )
+
+    action = state.actions["action-1"]
+    assert action.phase is ActionPhase.BLOCKED
+    assert action.execution_confirmed is False
+    assert action.outcome is None
+    assert action.effect_confirmed is None
+    assert state.world.observed == ()
 
 
 def receipt_with_evidence(*, actor_id: str, status: str = "success"):

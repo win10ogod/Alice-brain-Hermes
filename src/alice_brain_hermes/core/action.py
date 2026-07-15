@@ -22,6 +22,7 @@ class RDPhase(StrEnum):
 class ActionPhase(StrEnum):
     PROPOSED = "proposed"
     PREPARED = "prepared"
+    BLOCKED = "blocked"
     DISPATCHED = "dispatched"
     RECEIPT = "receipt"
     RECONSTRUCTED = "reconstructed"
@@ -216,6 +217,7 @@ def reduce_actions(
     lifecycle_events = {
         "action.proposed",
         "action.prepared",
+        "action.blocked",
         "action.dispatched",
         "action.receipt",
         "action.reconstructed",
@@ -257,6 +259,29 @@ def reduce_actions(
             phase=ActionPhase.PREPARED,
             rd_phase=RDPhase.PREPARE,
             updates={"prepared_branch_id": branch_id},
+        )
+    elif event.event_type == "action.blocked":
+        if (
+            event.payload.get("status") != "blocked"
+            or event.payload.get("execution_confirmed") is not False
+            or event.payload.get("outcome") is not None
+            or event.payload.get("effect_confirmed") is not None
+        ):
+            raise DomainInvariantError(
+                "blocked action must explicitly record non-execution only"
+            )
+        action = _transition(
+            action,
+            event,
+            required=ActionPhase.PREPARED,
+            phase=ActionPhase.BLOCKED,
+            rd_phase=RDPhase.PREPARE,
+            updates={
+                "execution_confirmed": False,
+                "outcome": None,
+                "effect_confirmed": None,
+                "receipt": FrozenJsonDict(event.payload),
+            },
         )
     elif event.event_type == "action.dispatched":
         action = _transition(

@@ -19,10 +19,10 @@ from alice_brain_hermes.core.workspace import WorkspaceCoordinator
 from alice_brain_hermes.errors import EventConflictError, ExpectedSequenceError
 from alice_brain_hermes.ids import validate_id
 from alice_brain_hermes.protocol.models import (
-    BridgeCommitAckV1,
+    BridgeCommitAckV2,
     BridgeRecordV1,
     BridgeStreamState,
-    ConsciousnessFrameV2,
+    ConsciousnessFrameV3,
 )
 from alice_brain_hermes.runtime.store import BridgeAbandonResult, BridgeCommitResult
 
@@ -69,7 +69,7 @@ class EventLedger(Protocol):
         connected_nonce: str | None = None,
         scheduler_sample: str,
         max_frame_bytes: int = 65_536,
-    ) -> ConsciousnessFrameV2: ...
+    ) -> ConsciousnessFrameV3: ...
 
 
 class Coordinator(Protocol):
@@ -212,7 +212,7 @@ class ConsciousEngine:
         connected_nonce: str | None = None,
         max_frame_bytes: int = 65_536,
         max_ack_bytes: int = 4_194_304,
-    ) -> BridgeCommitAckV1:
+    ) -> BridgeCommitAckV2:
         """Commit one typed bridge record and publish only its committed successor."""
         self._assert_creator_process()
         with self._lock:
@@ -239,7 +239,7 @@ class ConsciousEngine:
                 self._diverged = True
                 raise
             if result.successor is not None:
-                if result.successor.last_sequence != result.ack.event_sequence:
+                if result.successor.last_sequence != result.ack.last_event_sequence:
                     self._diverged = True
                     raise EventConflictError(
                         "bridge publication does not match committed sequence"
@@ -286,7 +286,7 @@ class ConsciousEngine:
         connected_nonce: str | None = None,
         scheduler_sample: str,
         max_frame_bytes: int = 65_536,
-    ) -> ConsciousnessFrameV2:
+    ) -> ConsciousnessFrameV3:
         """Return one integrity-checked live frame under engine serialization."""
         self._assert_creator_process()
         with self._lock:

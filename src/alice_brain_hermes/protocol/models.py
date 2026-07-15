@@ -23,12 +23,12 @@ from pydantic import (
 from alice_brain_hermes.core.events import FrozenJsonDict, thaw_json
 from alice_brain_hermes.ids import validate_id
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 SERVER_ADAPTER_ID = "alice-brain-hermes-observer-v1"
 OBSERVER_SCHEMA_VERSION = 1
 RECORD_SCHEMA_VERSION = 1
 GAP_SCHEMA_VERSION = 1
-FRAME_SCHEMA_VERSION = 2
+FRAME_SCHEMA_VERSION = 3
 MAX_PROTOCOL_BYTES = 4_194_304
 MAX_PROTOCOL_DEPTH = 128
 MAX_PROTOCOL_NODES = 100_000
@@ -738,10 +738,9 @@ class FrameFreshnessV1(_StrictModel):
     stream_connection: Literal["connected", "disconnected"]
 
 
-class ConsciousnessFrameV2(_StrictModel):
-    """Bounded structural projection of one exact successor state."""
+class _ConsciousnessFrameBase(_StrictModel):
+    """Fields shared by persisted legacy and current structural projections."""
 
-    schema_version: Literal[FRAME_SCHEMA_VERSION] = FRAME_SCHEMA_VERSION
     brain_id: str
     state_sequence: int = Field(ge=0)
     through_capture_seq: int = Field(ge=0)
@@ -773,6 +772,18 @@ class ConsciousnessFrameV2(_StrictModel):
         return _canonical_model_json(self)
 
 
+class ConsciousnessFrameV2(_ConsciousnessFrameBase):
+    """Legacy raw-only frame retained solely for verified SQLite migration."""
+
+    schema_version: Literal[2] = 2
+
+
+class ConsciousnessFrameV3(_ConsciousnessFrameBase):
+    """Bounded projection through the final event of one semantic batch."""
+
+    schema_version: Literal[FRAME_SCHEMA_VERSION] = FRAME_SCHEMA_VERSION
+
+
 class BridgeCommitAckV1(_StrictModel):
     """Canonical persisted acknowledgement for one accepted bridge record."""
 
@@ -788,6 +799,86 @@ class BridgeCommitAckV1(_StrictModel):
     @classmethod
     def _event_id(cls, value: str) -> str:
         return validate_id(value)
+
+    def canonical_json(self) -> str:
+        return _canonical_model_json(self)
+
+
+SemanticStatus: TypeAlias = Literal[
+    "applied",
+    "not_applicable",
+    "gap",
+    "legacy_raw_only",
+]
+
+
+class BridgeCommitAckV2(_StrictModel):
+    """Canonical acknowledgement for one raw-plus-derived atomic batch."""
+
+    schema_version: Literal[2] = 2
+    record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    duplicate: Literal[False] = False
+    raw_event_id: str
+    raw_event_sequence: int = Field(ge=1)
+    derived_event_ids: tuple[str, ...] = Field(default=(), max_length=8)
+    derived_event_count: int = Field(ge=0, le=8)
+    last_event_sequence: int = Field(ge=1)
+    semantic_status: SemanticStatus
+    semantic_complete: bool
+    semantic_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    frame: ConsciousnessFrameV3
+    through_capture_seq: int = Field(ge=1)
+
+    @field_validator("raw_event_id")
+    @classmethod
+    def _raw_event_id(cls, value: str) -> str:
+        return validate_id(value)
+
+    @field_validator("derived_event_ids")
+    @classmethod
+    def _derived_event_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        validated = tuple(validate_id(item) for item in value)
+        if len(validated) != len(set(validated)):
+            raise ValueError("derived event IDs must be unique")
+        return validated
+
+    @model_validator(mode="after")
+    def _semantic_batch(self) -> BridgeCommitAckV2:
+        if self.derived_event_count != len(self.derived_event_ids):
+            raise ValueError("derived event count must match derived event IDs")
+        if self.last_event_sequence != (
+            self.raw_event_sequence + self.derived_event_count
+        ):
+            raise ValueError("semantic batch event sequences must be contiguous")
+        expected_complete = self.semantic_status in {"applied", "not_applicable"}
+        if self.semantic_complete is not expected_complete:
+            raise ValueError("semantic completeness must match semantic status")
+        if self.semantic_status == "applied" and self.derived_event_count == 0:
+            raise ValueError("applied semantic batches require a derived event")
+        if self.semantic_status in {"not_applicable", "legacy_raw_only"} and (
+            self.derived_event_count != 0
+        ):
+            raise ValueError(
+                "not-applicable and legacy batches cannot claim derived events"
+            )
+        if (
+            self.frame.state_sequence != self.last_event_sequence
+            or self.frame.freshness.projected_at_state_sequence
+            != self.last_event_sequence
+            or self.frame.through_capture_seq != self.through_capture_seq
+        ):
+            raise ValueError("frame must bind the semantic batch terminal sequence")
+        return self
+
+    @property
+    def event_id(self) -> str:
+        """Compatibility accessor: the bridge record's event is the raw event."""
+        return self.raw_event_id
+
+    @property
+    def event_sequence(self) -> int:
+        """Compatibility accessor for the raw event's allocated sequence."""
+        return self.raw_event_sequence
 
     def canonical_json(self) -> str:
         return _canonical_model_json(self)
@@ -860,6 +951,45 @@ class BridgeStreamState(_StrictModel):
         return self
 
 
+class ObservabilitySnapshotV1(_StrictModel):
+    """Bounded persisted bridge and semantic-health projection."""
+
+    schema_version: Literal[1] = 1
+    semantic_schema_version: Literal[1] = 1
+    sqlite_schema_version: Literal[5] = 5
+    brain_id: str | None = None
+    brain_count: int = Field(ge=0)
+    trace_complete: bool
+    semantic_complete: bool
+    dropped_events: int = Field(ge=0)
+    semantic_records: int = Field(ge=0)
+    legacy_raw_only_records: int = Field(ge=0)
+    semantic_gap_records: int = Field(ge=0)
+    total_bridges: int = Field(ge=0)
+    connected_open_bridges: int = Field(ge=0)
+    disconnected_open_bridges: int = Field(ge=0)
+    clean_closed_bridges: int = Field(ge=0)
+    abandoned_bridges: int = Field(ge=0)
+
+    @field_validator("brain_id")
+    @classmethod
+    def _optional_brain_id(cls, value: str | None) -> str | None:
+        return None if value is None else validate_id(value)
+
+    @model_validator(mode="after")
+    def _bridge_partition(self) -> ObservabilitySnapshotV1:
+        if self.total_bridges != sum(
+            (
+                self.connected_open_bridges,
+                self.disconnected_open_bridges,
+                self.clean_closed_bridges,
+                self.abandoned_bridges,
+            )
+        ):
+            raise ValueError("observability bridge counts must form an exact partition")
+        return self
+
+
 class LoopbackEndpointV1(_StrictModel):
     host: Literal["127.0.0.1"] = "127.0.0.1"
     port: int = Field(ge=1, le=65_535)
@@ -902,7 +1032,7 @@ class ProtocolLimitsV1(_StrictModel):
         ge=4_096,
         le=MAX_PROTOCOL_BYTES,
     )
-    max_response_bytes: int = Field(default=262_144, ge=4_096, le=MAX_PROTOCOL_BYTES)
+    max_response_bytes: int = Field(default=1_048_576, ge=4_096, le=MAX_PROTOCOL_BYTES)
     max_frame_bytes: int = Field(default=65_536, ge=4_096, le=1_048_576)
     max_record_bytes: int = Field(
         default=TASK6_MAX_DETACHED_RECORD_BYTES,
@@ -1031,11 +1161,13 @@ __all__ = [
     "TASK6_MAX_DETACHED_RECORD_BYTES",
     "BrainProfileV1",
     "BridgeCommitAckV1",
+    "BridgeCommitAckV2",
     "BridgeGapV1",
     "BridgeRecordV1",
     "BridgeStreamState",
     "CapabilityProfileV1",
     "ConsciousnessFrameV2",
+    "ConsciousnessFrameV3",
     "CoverageV1",
     "DaemonDiscoveryV1",
     "FrameFreshnessV1",
@@ -1044,8 +1176,10 @@ __all__ = [
     "HermesObservationV1",
     "InitializeResultV1",
     "LoopbackEndpointV1",
+    "ObservabilitySnapshotV1",
     "ObservationContextV1",
     "ProtocolLimitsV1",
+    "SemanticStatus",
     "copy_protocol_limits",
     "validate_bridge_record",
     "validate_bridge_record_json",

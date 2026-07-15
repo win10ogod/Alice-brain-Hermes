@@ -1,0 +1,590 @@
+"""Pure, bounded Hermes raw-to-semantic ingestion plans."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from typing import Literal
+from uuid import UUID
+
+from alice_brain_hermes.core.events import EventEnvelope, new_event, thaw_json
+from alice_brain_hermes.ids import validate_id
+from alice_brain_hermes.protocol.models import (
+    HOOK_EVENT_TYPES,
+    BridgeGapV1,
+    BridgeRecordV1,
+    BridgeStreamState,
+    HermesObservationV1,
+    SemanticStatus,
+)
+
+MAX_DERIVED_EVENTS_PER_RECORD = 8
+SpanKind = Literal["tool", "api"]
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        thaw_json(value),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _json_fingerprint(value: object) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _derived_id(raw_event_id: str, role: str) -> str:
+    digest = bytearray(
+        hashlib.sha256(f"{raw_event_id}\x00{role}".encode("utf-8")).digest()[:16]
+    )
+    digest[6] = (digest[6] & 0x0F) | 0x40
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(UUID(bytes=bytes(digest)))
+
+
+def span_context_fingerprint(record: HermesObservationV1) -> str:
+    """Fingerprint exact hook correlation context without retaining its values."""
+    if not isinstance(record, HermesObservationV1):
+        raise TypeError("span context requires one Hermes observation")
+    return _json_fingerprint(record.context.model_dump(mode="json"))
+
+
+@dataclass(frozen=True, slots=True)
+class HermesSpan:
+    bridge_instance_id: str
+    span_kind: SpanKind
+    external_id: str
+    occurrence_capture_seq: int
+    context_fingerprint: str
+    action_id: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_id(self.bridge_instance_id)
+        if self.span_kind not in {"tool", "api"}:
+            raise ValueError("Hermes span kind must be tool or api")
+        if not isinstance(self.external_id, str) or not 1 <= len(self.external_id) <= 512:
+            raise ValueError("Hermes span external ID must be non-blank and bounded")
+        if (
+            isinstance(self.occurrence_capture_seq, bool)
+            or not isinstance(self.occurrence_capture_seq, int)
+            or self.occurrence_capture_seq < 1
+        ):
+            raise ValueError("Hermes span occurrence must be a capture sequence")
+        if (
+            not isinstance(self.context_fingerprint, str)
+            or len(self.context_fingerprint) != 64
+            or any(item not in "0123456789abcdef" for item in self.context_fingerprint)
+        ):
+            raise ValueError("Hermes span context fingerprint must be SHA-256")
+        if self.action_id is not None and (
+            not isinstance(self.action_id, str)
+            or not self.action_id.strip()
+            or len(self.action_id) > 512
+        ):
+            raise ValueError("Hermes span action ID must be non-blank and bounded")
+
+    def canonical_data(self) -> dict[str, object]:
+        return {
+            "action_id": self.action_id,
+            "bridge_instance_id": self.bridge_instance_id,
+            "context_fingerprint": self.context_fingerprint,
+            "external_id": self.external_id,
+            "occurrence_capture_seq": self.occurrence_capture_seq,
+            "span_kind": self.span_kind,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticPlan:
+    semantic_status: SemanticStatus
+    semantic_complete: bool
+    derived_events: tuple[EventEnvelope, ...]
+    span_open: HermesSpan | None = None
+    span_close: HermesSpan | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.derived_events) > MAX_DERIVED_EVENTS_PER_RECORD:
+            raise ValueError("semantic plan exceeds the derived event limit")
+        expected_complete = self.semantic_status in {"applied", "not_applicable"}
+        if self.semantic_complete is not expected_complete:
+            raise ValueError("semantic plan completeness does not match status")
+        if self.semantic_status == "applied" and not self.derived_events:
+            raise ValueError("applied semantic plan requires derived evidence")
+        if self.semantic_status in {"not_applicable", "legacy_raw_only"} and (
+            self.derived_events
+        ):
+            raise ValueError("raw-only semantic statuses cannot carry derived events")
+
+    def fingerprint(self) -> str:
+        value = {
+            "derived_events": [
+                event.canonical_data(exclude_sequence=True)
+                for event in self.derived_events
+            ],
+            "semantic_complete": self.semantic_complete,
+            "semantic_status": self.semantic_status,
+            "span_close": (
+                None if self.span_close is None else self.span_close.canonical_data()
+            ),
+            "span_open": (
+                None if self.span_open is None else self.span_open.canonical_data()
+            ),
+        }
+        return _json_fingerprint(value)
+
+
+def _observation_provenance(record: HermesObservationV1) -> dict[str, str | None]:
+    return {
+        "session_id": getattr(record.context, "session_id", None),
+        "turn_id": getattr(record.context, "turn_id", None),
+        "correlation_id": getattr(record.context, "api_request_id", None),
+    }
+
+
+def build_raw_event(
+    stream: BridgeStreamState, record: BridgeRecordV1
+) -> EventEnvelope:
+    if record.bridge_instance_id != stream.bridge_instance_id:
+        raise ValueError("bridge record does not match semantic stream")
+    if isinstance(record, HermesObservationV1):
+        return new_event(
+            HOOK_EVENT_TYPES[record.hook],
+            stream.brain_id,
+            stream.server_actor_id,
+            record.model_dump(mode="json"),
+            wall_time=record.captured_at,
+            monotonic_ns=record.captured_monotonic_ns,
+            adapter_id=stream.server_adapter_id,
+            **_observation_provenance(record),
+        )
+    if not isinstance(record, BridgeGapV1):
+        raise TypeError("semantic ingestion requires a typed bridge record")
+    return new_event(
+        "trace.gap",
+        stream.brain_id,
+        stream.server_actor_id,
+        {
+            **record.model_dump(mode="json"),
+            "exact": True,
+            "trace_complete": False,
+        },
+        adapter_id=stream.server_adapter_id,
+    )
+
+
+def _derived_event(
+    stream: BridgeStreamState,
+    record: HermesObservationV1,
+    raw_event: EventEnvelope,
+    *,
+    role: str,
+    event_type: str,
+    payload: dict[str, object],
+    action_id: str | None = None,
+    causation_id: str | None = None,
+) -> EventEnvelope:
+    return new_event(
+        event_type,
+        stream.brain_id,
+        stream.server_actor_id,
+        payload,
+        event_id=_derived_id(raw_event.event_id, role),
+        wall_time=raw_event.wall_time,
+        monotonic_ns=raw_event.monotonic_ns,
+        adapter_id=stream.server_adapter_id,
+        action_id=action_id,
+        causation_id=raw_event.event_id if causation_id is None else causation_id,
+        **_observation_provenance(record),
+    )
+
+
+def _action_id(raw_event: EventEnvelope, capture_seq: int) -> str:
+    digest = hashlib.sha256(
+        f"{raw_event.event_id}\x00tool\x00{capture_seq}".encode("ascii")
+    ).hexdigest()
+    return f"hermes-action-{digest}"
+
+
+def _pre_tool_plan(
+    stream: BridgeStreamState,
+    record: HermesObservationV1,
+    raw_event: EventEnvelope,
+) -> SemanticPlan:
+    action_id = _action_id(raw_event, record.capture_seq)
+    branch_id = f"hermes-branch-{hashlib.sha256(action_id.encode('ascii')).hexdigest()}"
+    args_sha256 = _json_fingerprint(record.payload.args)
+    middleware_sha256 = _json_fingerprint(record.payload.middleware_trace)
+    intent = {
+        "args_sha256": args_sha256,
+        "capture_seq": record.capture_seq,
+        "kind": "hermes.tool_call",
+        "middleware_trace_sha256": middleware_sha256,
+        "raw_event_id": raw_event.event_id,
+        "tool_name": record.payload.tool_name,
+    }
+    proposed = _derived_event(
+        stream,
+        record,
+        raw_event,
+        role="pc.action_proposed",
+        event_type="action.proposed",
+        payload={"action_id": action_id, "intent": intent},
+        action_id=action_id,
+    )
+    pc = _derived_event(
+        stream,
+        record,
+        raw_event,
+        role="pc.control_sampled",
+        event_type="personality.control.sampled",
+        payload={
+            "action_id": action_id,
+            "algorithm_version": "hermes-semantic-v1",
+            "args_sha256": args_sha256,
+            "sample": "commit_predecessor_personality",
+        },
+        action_id=action_id,
+        causation_id=proposed.event_id,
+    )
+    energy = _derived_event(
+        stream,
+        record,
+        raw_event,
+        role="energy.assessed",
+        event_type="action.energy_assessed",
+        payload={
+            "action_id": action_id,
+            "arousal": 0.0,
+            "control": 0.5,
+            "cost": 0.5,
+            "deficits": {"execution_evidence": 1.0},
+            "personality_relevance": 0.5,
+            "resources": 0.5,
+            "salience": 0.5,
+            "urgency": 0.5,
+            "valence": 0.0,
+        },
+        action_id=action_id,
+        causation_id=pc.event_id,
+    )
+    simulated = _derived_event(
+        stream,
+        record,
+        raw_event,
+        role="thought.simulated",
+        event_type="simulation.created",
+        payload={
+            "algorithm_version": "hermes-semantic-v1",
+            "branch_id": branch_id,
+            "cognition_mode": "event",
+            "config_version": "hermes-semantic-v1",
+            "content": {
+                "args_sha256": args_sha256,
+                "kind": "hermes.tool_counterfactual",
+                "tool_name": record.payload.tool_name,
+            },
+            "expected_consequences": [
+                {"kind": "execution_success", "requires_confirmation": True},
+                {"kind": "execution_failure", "requires_confirmation": True},
+            ],
+            "proposition_id": branch_id,
+            "source_ids": [raw_event.event_id],
+            "stance": "simulate",
+            "uncertainty": 0.5,
+        },
+        action_id=action_id,
+        causation_id=energy.event_id,
+    )
+    prepared = _derived_event(
+        stream,
+        record,
+        raw_event,
+        role="decision.prepared",
+        event_type="action.prepared",
+        payload={"action_id": action_id, "branch_id": branch_id},
+        action_id=action_id,
+        causation_id=simulated.event_id,
+    )
+    span = HermesSpan(
+        bridge_instance_id=record.bridge_instance_id,
+        span_kind="tool",
+        external_id=record.context.tool_call_id,
+        occurrence_capture_seq=record.capture_seq,
+        context_fingerprint=span_context_fingerprint(record),
+        action_id=action_id,
+    )
+    return SemanticPlan(
+        semantic_status="applied",
+        semantic_complete=True,
+        derived_events=(proposed, pc, energy, simulated, prepared),
+        span_open=span,
+    )
+
+
+def _semantic_gap(
+    stream: BridgeStreamState,
+    record: HermesObservationV1,
+    raw_event: EventEnvelope,
+    *,
+    reason: str,
+) -> SemanticPlan:
+    event = _derived_event(
+        stream,
+        record,
+        raw_event,
+        role=f"semantic_gap.{reason}",
+        event_type="semantic.gap",
+        payload={
+            "capture_seq": record.capture_seq,
+            "context_sha256": span_context_fingerprint(record),
+            "hook": record.hook,
+            "raw_payload_sha256": _json_fingerprint(
+                record.payload.model_dump(mode="json")
+            ),
+            "reason": reason,
+            "trace_complete": False,
+        },
+    )
+    return SemanticPlan(
+        semantic_status="gap",
+        semantic_complete=False,
+        derived_events=(event,),
+    )
+
+
+def _validate_matched_span(
+    record: HermesObservationV1,
+    span: HermesSpan,
+    *,
+    span_kind: SpanKind,
+    external_id: str,
+) -> None:
+    if (
+        span.bridge_instance_id != record.bridge_instance_id
+        or span.span_kind != span_kind
+        or span.external_id != external_id
+        or span.context_fingerprint != span_context_fingerprint(record)
+    ):
+        raise ValueError("matched Hermes span does not bind the observation context")
+
+
+def _post_tool_plan(
+    stream: BridgeStreamState,
+    record: HermesObservationV1,
+    raw_event: EventEnvelope,
+    matched_span: HermesSpan | None,
+) -> SemanticPlan:
+    if matched_span is None:
+        return _semantic_gap(
+            stream, record, raw_event, reason="unmatched_post_tool"
+        )
+    _validate_matched_span(
+        record,
+        matched_span,
+        span_kind="tool",
+        external_id=record.context.tool_call_id,
+    )
+    if matched_span.action_id is None:
+        raise ValueError("matched tool span is missing its action identity")
+    action_id = matched_span.action_id
+    raw_status = record.payload.status.strip().casefold()
+    if raw_status in {"ok", "success"}:
+        receipt_status, execution, outcome = "success", True, "success"
+    elif raw_status in {"error", "failure"}:
+        receipt_status, execution, outcome = "failure", True, "failure"
+    elif raw_status in {
+        "error+thread_missing_result",
+        "timeout",
+        "cancelled",
+    }:
+        receipt_status, execution, outcome = "unknown", None, None
+    elif raw_status == "blocked":
+        receipt_status, execution, outcome = "blocked", False, None
+    else:
+        return _semantic_gap(
+            stream, record, raw_event, reason="unknown_post_tool_status"
+        )
+    result_sha256 = _json_fingerprint(record.payload.result)
+    error_type_sha256 = _json_fingerprint(record.payload.error_type)
+    error_message_sha256 = _json_fingerprint(record.payload.error_message)
+    evidence = {
+        "action_id": action_id,
+        "duration_ms": record.payload.duration_ms,
+        "effect_confirmed": None,
+        "error_message_sha256": error_message_sha256,
+        "error_type_sha256": error_type_sha256,
+        "execution_confirmed": execution,
+        "outcome": outcome,
+        "raw_status": raw_status,
+        "result_sha256": result_sha256,
+        "status": receipt_status,
+    }
+    if raw_status == "blocked":
+        blocked = _derived_event(
+            stream,
+            record,
+            raw_event,
+            role="action.blocked",
+            event_type="action.blocked",
+            payload=evidence,
+            action_id=action_id,
+        )
+        events = (blocked,)
+    else:
+        dispatched = _derived_event(
+            stream,
+            record,
+            raw_event,
+            role="action.dispatched",
+            event_type="action.dispatched",
+            payload={"action_id": action_id},
+            action_id=action_id,
+        )
+        receipt = _derived_event(
+            stream,
+            record,
+            raw_event,
+            role="action.receipt",
+            event_type="action.receipt",
+            payload=evidence,
+            action_id=action_id,
+            causation_id=dispatched.event_id,
+        )
+        events = (dispatched, receipt)
+    return SemanticPlan(
+        semantic_status="applied",
+        semantic_complete=True,
+        derived_events=events,
+        span_close=matched_span,
+    )
+
+
+_ATTRIBUTED_EVENT_TYPES = {
+    "on_session_start": "semantic.session.attributed",
+    "on_session_end": "semantic.session.attributed",
+    "on_session_finalize": "semantic.session.attributed",
+    "on_session_reset": "semantic.session.attributed",
+    "pre_llm_call": "semantic.llm.attributed",
+    "post_llm_call": "semantic.llm.attributed",
+    "pre_api_request": "semantic.api.attributed",
+    "post_api_request": "semantic.api.attributed",
+    "api_request_error": "semantic.api.attributed",
+    "pre_approval_request": "semantic.approval.attributed",
+    "post_approval_response": "semantic.approval.attributed",
+    "subagent_start": "semantic.subagent.attributed",
+    "subagent_stop": "semantic.subagent.attributed",
+    "pre_verify": "semantic.verification.attributed",
+}
+
+
+def _attributed_plan(
+    stream: BridgeStreamState,
+    record: HermesObservationV1,
+    raw_event: EventEnvelope,
+    matched_span: HermesSpan | None,
+) -> SemanticPlan:
+    event_type = _ATTRIBUTED_EVENT_TYPES.get(record.hook)
+    if event_type is None:
+        return _semantic_gap(
+            stream, record, raw_event, reason="unsupported_semantic_hook"
+        )
+    span_open: HermesSpan | None = None
+    span_close: HermesSpan | None = None
+    occurrence: int | None = None
+    if record.hook == "pre_api_request":
+        span_open = HermesSpan(
+            bridge_instance_id=record.bridge_instance_id,
+            span_kind="api",
+            external_id=record.context.api_request_id,
+            occurrence_capture_seq=record.capture_seq,
+            context_fingerprint=span_context_fingerprint(record),
+        )
+        occurrence = record.capture_seq
+    elif record.hook in {"post_api_request", "api_request_error"}:
+        if matched_span is None:
+            return _semantic_gap(
+                stream, record, raw_event, reason="unmatched_api_completion"
+            )
+        _validate_matched_span(
+            record,
+            matched_span,
+            span_kind="api",
+            external_id=record.context.api_request_id,
+        )
+        span_close = matched_span
+        occurrence = matched_span.occurrence_capture_seq
+    event = _derived_event(
+        stream,
+        record,
+        raw_event,
+        role=f"attributed.{record.hook}",
+        event_type=event_type,
+        payload={
+            "capture_seq": record.capture_seq,
+            "context_sha256": span_context_fingerprint(record),
+            "hook": record.hook,
+            "occurrence_capture_seq": occurrence,
+            "raw_payload_sha256": _json_fingerprint(
+                record.payload.model_dump(mode="json")
+            ),
+            "source": "hermes_observer_v1",
+        },
+    )
+    return SemanticPlan(
+        semantic_status="applied",
+        semantic_complete=True,
+        derived_events=(event,),
+        span_open=span_open,
+        span_close=span_close,
+    )
+
+
+def build_semantic_plan(
+    stream: BridgeStreamState,
+    record: BridgeRecordV1,
+    *,
+    raw_event: EventEnvelope,
+    matched_span: HermesSpan | None = None,
+) -> SemanticPlan:
+    if record.bridge_instance_id != stream.bridge_instance_id:
+        raise ValueError("bridge record does not match semantic stream")
+    if (
+        raw_event.brain_id != stream.brain_id
+        or raw_event.actor_id != stream.server_actor_id
+        or raw_event.adapter_id != stream.server_adapter_id
+        or raw_event.sequence is not None
+    ):
+        raise ValueError("raw event does not bind the semantic stream")
+    if isinstance(record, BridgeGapV1):
+        if raw_event.event_type != "trace.gap":
+            raise ValueError("gap record requires one raw trace gap")
+        return SemanticPlan(
+            semantic_status="gap",
+            semantic_complete=False,
+            derived_events=(),
+        )
+    if not isinstance(record, HermesObservationV1):
+        raise TypeError("semantic ingestion requires a typed bridge record")
+    if raw_event.event_type != HOOK_EVENT_TYPES[record.hook]:
+        raise ValueError("raw event does not represent the observation hook")
+    if record.hook == "pre_tool_call":
+        if matched_span is not None:
+            raise ValueError("pre-tool observation cannot close a span")
+        return _pre_tool_plan(stream, record, raw_event)
+    if record.hook == "post_tool_call":
+        return _post_tool_plan(stream, record, raw_event, matched_span)
+    return _attributed_plan(stream, record, raw_event, matched_span)
+
+
+__all__ = [
+    "HermesSpan",
+    "MAX_DERIVED_EVENTS_PER_RECORD",
+    "SemanticPlan",
+    "build_raw_event",
+    "build_semantic_plan",
+    "span_context_fingerprint",
+]

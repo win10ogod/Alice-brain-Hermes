@@ -46,24 +46,36 @@ from alice_brain_hermes.protocol.models import (
     HOOK_EVENT_TYPES,
     BrainProfileV1,
     BridgeCommitAckV1,
+    BridgeCommitAckV2,
     BridgeGapV1,
     BridgeRecordV1,
     BridgeStreamState,
     ConsciousnessFrameV2,
+    ConsciousnessFrameV3,
     FrameFreshnessV1,
     HermesObservationV1,
+    ObservabilitySnapshotV1,
     validate_bridge_record_json,
     validate_observation,
     validate_observation_json,
 )
 from alice_brain_hermes.runtime.lease import RetainedSQLiteFiles, RuntimeLease
+from alice_brain_hermes.runtime.semantic_ingest import (
+    HermesSpan,
+    SemanticPlan,
+    build_raw_event,
+    build_semantic_plan,
+    span_context_fingerprint,
+)
 
-SQLITE_SCHEMA_VERSION = 4
+SQLITE_SCHEMA_VERSION = 5
+SEMANTIC_SCHEMA_VERSION = 1
+MAX_HERMES_SPANS_PER_STREAM = 256
 MAX_PAGE_SIZE = 10_000
 DEFAULT_MAX_FRAME_BYTES = 65_536
 DEFAULT_MAX_ACK_BYTES = 4_194_304
 _LEGACY_STATE_SCHEMA_VERSIONS = frozenset({1, 2, 3})
-_SQLITE_BRIDGE_SCHEMA_VERSIONS = frozenset({3, SQLITE_SCHEMA_VERSION})
+_SQLITE_BRIDGE_SCHEMA_VERSIONS = frozenset({3, 4, SQLITE_SCHEMA_VERSION})
 
 _SQLITE_MUTATION_ACTIONS = frozenset(
     {
@@ -102,7 +114,7 @@ _SQLITE_MUTATING_NO_ARGUMENT_PRAGMAS = frozenset(
 )
 
 
-_CREATE_SCHEMA = """
+_CREATE_BASE_SCHEMA = """
 CREATE TABLE schema_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -136,7 +148,9 @@ CREATE TABLE snapshots (
 ) WITHOUT ROWID;
 
 CREATE INDEX snapshots_latest ON snapshots(brain_id, sequence DESC);
+"""
 
+_CREATE_BRIDGE_STREAM_SCHEMA = """
 CREATE TABLE bridge_stream (
     bridge_instance_id TEXT PRIMARY KEY,
     brain_id TEXT NOT NULL,
@@ -157,7 +171,9 @@ CREATE TABLE bridge_stream (
     closed_final_seq INTEGER CHECK (closed_final_seq >= 0),
     FOREIGN KEY (brain_id) REFERENCES brains(brain_id)
 ) WITHOUT ROWID;
+"""
 
+_CREATE_BRIDGE_RECORD_V4_SCHEMA = """
 CREATE TABLE bridge_record (
     bridge_instance_id TEXT NOT NULL,
     first_capture_seq INTEGER NOT NULL CHECK (first_capture_seq >= 1),
@@ -175,7 +191,9 @@ CREATE TABLE bridge_record (
 ) WITHOUT ROWID;
 
 CREATE INDEX bridge_record_event ON bridge_record(event_id);
+"""
 
+_CREATE_PROFILE_SCHEMA = """
 CREATE TABLE brain_profile (
     profile_key TEXT PRIMARY KEY,
     profile_fingerprint TEXT NOT NULL,
@@ -185,58 +203,98 @@ CREATE TABLE brain_profile (
 ) WITHOUT ROWID;
 """
 
-_CREATE_BRIDGE_SCHEMA = """
-CREATE TABLE bridge_stream (
-    bridge_instance_id TEXT PRIMARY KEY,
-    brain_id TEXT NOT NULL,
-    server_actor_id TEXT NOT NULL,
-    server_adapter_id TEXT NOT NULL,
-    recovery_token_digest BLOB NOT NULL CHECK (
-        typeof(recovery_token_digest) = 'blob'
-        AND length(recovery_token_digest) = 32
-    ),
-    next_capture_seq INTEGER NOT NULL CHECK (next_capture_seq >= 1),
-    status TEXT NOT NULL CHECK (status IN ('open', 'clean_closed', 'abandoned')),
-    connected_nonce TEXT,
-    disconnected_reason TEXT CHECK (disconnected_reason IN (
-        'connection_eof', 'daemon_restart', 'clean_close', 'grace_abandonment'
+_CREATE_BRIDGE_RECORD_V5_SCHEMA = """
+CREATE TABLE bridge_record (
+    bridge_instance_id TEXT NOT NULL,
+    first_capture_seq INTEGER NOT NULL CHECK (first_capture_seq >= 1),
+    last_capture_seq INTEGER NOT NULL CHECK (last_capture_seq >= first_capture_seq),
+    record_kind TEXT NOT NULL CHECK (record_kind IN ('observation', 'gap')),
+    record_fingerprint TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    event_id TEXT NOT NULL UNIQUE,
+    ledger_sequence INTEGER NOT NULL CHECK (ledger_sequence >= 1),
+    semantic_status TEXT NOT NULL CHECK (semantic_status IN (
+        'applied', 'not_applicable', 'gap', 'legacy_raw_only'
     )),
-    disconnected_at TEXT,
-    last_seen TEXT NOT NULL,
-    closed_final_seq INTEGER CHECK (closed_final_seq >= 0),
-    FOREIGN KEY (brain_id) REFERENCES brains(brain_id)
-) WITHOUT ROWID;
-CREATE TABLE bridge_record (
-    bridge_instance_id TEXT NOT NULL,
-    first_capture_seq INTEGER NOT NULL CHECK (first_capture_seq >= 1),
-    last_capture_seq INTEGER NOT NULL CHECK (last_capture_seq >= first_capture_seq),
-    record_kind TEXT NOT NULL CHECK (record_kind IN ('observation', 'gap')),
-    record_fingerprint TEXT NOT NULL,
-    record_json TEXT NOT NULL,
-    event_id TEXT NOT NULL UNIQUE,
-    ledger_sequence INTEGER NOT NULL CHECK (ledger_sequence >= 1),
+    semantic_complete INTEGER NOT NULL CHECK (semantic_complete IN (0, 1)),
+    semantic_fingerprint TEXT NOT NULL CHECK (length(semantic_fingerprint) = 64),
+    derived_event_count INTEGER NOT NULL CHECK (
+        derived_event_count >= 0 AND derived_event_count <= 8
+    ),
+    derived_first_sequence INTEGER CHECK (derived_first_sequence >= 1),
+    derived_last_sequence INTEGER CHECK (derived_last_sequence >= 1),
     ack_json TEXT NOT NULL,
     accepted_at TEXT NOT NULL,
+    CHECK (
+        (derived_event_count = 0
+         AND derived_first_sequence IS NULL
+         AND derived_last_sequence IS NULL)
+        OR
+        (derived_event_count > 0
+         AND derived_first_sequence = ledger_sequence + 1
+         AND derived_last_sequence = ledger_sequence + derived_event_count)
+    ),
     PRIMARY KEY (bridge_instance_id, first_capture_seq),
     FOREIGN KEY (bridge_instance_id) REFERENCES bridge_stream(bridge_instance_id),
     FOREIGN KEY (event_id) REFERENCES events(event_id)
 ) WITHOUT ROWID;
 CREATE INDEX bridge_record_event ON bridge_record(event_id);
-CREATE TABLE brain_profile (
-    profile_key TEXT PRIMARY KEY,
-    profile_fingerprint TEXT NOT NULL,
-    profile_json TEXT NOT NULL,
-    brain_id TEXT NOT NULL UNIQUE,
+
+CREATE TABLE hermes_span (
+    bridge_instance_id TEXT NOT NULL,
+    span_kind TEXT NOT NULL CHECK (span_kind IN ('tool', 'api')),
+    external_id TEXT NOT NULL CHECK (
+        length(external_id) >= 1 AND length(external_id) <= 512
+    ),
+    occurrence_capture_seq INTEGER NOT NULL CHECK (occurrence_capture_seq >= 1),
+    context_fingerprint TEXT NOT NULL CHECK (length(context_fingerprint) = 64),
+    action_id TEXT CHECK (action_id IS NULL OR (
+        length(action_id) >= 1 AND length(action_id) <= 512
+    )),
+    closed_capture_seq INTEGER CHECK (
+        closed_capture_seq IS NULL OR closed_capture_seq >= occurrence_capture_seq
+    ),
+    PRIMARY KEY (
+        bridge_instance_id, span_kind, external_id, occurrence_capture_seq
+    ),
+    FOREIGN KEY (bridge_instance_id) REFERENCES bridge_stream(bridge_instance_id)
+) WITHOUT ROWID;
+
+CREATE INDEX hermes_span_lookup ON hermes_span(
+    bridge_instance_id, span_kind, external_id,
+    closed_capture_seq, occurrence_capture_seq DESC
+);
+
+CREATE TABLE brain_observability (
+    brain_id TEXT PRIMARY KEY,
+    trace_complete INTEGER NOT NULL CHECK (trace_complete IN (0, 1)),
+    semantic_complete INTEGER NOT NULL CHECK (semantic_complete IN (0, 1)),
+    dropped_events INTEGER NOT NULL CHECK (dropped_events >= 0),
+    semantic_records INTEGER NOT NULL CHECK (semantic_records >= 0),
+    legacy_raw_only_records INTEGER NOT NULL CHECK (legacy_raw_only_records >= 0),
+    semantic_gap_records INTEGER NOT NULL CHECK (semantic_gap_records >= 0),
     FOREIGN KEY (brain_id) REFERENCES brains(brain_id)
 ) WITHOUT ROWID;
 """
 
-_CREATE_V2_SCHEMA = _CREATE_SCHEMA.partition("\nCREATE TABLE bridge_stream")[0]
+_CREATE_V2_SCHEMA = _CREATE_BASE_SCHEMA
+_CREATE_V4_SCHEMA = (
+    _CREATE_BASE_SCHEMA
+    + _CREATE_BRIDGE_STREAM_SCHEMA
+    + _CREATE_BRIDGE_RECORD_V4_SCHEMA
+    + _CREATE_PROFILE_SCHEMA
+)
+_CREATE_BRIDGE_SCHEMA = (
+    _CREATE_BRIDGE_STREAM_SCHEMA
+    + _CREATE_BRIDGE_RECORD_V5_SCHEMA
+    + _CREATE_PROFILE_SCHEMA
+)
+_CREATE_SCHEMA = _CREATE_BASE_SCHEMA + _CREATE_BRIDGE_SCHEMA
 
 
 @dataclass(frozen=True, slots=True)
 class BridgeCommitResult:
-    ack: BridgeCommitAckV1
+    ack: BridgeCommitAckV2
     successor: BrainState | None
 
 
@@ -528,6 +586,12 @@ class SQLiteLedger:
                 for statement in _statements(_CREATE_BRIDGE_SCHEMA):
                     self._connection.execute(statement)
                 self._connection.execute(
+                    "INSERT INTO brain_observability("
+                    "brain_id, trace_complete, semantic_complete, dropped_events, "
+                    "semantic_records, legacy_raw_only_records, semantic_gap_records) "
+                    "SELECT brain_id, 1, 1, 0, 0, 0, 0 FROM brains"
+                )
+                self._connection.execute(
                     "UPDATE schema_metadata SET value = ? WHERE key = ?",
                     (str(SQLITE_SCHEMA_VERSION), "schema_version"),
                 )
@@ -539,10 +603,13 @@ class SQLiteLedger:
                 )
                 self._validate_schema_metadata(SQLITE_SCHEMA_VERSION)
                 return
-            if version == 3:
-                self._validate_schema_metadata(3)
+            if version in {3, 4}:
+                self._validate_schema_metadata(version)
                 self._startup_audited_final_states = self._validate_schema_contract(
-                    3, validate_data=True
+                    version, validate_data=True
+                )
+                self._migrate_bridge_schema_to_v5(
+                    final_states=self._startup_audited_final_states
                 )
                 self._connection.execute(
                     "UPDATE schema_metadata SET value = ? WHERE key = ?",
@@ -566,6 +633,146 @@ class SQLiteLedger:
             )
             self._validate_schema_metadata(SQLITE_SCHEMA_VERSION)
 
+    @staticmethod
+    def _legacy_semantic_fingerprint(
+        *,
+        record_fingerprint: str,
+        raw_event_id: str,
+        raw_event_sequence: int,
+        through_capture_seq: int,
+    ) -> str:
+        encoded = json.dumps(
+            {
+                "record_fingerprint": record_fingerprint,
+                "raw_event_id": raw_event_id,
+                "raw_event_sequence": raw_event_sequence,
+                "semantic_schema_version": SEMANTIC_SCHEMA_VERSION,
+                "semantic_status": "legacy_raw_only",
+                "through_capture_seq": through_capture_seq,
+            },
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _migrate_bridge_schema_to_v5(
+        self, *, final_states: Mapping[str, BrainState]
+    ) -> None:
+        """Rewrite verified v3/v4 ACKs without inventing semantic backfill."""
+        rows = self._connection.execute(
+            "SELECT bridge_instance_id, first_capture_seq, last_capture_seq, "
+            "record_kind, record_fingerprint, record_json, event_id, "
+            "ledger_sequence, ack_json, accepted_at FROM bridge_record "
+            "ORDER BY bridge_instance_id, first_capture_seq"
+        ).fetchall()
+        migrated_rows: list[tuple[object, ...]] = []
+        record_health: dict[str, dict[str, int]] = {}
+        stream_brains = {
+            row["bridge_instance_id"]: row["brain_id"]
+            for row in self._connection.execute(
+                "SELECT bridge_instance_id, brain_id FROM bridge_stream"
+            ).fetchall()
+        }
+        for row in rows:
+            legacy = BridgeCommitAckV1.model_validate_json(row["ack_json"])
+            frame_values = legacy.frame.model_dump(mode="python")
+            frame_values["schema_version"] = 3
+            frame = ConsciousnessFrameV3.model_validate(frame_values, strict=True)
+            semantic_fingerprint = self._legacy_semantic_fingerprint(
+                record_fingerprint=row["record_fingerprint"],
+                raw_event_id=row["event_id"],
+                raw_event_sequence=int(row["ledger_sequence"]),
+                through_capture_seq=int(row["last_capture_seq"]),
+            )
+            migrated_ack = BridgeCommitAckV2(
+                record_fingerprint=row["record_fingerprint"],
+                raw_event_id=row["event_id"],
+                raw_event_sequence=int(row["ledger_sequence"]),
+                derived_event_ids=(),
+                derived_event_count=0,
+                last_event_sequence=int(row["ledger_sequence"]),
+                semantic_status="legacy_raw_only",
+                semantic_complete=False,
+                semantic_fingerprint=semantic_fingerprint,
+                frame=frame,
+                through_capture_seq=int(row["last_capture_seq"]),
+            )
+            migrated_rows.append(
+                (
+                    row["bridge_instance_id"],
+                    row["first_capture_seq"],
+                    row["last_capture_seq"],
+                    row["record_kind"],
+                    row["record_fingerprint"],
+                    row["record_json"],
+                    row["event_id"],
+                    row["ledger_sequence"],
+                    "legacy_raw_only",
+                    0,
+                    semantic_fingerprint,
+                    0,
+                    None,
+                    None,
+                    migrated_ack.canonical_json(),
+                    row["accepted_at"],
+                )
+            )
+            brain_id = stream_brains[row["bridge_instance_id"]]
+            health = record_health.setdefault(
+                brain_id,
+                {"records": 0, "legacy": 0, "gaps": 0, "dropped": 0},
+            )
+            health["records"] += 1
+            health["legacy"] += 1
+            if row["record_kind"] == "gap":
+                record = validate_bridge_record_json(row["record_json"])
+                if not isinstance(record, BridgeGapV1):
+                    raise LedgerIntegrityError(
+                        "legacy gap row does not contain a typed bridge gap"
+                    )
+                health["gaps"] += 1
+                health["dropped"] += record.dropped_count
+
+        self._connection.execute("DROP INDEX bridge_record_event")
+        self._connection.execute(
+            "ALTER TABLE bridge_record RENAME TO bridge_record_v4"
+        )
+        for statement in _statements(_CREATE_BRIDGE_RECORD_V5_SCHEMA):
+            self._connection.execute(statement)
+        for values in migrated_rows:
+            self._connection.execute(
+                "INSERT INTO bridge_record("
+                "bridge_instance_id, first_capture_seq, last_capture_seq, "
+                "record_kind, record_fingerprint, record_json, event_id, "
+                "ledger_sequence, semantic_status, semantic_complete, "
+                "semantic_fingerprint, derived_event_count, "
+                "derived_first_sequence, derived_last_sequence, ack_json, "
+                "accepted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                values,
+            )
+        self._connection.execute("DROP TABLE bridge_record_v4")
+        for brain_id, state in final_states.items():
+            health = record_health.get(
+                brain_id,
+                {"records": 0, "legacy": 0, "gaps": 0, "dropped": 0},
+            )
+            self._connection.execute(
+                "INSERT INTO brain_observability("
+                "brain_id, trace_complete, semantic_complete, dropped_events, "
+                "semantic_records, legacy_raw_only_records, semantic_gap_records) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    brain_id,
+                    int(state.trace_complete),
+                    int(health["legacy"] == 0 and health["gaps"] == 0),
+                    health["dropped"],
+                    health["records"],
+                    health["legacy"],
+                    health["gaps"],
+                ),
+            )
+
     def _validate_schema_metadata(self, version: int) -> None:
         expected = [("schema_version", str(version))]
         try:
@@ -586,7 +793,11 @@ class SQLiteLedger:
         self, version: int, *, validate_data: bool
     ) -> dict[str, BrainState]:
         expected = _schema_objects(
-            _CREATE_V2_SCHEMA if version == 2 else _CREATE_SCHEMA
+            _CREATE_V2_SCHEMA
+            if version == 2
+            else _CREATE_V4_SCHEMA
+            if version in {3, 4}
+            else _CREATE_SCHEMA
         )
         rows = self._connection.execute(
             "SELECT type, name, tbl_name, sql FROM sqlite_master "
@@ -635,6 +846,7 @@ class SQLiteLedger:
                     historical_states=historical_states,
                     final_states=final_states,
                     migrate_legacy_action_frames=(version == 3),
+                    legacy_bridge_schema=(version in {3, 4}),
                 )
             except Exception as error:
                 raise SchemaVersionError(
@@ -646,6 +858,104 @@ class SQLiteLedger:
     def schema_version(self) -> int:
         self._ensure_open()
         return SQLITE_SCHEMA_VERSION
+
+    def observability_snapshot(
+        self, brain_id: str | None = None
+    ) -> ObservabilitySnapshotV1:
+        """Return bounded persisted semantic and bridge health without replay."""
+        if brain_id is not None:
+            brain_id = validate_id(brain_id)
+        self._assert_creator_process()
+        with self._lock:
+            self._ensure_open()
+            where = " WHERE brain_id = ?" if brain_id is not None else ""
+            parameters: tuple[object, ...] = () if brain_id is None else (brain_id,)
+            health = self._connection.execute(
+                "SELECT COUNT(*) AS brain_count, "
+                "COALESCE(MIN(trace_complete), 1) AS trace_complete, "
+                "COALESCE(MIN(semantic_complete), 1) AS semantic_complete, "
+                "COALESCE(SUM(dropped_events), 0) AS dropped_events, "
+                "COALESCE(SUM(semantic_records), 0) AS semantic_records, "
+                "COALESCE(SUM(legacy_raw_only_records), 0) "
+                "AS legacy_raw_only_records, "
+                "COALESCE(SUM(semantic_gap_records), 0) AS semantic_gap_records "
+                "FROM brain_observability" + where,
+                parameters,
+            ).fetchone()
+            if brain_id is not None and int(health["brain_count"]) != 1:
+                raise ValueError("observability brain is not persisted")
+            bridge_where = " WHERE brain_id = ?" if brain_id is not None else ""
+            bridges = self._connection.execute(
+                "SELECT COUNT(*) AS total_bridges, "
+                "COALESCE(SUM(CASE WHEN status = 'open' "
+                "AND connected_nonce IS NOT NULL THEN 1 ELSE 0 END), 0) "
+                "AS connected_open_bridges, "
+                "COALESCE(SUM(CASE WHEN status = 'open' "
+                "AND connected_nonce IS NULL THEN 1 ELSE 0 END), 0) "
+                "AS disconnected_open_bridges, "
+                "COALESCE(SUM(CASE WHEN status = 'clean_closed' "
+                "THEN 1 ELSE 0 END), 0) AS clean_closed_bridges, "
+                "COALESCE(SUM(CASE WHEN status = 'abandoned' "
+                "THEN 1 ELSE 0 END), 0) AS abandoned_bridges "
+                "FROM bridge_stream" + bridge_where,
+                parameters,
+            ).fetchone()
+            return ObservabilitySnapshotV1(
+                brain_id=brain_id,
+                brain_count=int(health["brain_count"]),
+                trace_complete=bool(health["trace_complete"]),
+                semantic_complete=bool(health["semantic_complete"]),
+                dropped_events=int(health["dropped_events"]),
+                semantic_records=int(health["semantic_records"]),
+                legacy_raw_only_records=int(health["legacy_raw_only_records"]),
+                semantic_gap_records=int(health["semantic_gap_records"]),
+                total_bridges=int(bridges["total_bridges"]),
+                connected_open_bridges=int(bridges["connected_open_bridges"]),
+                disconnected_open_bridges=int(
+                    bridges["disconnected_open_bridges"]
+                ),
+                clean_closed_bridges=int(bridges["clean_closed_bridges"]),
+                abandoned_bridges=int(bridges["abandoned_bridges"]),
+            )
+
+    def _record_semantic_observability(
+        self,
+        brain_id: str,
+        record: BridgeRecordV1,
+        plan: SemanticPlan,
+    ) -> None:
+        dropped = record.dropped_count if isinstance(record, BridgeGapV1) else 0
+        gap = int(plan.semantic_status == "gap")
+        updated = self._connection.execute(
+            "UPDATE brain_observability SET "
+            "trace_complete = CASE WHEN trace_complete = 1 AND ? = 0 "
+            "THEN 1 ELSE 0 END, "
+            "semantic_complete = CASE WHEN semantic_complete = 1 AND ? = 1 "
+            "THEN 1 ELSE 0 END, "
+            "dropped_events = dropped_events + ?, "
+            "semantic_records = semantic_records + 1, "
+            "semantic_gap_records = semantic_gap_records + ? "
+            "WHERE brain_id = ?",
+            (
+                gap,
+                int(plan.semantic_complete),
+                dropped,
+                gap,
+                brain_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise LedgerIntegrityError("semantic observability row is missing")
+
+    def _record_unbounded_gap_observability(self, brain_id: str) -> None:
+        updated = self._connection.execute(
+            "UPDATE brain_observability SET trace_complete = 0, "
+            "semantic_complete = 0, semantic_gap_records = semantic_gap_records + 1 "
+            "WHERE brain_id = ?",
+            (brain_id,),
+        )
+        if updated.rowcount != 1:
+            raise LedgerIntegrityError("gap observability row is missing")
 
     @property
     def foreign_keys_enabled(self) -> bool:
@@ -862,7 +1172,18 @@ class SQLiteLedger:
                 "ON CONFLICT(brain_id) DO NOTHING",
                 (brain_id,),
             )
+            self._ensure_observability_row(brain_id)
         return brain_id
+
+    def _ensure_observability_row(self, brain_id: str) -> None:
+        self._connection.execute(
+            "INSERT INTO brain_observability("
+            "brain_id, trace_complete, semantic_complete, dropped_events, "
+            "semantic_records, legacy_raw_only_records, semantic_gap_records) "
+            "VALUES (?, 1, 1, 0, 0, 0, 0) "
+            "ON CONFLICT(brain_id) DO NOTHING",
+            (brain_id,),
+        )
 
     def create_brain_foundation(
         self, brain_id: str, *, name: str | None
@@ -882,6 +1203,7 @@ class SQLiteLedger:
                 "INSERT INTO brains(brain_id, next_sequence) VALUES (?, 2)",
                 (brain_id,),
             )
+            self._ensure_observability_row(brain_id)
             self._connection.execute(
                 "INSERT INTO events("
                 "brain_id, sequence, event_id, body_fingerprint, "
@@ -981,6 +1303,7 @@ class SQLiteLedger:
                 "INSERT INTO brains(brain_id, next_sequence) VALUES (?, 2)",
                 (brain_id,),
             )
+            self._ensure_observability_row(brain_id)
             self._connection.execute(
                 "INSERT INTO events("
                 "brain_id, sequence, event_id, body_fingerprint, "
@@ -1128,6 +1451,10 @@ class SQLiteLedger:
                 raise LedgerIntegrityError(
                     "exact dynamic foundation compensation was lost"
                 )
+            self._connection.execute(
+                "DELETE FROM brain_observability WHERE brain_id = ?",
+                (brain_id,),
+            )
             deleted_brain = self._connection.execute(
                 "DELETE FROM brains WHERE brain_id = ? AND next_sequence = 2",
                 (brain_id,),
@@ -1246,11 +1573,20 @@ class SQLiteLedger:
         historical_states: Mapping[int, BrainState] | None = None,
         final_state: BrainState | None = None,
         migrate_legacy_action_frames: bool = False,
+        legacy_bridge_schema: bool = False,
     ) -> BrainState:
+        semantic_columns = (
+            ""
+            if legacy_bridge_schema
+            else ", semantic_status, semantic_complete, semantic_fingerprint, "
+            "derived_event_count, derived_first_sequence, derived_last_sequence"
+        )
         rows = self._connection.execute(
             "SELECT bridge_instance_id, first_capture_seq, last_capture_seq, "
             "record_kind, record_fingerprint, record_json, event_id, "
-            "ledger_sequence, ack_json, accepted_at FROM bridge_record "
+            "ledger_sequence, ack_json, accepted_at"
+            + semantic_columns
+            + " FROM bridge_record "
             "WHERE bridge_instance_id = ? ORDER BY first_capture_seq",
             (stream.bridge_instance_id,),
         ).fetchall()
@@ -1258,7 +1594,15 @@ class SQLiteLedger:
             historical_states, replayed_final = (
                 self._replay_target_states_in_transaction(
                     stream.brain_id,
-                    {int(row["ledger_sequence"]) for row in rows},
+                    {
+                        int(row["ledger_sequence"])
+                        + (
+                            0
+                            if legacy_bridge_schema
+                            else int(row["derived_event_count"])
+                        )
+                        for row in rows
+                    },
                 )
             )
         else:
@@ -1271,6 +1615,7 @@ class SQLiteLedger:
             )
         expected_cursor = 1
         previous_ledger_sequence = 0
+        expected_spans: list[tuple[HermesSpan, int | None]] = []
         for row in rows:
             if row["first_capture_seq"] != expected_cursor:
                 raise LedgerIntegrityError(
@@ -1293,20 +1638,151 @@ class SQLiteLedger:
                 raise LedgerIntegrityError(
                     "persisted bridge record history is invalid"
                 ) from error
-            historical_state = historical_states.get(int(row["ledger_sequence"]))
+            row_last_sequence = int(row["ledger_sequence"]) + (
+                0 if legacy_bridge_schema else int(row["derived_event_count"])
+            )
+            historical_state = historical_states.get(row_last_sequence)
             if historical_state is None:
                 raise LedgerIntegrityError(
                     "bridge event sequence is absent from authoritative replay"
                 )
             try:
-                self._decode_duplicate_bridge_record(
-                    row,
-                    requested=record,
-                    requested_json=record.canonical_json(),
-                    requested_fingerprint=record.fingerprint(),
-                    historical_state=historical_state,
-                    migrate_legacy_action_frame=migrate_legacy_action_frames,
-                )
+                if legacy_bridge_schema:
+                    self._decode_legacy_duplicate_bridge_record(
+                        row,
+                        requested=record,
+                        requested_json=record.canonical_json(),
+                        requested_fingerprint=record.fingerprint(),
+                        historical_state=historical_state,
+                        migrate_legacy_action_frame=migrate_legacy_action_frames,
+                    )
+                else:
+                    ack = self._decode_duplicate_bridge_record(
+                        row,
+                        requested=record,
+                        requested_json=record.canonical_json(),
+                        requested_fingerprint=record.fingerprint(),
+                        historical_state=historical_state,
+                    )
+                    if ack.semantic_status == "legacy_raw_only":
+                        expected_legacy_fingerprint = (
+                            self._legacy_semantic_fingerprint(
+                                record_fingerprint=record.fingerprint(),
+                                raw_event_id=ack.raw_event_id,
+                                raw_event_sequence=ack.raw_event_sequence,
+                                through_capture_seq=record.last_capture_seq,
+                            )
+                        )
+                        if (
+                            ack.semantic_fingerprint
+                            != expected_legacy_fingerprint
+                            or ack.semantic_complete
+                            or ack.derived_event_count != 0
+                        ):
+                            raise LedgerIntegrityError(
+                                "legacy raw-only semantic evidence is not canonical"
+                            )
+                    else:
+                        event_rows = self._connection.execute(
+                            "SELECT event_id, brain_id, sequence, body_fingerprint, "
+                            "envelope_fingerprint, envelope_json FROM events "
+                            "WHERE brain_id = ? AND sequence BETWEEN ? AND ? "
+                            "ORDER BY sequence",
+                            (
+                                stream.brain_id,
+                                ack.raw_event_sequence,
+                                ack.last_event_sequence,
+                            ),
+                        ).fetchall()
+                        events = tuple(
+                            self._decode_event(event_row) for event_row in event_rows
+                        )
+                        raw_event = events[0].model_copy(
+                            update={"sequence": None}
+                        ).revalidated()
+                        matched_span: HermesSpan | None = None
+                        if isinstance(record, HermesObservationV1):
+                            if record.hook == "post_tool_call":
+                                span_kind = "tool"
+                                external_id = record.context.tool_call_id
+                            elif record.hook in {
+                                "post_api_request",
+                                "api_request_error",
+                            }:
+                                span_kind = "api"
+                                external_id = record.context.api_request_id
+                            else:
+                                span_kind = None
+                                external_id = None
+                            if span_kind is not None and external_id is not None:
+                                context_fingerprint = span_context_fingerprint(record)
+                                matched_span = next(
+                                    (
+                                        span
+                                        for span, closed_at in reversed(expected_spans)
+                                        if closed_at is None
+                                        and span.span_kind == span_kind
+                                        and span.external_id == external_id
+                                        and span.context_fingerprint
+                                        == context_fingerprint
+                                    ),
+                                    None,
+                                )
+                        expected_plan = build_semantic_plan(
+                            stream,
+                            record,
+                            raw_event=raw_event,
+                            matched_span=matched_span,
+                        )
+                        actual_derived = events[1:]
+                        if (
+                            expected_plan.semantic_status != ack.semantic_status
+                            or expected_plan.semantic_complete
+                            is not ack.semantic_complete
+                            or expected_plan.fingerprint()
+                            != ack.semantic_fingerprint
+                            or len(expected_plan.derived_events)
+                            != len(actual_derived)
+                            or any(
+                                expected.event_id != actual.event_id
+                                or expected.canonical_json(exclude_sequence=True)
+                                != actual.canonical_json(exclude_sequence=True)
+                                for expected, actual in zip(
+                                    expected_plan.derived_events,
+                                    actual_derived,
+                                    strict=True,
+                                )
+                            )
+                        ):
+                            raise LedgerIntegrityError(
+                                "persisted derived events do not match semantic plan"
+                            )
+                        if expected_plan.span_close is not None:
+                            for index in range(len(expected_spans) - 1, -1, -1):
+                                span, closed_at = expected_spans[index]
+                                if span == expected_plan.span_close and closed_at is None:
+                                    expected_spans[index] = (
+                                        span,
+                                        record.last_capture_seq,
+                                    )
+                                    break
+                            else:
+                                raise LedgerIntegrityError(
+                                    "semantic history closed an absent span"
+                                )
+                        if expected_plan.span_open is not None:
+                            expected_spans.append((expected_plan.span_open, None))
+                        excess = len(expected_spans) - MAX_HERMES_SPANS_PER_STREAM
+                        if excess > 0:
+                            victim_indexes = sorted(
+                                range(len(expected_spans)),
+                                key=lambda index: (
+                                    expected_spans[index][1] is None,
+                                    expected_spans[index][0].occurrence_capture_seq,
+                                ),
+                            )[:excess]
+                            for index in sorted(victim_indexes, reverse=True):
+                                expected_spans.pop(index)
             except IdempotencyConflictError as error:
                 raise LedgerIntegrityError(
                     "persisted bridge history fingerprint does not match"
@@ -1317,6 +1793,31 @@ class SQLiteLedger:
             raise LedgerIntegrityError(
                 "persisted bridge cursor does not match contiguous history"
             )
+        if not legacy_bridge_schema:
+            persisted_span_rows = self._connection.execute(
+                "SELECT bridge_instance_id, span_kind, external_id, "
+                "occurrence_capture_seq, context_fingerprint, action_id, "
+                "closed_capture_seq FROM hermes_span WHERE bridge_instance_id = ? "
+                "ORDER BY span_kind, external_id, occurrence_capture_seq",
+                (stream.bridge_instance_id,),
+            ).fetchall()
+            expected_span_values = sorted(
+                (
+                    span.bridge_instance_id,
+                    span.span_kind,
+                    span.external_id,
+                    span.occurrence_capture_seq,
+                    span.context_fingerprint,
+                    span.action_id,
+                    closed_at,
+                )
+                for span, closed_at in expected_spans
+            )
+            persisted_span_values = [tuple(row) for row in persisted_span_rows]
+            if persisted_span_values != expected_span_values:
+                raise LedgerIntegrityError(
+                    "bounded Hermes span cache does not match semantic history"
+                )
         return replayed_final
 
     @staticmethod
@@ -1422,24 +1923,83 @@ class SQLiteLedger:
                 "abandoned streams and unknown gaps are not one-to-one"
             )
 
+    def _validate_observability_in_transaction(
+        self,
+        *,
+        final_states: Mapping[str, BrainState],
+        streams: Mapping[str, BridgeStreamState],
+    ) -> None:
+        expected = {
+            brain_id: {
+                "trace_complete": int(state.trace_complete),
+                "semantic_complete": int(state.trace_complete),
+                "dropped_events": 0,
+                "semantic_records": 0,
+                "legacy_raw_only_records": 0,
+                "semantic_gap_records": 0,
+            }
+            for brain_id, state in final_states.items()
+        }
+        rows = self._connection.execute(
+            "SELECT stream.brain_id, record.record_kind, record.record_json, "
+            "record.semantic_status FROM bridge_record AS record "
+            "JOIN bridge_stream AS stream ON stream.bridge_instance_id = "
+            "record.bridge_instance_id ORDER BY stream.brain_id, "
+            "record.first_capture_seq"
+        ).fetchall()
+        for row in rows:
+            health = expected[row["brain_id"]]
+            health["semantic_records"] += 1
+            if row["semantic_status"] == "legacy_raw_only":
+                health["legacy_raw_only_records"] += 1
+                health["semantic_complete"] = 0
+            if row["semantic_status"] == "gap":
+                health["semantic_gap_records"] += 1
+                health["semantic_complete"] = 0
+            if row["record_kind"] == "gap":
+                record = validate_bridge_record_json(row["record_json"])
+                if not isinstance(record, BridgeGapV1):
+                    raise LedgerIntegrityError(
+                        "observability gap row is not a typed bridge gap"
+                    )
+                health["dropped_events"] += record.dropped_count
+        for stream in streams.values():
+            if stream.status == "abandoned":
+                health = expected[stream.brain_id]
+                health["semantic_gap_records"] += 1
+                health["semantic_complete"] = 0
+        persisted_rows = self._connection.execute(
+            "SELECT brain_id, trace_complete, semantic_complete, dropped_events, "
+            "semantic_records, legacy_raw_only_records, semantic_gap_records "
+            "FROM brain_observability ORDER BY brain_id"
+        ).fetchall()
+        persisted = {
+            row["brain_id"]: {
+                "trace_complete": int(row["trace_complete"]),
+                "semantic_complete": int(row["semantic_complete"]),
+                "dropped_events": int(row["dropped_events"]),
+                "semantic_records": int(row["semantic_records"]),
+                "legacy_raw_only_records": int(row["legacy_raw_only_records"]),
+                "semantic_gap_records": int(row["semantic_gap_records"]),
+            }
+            for row in persisted_rows
+        }
+        if persisted != expected:
+            raise LedgerIntegrityError(
+                "persisted observability metadata does not match replay"
+            )
+
     def _validate_bridge_tail_in_transaction(
         self, stream: BridgeStreamState
     ) -> BridgeRecordV1 | None:
         rows = self._connection.execute(
-            "SELECT record.bridge_instance_id, record.first_capture_seq, "
-            "record.last_capture_seq, record.record_kind, "
-            "record.record_fingerprint, record.record_json, record.event_id, "
-            "record.ledger_sequence, record.ack_json, record.accepted_at, "
-            "event.event_id AS linked_event_id, "
-            "event.brain_id AS linked_brain_id, "
-            "event.sequence AS linked_sequence, "
-            "event.body_fingerprint AS linked_body_fingerprint, "
-            "event.envelope_fingerprint AS linked_envelope_fingerprint, "
-            "event.envelope_json AS linked_envelope_json "
-            "FROM bridge_record AS record JOIN events AS event "
-            "ON event.event_id = record.event_id "
-            "WHERE record.bridge_instance_id = ? "
-            "ORDER BY record.first_capture_seq DESC LIMIT 2",
+            "SELECT bridge_instance_id, first_capture_seq, last_capture_seq, "
+            "record_kind, record_fingerprint, record_json, event_id, "
+            "ledger_sequence, semantic_status, semantic_complete, "
+            "semantic_fingerprint, derived_event_count, derived_first_sequence, "
+            "derived_last_sequence, ack_json, accepted_at FROM bridge_record "
+            "WHERE bridge_instance_id = ? "
+            "ORDER BY first_capture_seq DESC LIMIT 2",
             (stream.bridge_instance_id,),
         ).fetchall()
         if not rows:
@@ -1462,14 +2022,6 @@ class SQLiteLedger:
                 requested=record,
                 requested_json=record.canonical_json(),
                 requested_fingerprint=record.fingerprint(),
-                event_row={
-                    "event_id": row["linked_event_id"],
-                    "brain_id": row["linked_brain_id"],
-                    "sequence": row["linked_sequence"],
-                    "body_fingerprint": row["linked_body_fingerprint"],
-                    "envelope_fingerprint": row["linked_envelope_fingerprint"],
-                    "envelope_json": row["linked_envelope_json"],
-                },
             )
             decoded.append(record)
 
@@ -1501,6 +2053,7 @@ class SQLiteLedger:
         historical_states: Mapping[str, Mapping[int, BrainState]],
         final_states: Mapping[str, BrainState],
         migrate_legacy_action_frames: bool,
+        legacy_bridge_schema: bool,
     ) -> None:
         self._validated_profile_rows_in_transaction()
         rows = self._connection.execute(
@@ -1526,8 +2079,14 @@ class SQLiteLedger:
                 historical_states=brain_history,
                 final_state=final_state,
                 migrate_legacy_action_frames=migrate_legacy_action_frames,
+                legacy_bridge_schema=legacy_bridge_schema,
             )
         self._validate_abandonment_history_in_transaction(streams)
+        if not legacy_bridge_schema:
+            self._validate_observability_in_transaction(
+                final_states=final_states,
+                streams=streams,
+            )
 
     def _validate_replay_and_snapshots_in_transaction(
         self, version: int
@@ -1553,8 +2112,15 @@ class SQLiteLedger:
             if row["schema_version"] == STATE_SCHEMA_VERSION:
                 target_sequences[brain_id].add(int(row["sequence"]))
         if version in _SQLITE_BRIDGE_SCHEMA_VERSIONS:
+            sequence_expression = (
+                "record.ledger_sequence"
+                if version in {3, 4}
+                else "record.ledger_sequence + record.derived_event_count"
+            )
             bridge_targets = self._connection.execute(
-                "SELECT stream.brain_id, record.ledger_sequence "
+                "SELECT stream.brain_id, "
+                + sequence_expression
+                + " AS ledger_sequence "
                 "FROM bridge_record AS record JOIN bridge_stream AS stream "
                 "ON stream.bridge_instance_id = record.bridge_instance_id "
                 "ORDER BY stream.brain_id, record.ledger_sequence"
@@ -2020,7 +2586,7 @@ class SQLiteLedger:
         capture_coverage: Mapping[str, object] | None = None,
         scheduler_sample: str = "not_sampled",
         stream_connected: bool = False,
-    ) -> ConsciousnessFrameV2:
+    ) -> ConsciousnessFrameV3:
         limit = 4
 
         def bounded_mapping(values: Mapping[str, object]) -> list[dict[str, object]]:
@@ -2211,7 +2777,7 @@ class SQLiteLedger:
             item.execution_confirmed is None or item.effect_confirmed is None
             for item in state.action_records
         )
-        return ConsciousnessFrameV2(
+        return ConsciousnessFrameV3(
             brain_id=state.brain_id,
             state_sequence=state.last_sequence,
             through_capture_seq=through_capture_seq,
@@ -2777,7 +3343,7 @@ class SQLiteLedger:
         connected_nonce: str | None = None,
         scheduler_sample: str,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
-    ) -> ConsciousnessFrameV2:
+    ) -> ConsciousnessFrameV3:
         """Project a live frame from canonical history and an exact engine state."""
         bridge_instance_id = validate_id(bridge_instance_id)
         if not isinstance(expected_state, BrainState):
@@ -2819,7 +3385,7 @@ class SQLiteLedger:
 
     @staticmethod
     def _enforce_frame_limit(
-        frame: ConsciousnessFrameV2, *, max_frame_bytes: int
+        frame: ConsciousnessFrameV2 | ConsciousnessFrameV3, *, max_frame_bytes: int
     ) -> None:
         if isinstance(max_frame_bytes, bool) or not isinstance(max_frame_bytes, int):
             raise TypeError("max_frame_bytes must be an integer")
@@ -2862,32 +3428,123 @@ class SQLiteLedger:
     def _bridge_event(
         stream: BridgeStreamState, record: BridgeRecordV1
     ) -> EventEnvelope:
-        if isinstance(record, HermesObservationV1):
-            return new_event(
-                HOOK_EVENT_TYPES[record.hook],
-                stream.brain_id,
-                stream.server_actor_id,
-                record.model_dump(mode="json"),
-                wall_time=record.captured_at,
-                monotonic_ns=record.captured_monotonic_ns,
-                adapter_id=stream.server_adapter_id,
-                session_id=getattr(record.context, "session_id", None),
-                turn_id=getattr(record.context, "turn_id", None),
-                correlation_id=getattr(record.context, "api_request_id", None),
-            )
-        return new_event(
-            "trace.gap",
-            stream.brain_id,
-            stream.server_actor_id,
-            {
-                **record.model_dump(mode="json"),
-                "exact": True,
-                "trace_complete": False,
-            },
-            adapter_id=stream.server_adapter_id,
+        return build_raw_event(stream, record)
+
+    @staticmethod
+    def _span_from_row(row: Mapping[str, object]) -> HermesSpan:
+        return HermesSpan(
+            bridge_instance_id=str(row["bridge_instance_id"]),
+            span_kind=str(row["span_kind"]),  # type: ignore[arg-type]
+            external_id=str(row["external_id"]),
+            occurrence_capture_seq=int(row["occurrence_capture_seq"]),
+            context_fingerprint=str(row["context_fingerprint"]),
+            action_id=(None if row["action_id"] is None else str(row["action_id"])),
         )
 
-    def _decode_duplicate_bridge_record(
+    def _matched_span_in_transaction(
+        self, record: BridgeRecordV1
+    ) -> HermesSpan | None:
+        if not isinstance(record, HermesObservationV1):
+            return None
+        if record.hook == "post_tool_call":
+            span_kind = "tool"
+            external_id = record.context.tool_call_id
+        elif record.hook in {"post_api_request", "api_request_error"}:
+            span_kind = "api"
+            external_id = record.context.api_request_id
+        else:
+            return None
+        row = self._connection.execute(
+            "SELECT bridge_instance_id, span_kind, external_id, "
+            "occurrence_capture_seq, context_fingerprint, action_id "
+            "FROM hermes_span WHERE bridge_instance_id = ? AND span_kind = ? "
+            "AND external_id = ? AND context_fingerprint = ? "
+            "AND closed_capture_seq IS NULL ORDER BY occurrence_capture_seq DESC LIMIT 1",
+            (
+                record.bridge_instance_id,
+                span_kind,
+                external_id,
+                span_context_fingerprint(record),
+            ),
+        ).fetchone()
+        return None if row is None else self._span_from_row(row)
+
+    def _apply_semantic_spans_in_transaction(
+        self, plan: SemanticPlan, *, closing_capture_seq: int
+    ) -> None:
+        if plan.span_close is not None:
+            span = plan.span_close
+            updated = self._connection.execute(
+                "UPDATE hermes_span SET closed_capture_seq = ? "
+                "WHERE bridge_instance_id = ? AND span_kind = ? "
+                "AND external_id = ? AND occurrence_capture_seq = ? "
+                "AND context_fingerprint = ? AND closed_capture_seq IS NULL",
+                (
+                    closing_capture_seq,
+                    span.bridge_instance_id,
+                    span.span_kind,
+                    span.external_id,
+                    span.occurrence_capture_seq,
+                    span.context_fingerprint,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise LedgerIntegrityError("matched Hermes span was lost before close")
+        if plan.span_open is not None:
+            span = plan.span_open
+            self._connection.execute(
+                "INSERT INTO hermes_span("
+                "bridge_instance_id, span_kind, external_id, "
+                "occurrence_capture_seq, context_fingerprint, action_id, "
+                "closed_capture_seq) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    span.bridge_instance_id,
+                    span.span_kind,
+                    span.external_id,
+                    span.occurrence_capture_seq,
+                    span.context_fingerprint,
+                    span.action_id,
+                ),
+            )
+        bridge_instance_id = (
+            plan.span_open.bridge_instance_id
+            if plan.span_open is not None
+            else plan.span_close.bridge_instance_id
+            if plan.span_close is not None
+            else None
+        )
+        if bridge_instance_id is None:
+            return
+        count = int(
+            self._connection.execute(
+                "SELECT COUNT(*) FROM hermes_span WHERE bridge_instance_id = ?",
+                (bridge_instance_id,),
+            ).fetchone()[0]
+        )
+        excess = count - MAX_HERMES_SPANS_PER_STREAM
+        if excess <= 0:
+            return
+        victims = self._connection.execute(
+            "SELECT span_kind, external_id, occurrence_capture_seq "
+            "FROM hermes_span WHERE bridge_instance_id = ? "
+            "ORDER BY CASE WHEN closed_capture_seq IS NULL THEN 1 ELSE 0 END, "
+            "occurrence_capture_seq LIMIT ?",
+            (bridge_instance_id, excess),
+        ).fetchall()
+        for victim in victims:
+            self._connection.execute(
+                "DELETE FROM hermes_span WHERE bridge_instance_id = ? "
+                "AND span_kind = ? AND external_id = ? "
+                "AND occurrence_capture_seq = ?",
+                (
+                    bridge_instance_id,
+                    victim["span_kind"],
+                    victim["external_id"],
+                    victim["occurrence_capture_seq"],
+                ),
+            )
+
+    def _decode_legacy_duplicate_bridge_record(
         self,
         row: sqlite3.Row,
         *,
@@ -3075,6 +3732,161 @@ class SQLiteLedger:
             ack = migrated
         return ack
 
+    @staticmethod
+    def _raw_bridge_event_matches(
+        event: EventEnvelope, record: BridgeRecordV1
+    ) -> bool:
+        if isinstance(record, HermesObservationV1):
+            return (
+                event.event_type == HOOK_EVENT_TYPES[record.hook]
+                and event.payload == record.model_dump(mode="json")
+                and event.wall_time == record.captured_at
+                and event.monotonic_ns == record.captured_monotonic_ns
+                and event.session_id == getattr(record.context, "session_id", None)
+                and event.turn_id == getattr(record.context, "turn_id", None)
+                and event.correlation_id
+                == getattr(record.context, "api_request_id", None)
+            )
+        return (
+            event.event_type == "trace.gap"
+            and event.payload
+            == {
+                **record.model_dump(mode="json"),
+                "exact": True,
+                "trace_complete": False,
+            }
+        )
+
+    def _decode_duplicate_bridge_record(
+        self,
+        row: Mapping[str, object],
+        *,
+        requested: BridgeRecordV1,
+        requested_json: str,
+        requested_fingerprint: str,
+        historical_state: BrainState | None = None,
+    ) -> BridgeCommitAckV2:
+        if (
+            row["record_fingerprint"] != requested_fingerprint
+            or row["record_json"] != requested_json
+        ):
+            raise IdempotencyConflictError(
+                "bridge idempotency key has a different immutable body"
+            )
+        if (
+            row["bridge_instance_id"] != requested.bridge_instance_id
+            or int(row["first_capture_seq"]) != requested.first_capture_seq
+            or int(row["last_capture_seq"]) != requested.last_capture_seq
+            or row["record_kind"] != requested.record_kind
+        ):
+            raise LedgerIntegrityError(
+                "persisted bridge record keys do not match its canonical body"
+            )
+        try:
+            persisted = validate_bridge_record_json(str(row["record_json"]))
+            accepted_at = datetime.fromisoformat(str(row["accepted_at"]))
+            ack = BridgeCommitAckV2.model_validate_json(str(row["ack_json"]))
+        except Exception as error:
+            raise LedgerIntegrityError(
+                "persisted semantic bridge record or acknowledgement is invalid"
+            ) from error
+        raw_sequence = int(row["ledger_sequence"])
+        derived_count = int(row["derived_event_count"])
+        derived_first = row["derived_first_sequence"]
+        derived_last = row["derived_last_sequence"]
+        last_sequence = raw_sequence + derived_count
+        if (
+            type(persisted) is not type(requested)
+            or persisted != requested
+            or persisted.canonical_json() != row["record_json"]
+            or accepted_at.tzinfo is None
+            or accepted_at.utcoffset() is None
+            or accepted_at.astimezone(UTC).isoformat() != row["accepted_at"]
+            or ack.canonical_json() != row["ack_json"]
+            or row["semantic_status"] != ack.semantic_status
+            or bool(row["semantic_complete"]) is not ack.semantic_complete
+            or row["semantic_fingerprint"] != ack.semantic_fingerprint
+            or derived_count != ack.derived_event_count
+            or (
+                derived_count == 0
+                and (derived_first is not None or derived_last is not None)
+            )
+            or (
+                derived_count > 0
+                and (
+                    int(derived_first) != raw_sequence + 1
+                    or int(derived_last) != last_sequence
+                )
+            )
+        ):
+            raise LedgerIntegrityError(
+                "persisted semantic bridge canonical data does not match"
+            )
+        stream = self._stream_from_row(
+            self._bridge_stream_row(requested.bridge_instance_id)
+        )
+        if (
+            accepted_at.astimezone(UTC) > stream.last_seen
+            or stream.next_capture_seq <= requested.last_capture_seq
+        ):
+            raise LedgerIntegrityError(
+                "persisted semantic bridge cursor or acceptance is invalid"
+            )
+        event_rows = self._connection.execute(
+            "SELECT event_id, brain_id, sequence, body_fingerprint, "
+            "envelope_fingerprint, envelope_json FROM events "
+            "WHERE brain_id = ? AND sequence BETWEEN ? AND ? ORDER BY sequence",
+            (stream.brain_id, raw_sequence, last_sequence),
+        ).fetchall()
+        if len(event_rows) != derived_count + 1:
+            raise LedgerIntegrityError("semantic bridge batch events are missing")
+        events = tuple(self._decode_event(event_row) for event_row in event_rows)
+        raw_event, *derived_events = events
+        if (
+            raw_event.event_id != row["event_id"]
+            or raw_event.event_id != ack.raw_event_id
+            or raw_event.sequence != raw_sequence
+            or ack.raw_event_sequence != raw_sequence
+            or ack.last_event_sequence != last_sequence
+            or tuple(event.event_id for event in derived_events)
+            != ack.derived_event_ids
+            or any(
+                event.brain_id != stream.brain_id
+                or event.actor_id != stream.server_actor_id
+                or event.adapter_id != stream.server_adapter_id
+                for event in events
+            )
+            or not self._raw_bridge_event_matches(raw_event, persisted)
+        ):
+            raise LedgerIntegrityError(
+                "persisted semantic bridge events do not match their record"
+            )
+        if historical_state is not None:
+            expected_frame = self._project_bridge_frame(
+                historical_state,
+                through_capture_seq=persisted.last_capture_seq,
+                capture_coverage=self._record_capture_coverage(persisted),
+                stream_connected=True,
+            )
+            if (
+                historical_state.brain_id != stream.brain_id
+                or historical_state.last_sequence != last_sequence
+                or ack.frame != expected_frame
+            ):
+                raise LedgerIntegrityError(
+                    "persisted semantic acknowledgement does not match replay"
+                )
+        elif (
+            ack.frame.brain_id != stream.brain_id
+            or ack.frame.state_sequence != last_sequence
+            or ack.frame.through_capture_seq != persisted.last_capture_seq
+            or ack.frame.capture_coverage != self._record_capture_coverage(persisted)
+        ):
+            raise LedgerIntegrityError(
+                "persisted semantic acknowledgement frame is not bound"
+            )
+        return ack
+
     def commit_bridge_record(
         self,
         bridge_instance_id: str,
@@ -3085,7 +3897,7 @@ class SQLiteLedger:
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         max_ack_bytes: int = DEFAULT_MAX_ACK_BYTES,
     ) -> BridgeCommitResult:
-        """Atomically commit record, event, successor frame, cursor and ACK."""
+        """Atomically commit raw, bounded semantic batch, cursor, frame and ACK."""
         bridge_instance_id = validate_id(bridge_instance_id)
         record = self._normalize_bridge_record(record)
         if record.bridge_instance_id != bridge_instance_id:
@@ -3112,7 +3924,10 @@ class SQLiteLedger:
             duplicate = self._connection.execute(
                 "SELECT bridge_instance_id, first_capture_seq, last_capture_seq, "
                 "record_kind, record_fingerprint, record_json, event_id, "
-                "ledger_sequence, ack_json, accepted_at FROM bridge_record "
+                "ledger_sequence, semantic_status, semantic_complete, "
+                "semantic_fingerprint, derived_event_count, "
+                "derived_first_sequence, derived_last_sequence, ack_json, "
+                "accepted_at FROM bridge_record "
                 "WHERE bridge_instance_id = ? AND first_capture_seq = ?",
                 (bridge_instance_id, first_capture_seq),
             ).fetchone()
@@ -3161,11 +3976,28 @@ class SQLiteLedger:
                     "bridge engine state does not match the authoritative head"
                 )
 
-            event = self._bridge_event(stream, record)
-            provisional = event.model_copy(
-                update={"sequence": expected_sequence}
-            ).revalidated()
-            successor = reduce_state(expected_state, provisional)
+            raw_event = self._bridge_event(stream, record)
+            matched_span = self._matched_span_in_transaction(record)
+            plan = build_semantic_plan(
+                stream,
+                record,
+                raw_event=raw_event,
+                matched_span=matched_span,
+            )
+            unsequenced_events = (raw_event, *plan.derived_events)
+            provisional_events = tuple(
+                event.model_copy(update={"sequence": expected_sequence + offset})
+                .revalidated()
+                for offset, event in enumerate(unsequenced_events)
+            )
+            successor = expected_state
+            for provisional in provisional_events:
+                successor = reduce_state(successor, provisional)
+            raw_provisional = provisional_events[0]
+            derived_provisionals = provisional_events[1:]
+            last_event_sequence = provisional_events[-1].sequence
+            if last_event_sequence is None:
+                raise AssertionError("semantic batch sequence allocation failed")
             frame = self._project_bridge_frame(
                 successor,
                 through_capture_seq=last_capture_seq,
@@ -3173,10 +4005,19 @@ class SQLiteLedger:
                 stream_connected=True,
             )
             self._enforce_frame_limit(frame, max_frame_bytes=max_frame_bytes)
-            ack = BridgeCommitAckV1(
+            semantic_fingerprint = plan.fingerprint()
+            ack = BridgeCommitAckV2(
                 record_fingerprint=fingerprint,
-                event_id=provisional.event_id,
-                event_sequence=expected_sequence,
+                raw_event_id=raw_provisional.event_id,
+                raw_event_sequence=expected_sequence,
+                derived_event_ids=tuple(
+                    event.event_id for event in derived_provisionals
+                ),
+                derived_event_count=len(derived_provisionals),
+                last_event_sequence=last_event_sequence,
+                semantic_status=plan.semantic_status,
+                semantic_complete=plan.semantic_complete,
+                semantic_fingerprint=semantic_fingerprint,
                 frame=frame,
                 through_capture_seq=last_capture_seq,
             )
@@ -3185,25 +4026,27 @@ class SQLiteLedger:
             updated = self._connection.execute(
                 "UPDATE brains SET next_sequence = ? "
                 "WHERE brain_id = ? AND next_sequence = ?",
-                (expected_sequence + 1, stream.brain_id, expected_sequence),
+                (last_event_sequence + 1, stream.brain_id, expected_sequence),
             )
             if updated.rowcount != 1:
                 raise ExpectedSequenceError(
                     "bridge expected sequence was lost before event insert"
                 )
-            self._connection.execute(
-                "INSERT INTO events("
-                "brain_id, sequence, event_id, body_fingerprint, "
-                "envelope_fingerprint, envelope_json) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    provisional.brain_id,
-                    expected_sequence,
-                    provisional.event_id,
-                    provisional.body_fingerprint(),
-                    provisional.envelope_fingerprint(),
-                    provisional.canonical_json(),
-                ),
-            )
+            for provisional in provisional_events:
+                self._connection.execute(
+                    "INSERT INTO events("
+                    "brain_id, sequence, event_id, body_fingerprint, "
+                    "envelope_fingerprint, envelope_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        provisional.brain_id,
+                        provisional.sequence,
+                        provisional.event_id,
+                        provisional.body_fingerprint(),
+                        provisional.envelope_fingerprint(),
+                        provisional.canonical_json(),
+                    ),
+                )
             cursor_update = self._connection.execute(
                 "UPDATE bridge_stream SET next_capture_seq = ?, last_seen = ? "
                 "WHERE bridge_instance_id = ? AND next_capture_seq = ?",
@@ -3218,12 +4061,25 @@ class SQLiteLedger:
                 raise ExpectedSequenceError(
                     "bridge capture cursor was lost before record insert"
                 )
+            self._apply_semantic_spans_in_transaction(
+                plan,
+                closing_capture_seq=last_capture_seq,
+            )
+            self._record_semantic_observability(stream.brain_id, record, plan)
+            derived_first_sequence = (
+                None if not derived_provisionals else expected_sequence + 1
+            )
+            derived_last_sequence = (
+                None if not derived_provisionals else last_event_sequence
+            )
             self._connection.execute(
                 "INSERT INTO bridge_record("
                 "bridge_instance_id, first_capture_seq, last_capture_seq, "
                 "record_kind, record_fingerprint, record_json, event_id, "
-                "ledger_sequence, ack_json, accepted_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "ledger_sequence, semantic_status, semantic_complete, "
+                "semantic_fingerprint, derived_event_count, "
+                "derived_first_sequence, derived_last_sequence, ack_json, "
+                "accepted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     bridge_instance_id,
                     first_capture_seq,
@@ -3231,8 +4087,14 @@ class SQLiteLedger:
                     record.record_kind,
                     fingerprint,
                     record_json,
-                    provisional.event_id,
+                    raw_provisional.event_id,
                     expected_sequence,
+                    plan.semantic_status,
+                    int(plan.semantic_complete),
+                    semantic_fingerprint,
+                    len(derived_provisionals),
+                    derived_first_sequence,
+                    derived_last_sequence,
                     ack_json,
                     accepted_at,
                 ),
@@ -3354,6 +4216,7 @@ class SQLiteLedger:
                 "ON CONFLICT(brain_id) DO NOTHING",
                 (event.brain_id,),
             )
+            self._ensure_observability_row(event.brain_id)
             sequence = int(
                 self._connection.execute(
                     "SELECT next_sequence FROM brains WHERE brain_id = ?",

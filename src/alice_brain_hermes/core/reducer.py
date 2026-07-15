@@ -256,7 +256,7 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
             (
                 index
                 for index, item in enumerate(actions)
-                if item.phase is ActionPhase.RECONSTRUCTED
+                if item.phase in {ActionPhase.BLOCKED, ActionPhase.RECONSTRUCTED}
             ),
             None,
         )
@@ -365,7 +365,7 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
         working_set = working_set.model_copy(
             update={"capabilities": WorkingSetCounter(total=len(capabilities))}
         )
-    elif event.event_type == "trace.gap":
+    elif event.event_type in {"semantic.gap", "trace.gap"}:
         values["trace_complete"] = False
     elif event.event_type == "action.energy_assessed":
         action_id = action_id_from_event(event)
