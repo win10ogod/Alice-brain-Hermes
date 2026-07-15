@@ -376,7 +376,7 @@ def test_unknown_receipt_keeps_execution_and_outcome_unknown() -> None:
     assert action.outcome is None
 
 
-def test_blocked_action_records_non_dispatch_without_fabricating_outcome_or_effect() -> None:
+def test_blocked_action_records_non_dispatch_without_fabricated_effect() -> None:
     state = reduce_many(
         prepared_state(),
         [

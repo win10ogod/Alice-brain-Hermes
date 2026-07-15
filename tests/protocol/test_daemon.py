@@ -19,6 +19,7 @@ from alice_brain_hermes.errors import DaemonRpcError
 from alice_brain_hermes.ids import new_id
 from alice_brain_hermes.protocol.client import DaemonClient
 from alice_brain_hermes.protocol.models import (
+    PROTOCOL_VERSION,
     BrainProfileV1,
     CapabilityProfileV1,
     CoverageV1,
@@ -180,7 +181,7 @@ def test_fragmented_coalesced_oversized_and_invalid_frames_are_recoverable(
             "id": 2,
             "method": "initialize",
             "params": {
-                "protocol_version": 1,
+                "protocol_version": PROTOCOL_VERSION,
                 "capabilities": CapabilityProfileV1().model_dump(mode="json"),
             },
             "auth": token,
@@ -311,7 +312,7 @@ def test_forced_death_recovers_connected_stream_for_exact_resume(
         },
     )
     assert second_ack["through_capture_seq"] == 2
-    assert second_ack["event_sequence"] > first_ack["event_sequence"]
+    assert second_ack["raw_event_sequence"] > first_ack["last_event_sequence"]
     closed = resumed.call(
         "bridge.close",
         {"binding": binding["binding"], "final_capture_seq": 2},

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import alice_brain_hermes.runtime.store as store_module
 from alice_brain_hermes.core.action import ActionOutcome, ActionPhase
 from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict
 from alice_brain_hermes.errors import IdempotencyConflictError, SchemaVersionError
@@ -35,6 +36,10 @@ def test_pre_tool_commits_raw_and_complete_pc_e_st_rd_batch_atomically(
         assert ack.frame.state_sequence == 6
         assert ack.semantic_status == "applied"
         assert ack.semantic_complete is True
+        assert ack.frame.aggregate_semantic_complete is True
+        assert ack.frame.semantic_schema_version == 1
+        assert ack.frame.semantic_evidence.semantic_records == 1
+        assert ack.frame.semantic_evidence.semantic_gap_records == 0
         assert engine.state.last_sequence == 6
         assert [event.event_type for event in ledger.list_events(engine.brain_id)] == [
             "hermes.observer.pre_tool_call",
@@ -95,6 +100,81 @@ def test_matched_post_tool_closes_occurrence_and_commits_execution_outcome(
         assert closed_capture_seq == 2
 
 
+def test_late_receipt_matches_latest_closed_occurrence_without_redispatch(
+    tmp_path: Path,
+) -> None:
+    ledger, engine, instance = make_engine(tmp_path)
+    database = ledger.path
+    with ledger:
+        engine.commit_bridge_record(
+            instance,
+            tool_observation(instance, 1, hook="pre_tool_call"),
+        )
+        engine.commit_bridge_record(
+            instance,
+            tool_observation(
+                instance, 2, hook="post_tool_call", status="timeout"
+            ),
+        )
+
+        ack = engine.commit_bridge_record(
+            instance,
+            tool_observation(instance, 3, hook="post_tool_call", status="ok"),
+        )
+
+        assert ack.semantic_status == "applied"
+        assert ack.derived_event_count == 1
+        assert [
+            event.event_type
+            for event in ledger.list_events(engine.brain_id)
+            if event.sequence is not None and event.sequence >= ack.raw_event_sequence
+        ] == ["hermes.observer.post_tool_call", "action.receipt"]
+        [action] = engine.state.action_records
+        assert action.outcome is ActionOutcome.SUCCESS
+        assert action.receipt_history[-1].late is True
+
+    from alice_brain_hermes.runtime.store import SQLiteLedger
+
+    with SQLiteLedger.open(database) as reopened:
+        assert reopened.observability_snapshot(engine.brain_id).semantic_complete
+
+
+def test_all_open_span_capacity_commits_raw_plus_explicit_gap_without_eviction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module, "MAX_HERMES_SPANS_PER_STREAM", 2)
+    ledger, engine, instance = make_engine(tmp_path)
+    with ledger:
+        for capture_seq in (1, 2):
+            ack = engine.commit_bridge_record(
+                instance,
+                tool_observation(
+                    instance,
+                    capture_seq,
+                    hook="pre_tool_call",
+                    tool_call_id=f"tool-{capture_seq}",
+                ),
+            )
+            assert ack.semantic_status == "applied"
+
+        capped = engine.commit_bridge_record(
+            instance,
+            tool_observation(
+                instance, 3, hook="pre_tool_call", tool_call_id="tool-3"
+            ),
+        )
+
+        assert capped.semantic_status == "gap"
+        assert capped.semantic_complete is False
+        assert capped.derived_event_count == 1
+        assert ledger._connection.execute(
+            "SELECT COUNT(*) FROM hermes_span WHERE closed_capture_seq IS NULL"
+        ).fetchone()[0] == 2
+        last = ledger.list_events(engine.brain_id)[-1]
+        assert last.event_type == "semantic.gap"
+        assert last.payload["reason"] == "span_capacity_all_open"
+
+
 def test_unmatched_post_tool_commits_raw_plus_semantic_gap(tmp_path: Path) -> None:
     ledger, engine, instance = make_engine(tmp_path)
     with ledger:
@@ -107,6 +187,8 @@ def test_unmatched_post_tool_commits_raw_plus_semantic_gap(tmp_path: Path) -> No
         assert ack.semantic_complete is False
         assert ack.derived_event_count == 1
         assert ack.last_event_sequence == 2
+        assert ack.frame.aggregate_semantic_complete is False
+        assert ack.frame.semantic_evidence.semantic_gap_records == 1
         assert engine.state.trace_complete is False
         assert [event.event_type for event in ledger.list_events(engine.brain_id)] == [
             "hermes.observer.post_tool_call",
@@ -223,11 +305,17 @@ def test_startup_rejects_rehashed_derived_event_outside_canonical_semantic_plan(
             "SELECT envelope_json FROM events WHERE sequence = 2"
         ).fetchone()
         event = EventEnvelope.model_validate_json(encoded)
-        payload = event.payload.model_dump() if hasattr(event.payload, "model_dump") else dict(event.payload)
+        payload = (
+            event.payload.model_dump()
+            if hasattr(event.payload, "model_dump")
+            else dict(event.payload)
+        )
         intent = dict(payload["intent"])
         intent["args_sha256"] = "c" * 64
         payload["intent"] = intent
-        changed = event.model_copy(update={"payload": FrozenJsonDict(payload)}).revalidated()
+        changed = event.model_copy(
+            update={"payload": FrozenJsonDict(payload)}
+        ).revalidated()
         connection.execute(
             "UPDATE events SET body_fingerprint = ?, envelope_fingerprint = ?, "
             "envelope_json = ? WHERE sequence = 2",
@@ -257,6 +345,38 @@ def test_startup_rejects_observability_metadata_that_claims_false_green(
     with sqlite3.connect(database) as connection:
         connection.execute(
             "UPDATE brain_observability SET trace_complete = 1, semantic_complete = 1"
+        )
+
+    from alice_brain_hermes.runtime.store import SQLiteLedger
+
+    with pytest.raises(SchemaVersionError, match="bridge or profile"):
+        SQLiteLedger.open(database)
+
+
+def test_startup_rejects_recanonicalized_false_frame_semantic_evidence(
+    tmp_path: Path,
+) -> None:
+    ledger, engine, instance = make_engine(tmp_path)
+    database = ledger.path
+    with ledger:
+        engine.commit_bridge_record(
+            instance,
+            tool_observation(instance, 1, hook="pre_tool_call"),
+        )
+    with sqlite3.connect(database) as connection:
+        [encoded] = connection.execute("SELECT ack_json FROM bridge_record").fetchone()
+        ack = BridgeCommitAckV2.model_validate_json(encoded)
+        frame_values = ack.frame.model_dump(mode="python")
+        frame_values["aggregate_semantic_complete"] = False
+        frame_values["semantic_evidence"]["semantic_gap_records"] = 1
+        ack_values = ack.model_dump(mode="python")
+        ack_values["frame"] = ack.frame.__class__.model_validate(
+            frame_values, strict=True
+        )
+        changed = BridgeCommitAckV2.model_validate(ack_values, strict=True)
+        connection.execute(
+            "UPDATE bridge_record SET ack_json = ?",
+            (changed.canonical_json(),),
         )
 
     from alice_brain_hermes.runtime.store import SQLiteLedger

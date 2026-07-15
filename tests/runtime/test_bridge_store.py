@@ -22,7 +22,6 @@ from alice_brain_hermes.errors import (
 from alice_brain_hermes.ids import new_id
 from alice_brain_hermes.protocol.models import (
     BrainProfileV1,
-    BridgeCommitAckV1,
     BridgeGapV1,
     BridgeStreamState,
     CoverageV1,
@@ -340,7 +339,10 @@ def test_atomic_bridge_commit_persists_typed_event_frame_cursor_and_ack(
         ack = engine.commit_bridge_record(instance, record)
 
         assert ack.record_fingerprint == record.fingerprint()
-        assert ack.event_sequence == ack.frame.state_sequence == 1
+        assert ack.raw_event_sequence == 1
+        assert ack.last_event_sequence == ack.frame.state_sequence == 2
+        assert ack.derived_event_count == 1
+        assert ack.semantic_status == "gap"
         assert ack.through_capture_seq == 1
         assert ack.frame.through_capture_seq == 1
         assert ack.frame.brain_id == engine.brain_id
@@ -349,7 +351,7 @@ def test_atomic_bridge_commit_persists_typed_event_frame_cursor_and_ack(
         assert ack.frame.freshness.scheduler_sample == "not_sampled"
         assert ack.frame.freshness.scheduler_tick == 0
         assert ack.duplicate is False
-        [stored] = ledger.list_events(engine.brain_id)
+        stored, semantic_gap = ledger.list_events(engine.brain_id)
         assert stored.event_type == "hermes.observer.post_api_request"
         assert stored.actor_id == engine.actor_id
         assert stored.adapter_id == "alice-brain-hermes-observer-v1"
@@ -357,6 +359,7 @@ def test_atomic_bridge_commit_persists_typed_event_frame_cursor_and_ack(
         assert stored.payload["payload"]["extensions"]["reasoning"] == {
             "effort": "high"
         }
+        assert semantic_gap.event_type == "semantic.gap"
         assert ledger.bridge_stream_state(instance).next_capture_seq == 2
 
         with pytest.raises(TypeError):
@@ -548,7 +551,9 @@ def test_public_frame_projection_reports_every_omitted_state_collection(
             scheduler_sample="running",
         )
 
-        assert frame.schema_version == 2
+        assert frame.schema_version == 3
+        assert frame.semantic_schema_version == 1
+        assert frame.aggregate_semantic_complete is True
         assert frame.pc["traits"][0] == {"key": "care", "value": 0.01}
         assert frame.energy["items"][0]["action_id"] == "action-1"
         assert frame.st["workspace"][0]["candidate_id"] == "candidate-1"
@@ -730,7 +735,7 @@ def test_lost_ack_retry_is_exact_after_later_c0_state(tmp_path: Path) -> None:
         retried = engine.commit_bridge_record(instance, record)
 
         assert retried == first
-        assert retried.frame.state_sequence == 1
+        assert retried.frame.state_sequence == first.last_event_sequence
         assert (
             len(
                 [
@@ -820,7 +825,9 @@ def test_lost_ack_retry_is_exact_for_every_hook_context_shape(
 
         assert retried == first
         assert retried.event_sequence == 1
-        assert len(ledger.list_events(engine.brain_id)) == 1
+        assert len(ledger.list_events(engine.brain_id)) == (
+            1 + first.derived_event_count
+        )
 
 
 def test_lost_ack_retry_for_gap_uses_strict_shared_record_validator(
@@ -847,7 +854,7 @@ def test_changed_retry_conflicts_without_mutating_ledger(tmp_path: Path) -> None
     ledger, engine, instance = make_engine(tmp_path)
     with ledger:
         record = observation(instance, 1)
-        engine.commit_bridge_record(instance, record)
+        accepted = engine.commit_bridge_record(instance, record)
         changed_values = record.model_dump(mode="python")
         changed_values["payload"]["provider"] = "changed"
         changed = validate_observation(changed_values)
@@ -855,8 +862,10 @@ def test_changed_retry_conflicts_without_mutating_ledger(tmp_path: Path) -> None
         with pytest.raises(IdempotencyConflictError):
             engine.commit_bridge_record(instance, changed)
 
-        assert engine.state.last_sequence == 1
-        assert len(ledger.list_events(engine.brain_id)) == 1
+        assert engine.state.last_sequence == accepted.last_event_sequence
+        assert len(ledger.list_events(engine.brain_id)) == (
+            1 + accepted.derived_event_count
+        )
         assert ledger.bridge_stream_state(instance).next_capture_seq == 2
 
 
@@ -890,6 +899,7 @@ def test_out_of_order_observation_requires_exact_gap(tmp_path: Path) -> None:
         assert [event.event_type for event in ledger.list_events(engine.brain_id)] == [
             "trace.gap",
             "hermes.observer.post_api_request",
+            "semantic.gap",
         ]
 
 
@@ -1033,6 +1043,8 @@ def test_schema_v2_migrates_transactionally_without_losing_brains(
         ledger.ensure_brain(brain_id)
     connection = sqlite3.connect(database)
     try:
+        connection.execute("DROP TABLE hermes_span")
+        connection.execute("DROP TABLE brain_observability")
         connection.execute("DROP TABLE bridge_record")
         connection.execute("DROP TABLE bridge_stream")
         connection.execute("DROP TABLE brain_profile")
@@ -1068,6 +1080,8 @@ def test_malformed_v2_schema_rolls_back_the_whole_migration(tmp_path: Path) -> N
         pass
     connection = sqlite3.connect(database)
     try:
+        connection.execute("DROP TABLE hermes_span")
+        connection.execute("DROP TABLE brain_observability")
         connection.execute("DROP TABLE bridge_record")
         connection.execute("DROP TABLE bridge_stream")
         connection.execute("DROP TABLE brain_profile")
@@ -1102,7 +1116,7 @@ def test_malformed_v2_schema_rolls_back_the_whole_migration(tmp_path: Path) -> N
         connection.close()
 
 
-def test_existing_v4_rejects_extra_schema_metadata_rows(tmp_path: Path) -> None:
+def test_existing_v5_rejects_extra_schema_metadata_rows(tmp_path: Path) -> None:
     database = tmp_path / "extra-v4-metadata.db"
     with SQLiteLedger.open(database):
         pass
@@ -1117,7 +1131,7 @@ def test_existing_v4_rejects_extra_schema_metadata_rows(tmp_path: Path) -> None:
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT key, value FROM schema_metadata ORDER BY key"
-        ).fetchall() == [("schema_version", "4"), ("unexpected", "4")]
+        ).fetchall() == [("schema_version", "5"), ("unexpected", "4")]
 
 
 def test_v2_extra_schema_metadata_row_fails_without_partial_migration(
@@ -1127,6 +1141,8 @@ def test_v2_extra_schema_metadata_row_fails_without_partial_migration(
     with SQLiteLedger.open(database):
         pass
     with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE hermes_span")
+        connection.execute("DROP TABLE brain_observability")
         connection.execute("DROP TABLE bridge_record")
         connection.execute("DROP TABLE bridge_stream")
         connection.execute("DROP TABLE brain_profile")
@@ -1249,6 +1265,8 @@ def test_v2_migration_with_extra_object_rolls_back_without_partial_v4(
     with SQLiteLedger.open(database):
         pass
     with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE hermes_span")
+        connection.execute("DROP TABLE brain_observability")
         connection.execute("DROP TABLE bridge_record")
         connection.execute("DROP TABLE bridge_stream")
         connection.execute("DROP TABLE brain_profile")
@@ -1277,60 +1295,19 @@ def test_bridge_history_requires_strictly_increasing_ledger_sequence(
 ) -> None:
     ledger, engine, instance = make_engine(tmp_path / audit_path)
     database = ledger.path
-    stream = ledger.bridge_stream_state(instance)
-    first = observation(instance, 1)
-    second = observation(instance, 2)
-    second_event = ledger.append(ledger._bridge_event(stream, second))
-    first_event = ledger.append(ledger._bridge_event(stream, first))
-    accepted_at = datetime.now(UTC).isoformat()
-    for record, event in ((first, first_event), (second, second_event)):
-        assert event.sequence is not None
-        replayed = ledger._full_replay_in_transaction(
-            engine.brain_id, through_sequence=event.sequence
-        )
-        frame = ledger._project_bridge_frame(
-            replayed,
-            through_capture_seq=record.last_capture_seq,
-            capture_coverage=ledger._record_capture_coverage(record),
-            stream_connected=True,
-        )
-        ack = BridgeCommitAckV1(
-            record_fingerprint=record.fingerprint(),
-            event_id=event.event_id,
-            event_sequence=event.sequence,
-            frame=frame,
-            through_capture_seq=record.last_capture_seq,
-        )
-        with ledger._transaction(immediate=True):
-            ledger._connection.execute(
-                "INSERT INTO bridge_record("
-                "bridge_instance_id, first_capture_seq, last_capture_seq, "
-                "record_kind, record_fingerprint, record_json, event_id, "
-                "ledger_sequence, ack_json, accepted_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    instance,
-                    record.first_capture_seq,
-                    record.last_capture_seq,
-                    record.record_kind,
-                    record.fingerprint(),
-                    record.canonical_json(),
-                    event.event_id,
-                    event.sequence,
-                    ack.canonical_json(),
-                    accepted_at,
-                ),
-            )
+    engine.commit_bridge_record(instance, observation(instance, 1))
+    engine.commit_bridge_record(instance, observation(instance, 2))
     with ledger._transaction(immediate=True):
         ledger._connection.execute(
-            "UPDATE bridge_stream SET next_capture_seq = 3, last_seen = ? "
-            "WHERE bridge_instance_id = ?",
-            (accepted_at, instance),
+            "UPDATE bridge_record SET ledger_sequence = 1, "
+            "derived_first_sequence = 2, derived_last_sequence = 2 "
+            "WHERE bridge_instance_id = ? AND first_capture_seq = 2",
+            (instance,),
         )
 
     if audit_path == "attach":
         ledger.disconnect_bridge_stream(instance, connected_nonce="daemon-nonce")
-        with pytest.raises(LedgerIntegrityError, match="strictly increasing"):
+        with pytest.raises(LedgerIntegrityError):
             ledger.attach_bridge_stream(
                 instance,
                 brain_id=engine.brain_id,
@@ -1528,11 +1505,11 @@ def test_concurrent_streams_share_one_engine_serialization_boundary(
             )
         )
 
-        assert sorted(ack.event_sequence for ack in acknowledgements) == list(
-            range(1, len(instances) + 1)
+        assert sorted(ack.raw_event_sequence for ack in acknowledgements) == list(
+            range(1, 2 * len(instances), 2)
         )
         assert [event.sequence for event in ledger.list_events(brain_id)] == list(
-            range(1, len(instances) + 1)
+            range(1, 2 * len(instances) + 1)
         )
 
 
@@ -1845,8 +1822,14 @@ def test_reconnect_rejects_bridge_record_event_relation_tampering(
             new_event("opaque.event", engine.brain_id, engine.actor_id, {})
         )
         ledger._connection.execute(
-            "UPDATE bridge_record SET event_id = ?, ledger_sequence = ?",
-            (unrelated.event_id, unrelated.sequence),
+            "UPDATE bridge_record SET event_id = ?, ledger_sequence = ?, "
+            "derived_first_sequence = ?, derived_last_sequence = ?",
+            (
+                unrelated.event_id,
+                unrelated.sequence,
+                unrelated.sequence + 1,
+                unrelated.sequence + 1,
+            ),
         )
 
         with pytest.raises(LedgerIntegrityError):

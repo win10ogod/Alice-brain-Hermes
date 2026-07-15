@@ -11,9 +11,17 @@ from alice_brain_hermes.core.action import ActionOutcome
 from alice_brain_hermes.core.events import new_event
 from alice_brain_hermes.errors import SchemaVersionError
 from alice_brain_hermes.ids import new_id
-from alice_brain_hermes.protocol.models import BridgeCommitAckV1, BridgeGapV1
+from alice_brain_hermes.protocol.models import (
+    BridgeCommitAckV1,
+    BridgeCommitAckV2,
+    BridgeGapV1,
+    ConsciousnessFrameV2,
+)
 from alice_brain_hermes.runtime.engine import ConsciousEngine
-from alice_brain_hermes.runtime.store import SQLiteLedger
+from alice_brain_hermes.runtime.store import (
+    _CREATE_BRIDGE_RECORD_V4_SCHEMA,
+    SQLiteLedger,
+)
 
 RECOVERY_TOKEN = "ab" * 32
 
@@ -144,21 +152,25 @@ def legacy_action_ack_database(database: Path, *, mark_sqlite_v3: bool):
                 engine.append(action_event)
         current_ack = engine.commit_bridge_record(bridge_instance_id, gap)
 
-        legacy_ack = json.loads(current_ack.canonical_json())
-        legacy_ack["frame"]["rd"]["actions"][-1]["execution_confirmed"] = False
-        legacy_ack["frame"]["a"]["actions"][-1]["execution_confirmed"] = False
+        legacy_frame = current_ack.frame.model_dump(mode="python")
+        legacy_frame["schema_version"] = 2
+        legacy_frame.pop("semantic_schema_version")
+        legacy_frame.pop("aggregate_semantic_complete")
+        legacy_frame.pop("semantic_evidence")
+        legacy_frame["rd"]["actions"][-1]["execution_confirmed"] = False
+        legacy_frame["a"]["actions"][-1]["execution_confirmed"] = False
         for section in ("rd", "a"):
-            legacy_ack["frame"]["omission_counts"][section]["fields"][
+            legacy_frame["omission_counts"][section]["fields"][
                 "omitted_record_json_nodes"
             ]["omitted"] -= 2
-        legacy_ack_json = json.dumps(
-            legacy_ack,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
+        legacy_ack = BridgeCommitAckV1(
+            record_fingerprint=current_ack.record_fingerprint,
+            event_id=current_ack.raw_event_id,
+            event_sequence=current_ack.raw_event_sequence,
+            frame=ConsciousnessFrameV2.model_validate(legacy_frame, strict=True),
+            through_capture_seq=current_ack.through_capture_seq,
         )
-        assert BridgeCommitAckV1.model_validate_json(legacy_ack_json)
+        legacy_ack_json = legacy_ack.canonical_json()
 
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -167,6 +179,23 @@ def legacy_action_ack_database(database: Path, *, mark_sqlite_v3: bool):
             (legacy_ack_json, bridge_instance_id),
         )
         if mark_sqlite_v3:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("DROP TABLE hermes_span")
+            connection.execute("DROP TABLE brain_observability")
+            connection.execute("DROP INDEX bridge_record_event")
+            connection.execute(
+                "ALTER TABLE bridge_record RENAME TO bridge_record_v5"
+            )
+            connection.executescript(_CREATE_BRIDGE_RECORD_V4_SCHEMA)
+            connection.execute(
+                "INSERT INTO bridge_record(bridge_instance_id, first_capture_seq, "
+                "last_capture_seq, record_kind, record_fingerprint, record_json, "
+                "event_id, ledger_sequence, ack_json, accepted_at) SELECT "
+                "bridge_instance_id, first_capture_seq, last_capture_seq, "
+                "record_kind, record_fingerprint, record_json, event_id, "
+                "ledger_sequence, ack_json, accepted_at FROM bridge_record_v5"
+            )
+            connection.execute("DROP TABLE bridge_record_v5")
             connection.execute(
                 "UPDATE schema_metadata SET value = '3' WHERE key = 'schema_version'"
             )
@@ -184,21 +213,27 @@ def test_v3_bridge_ack_is_migrated_after_failure_execution_semantics_change(
     )
 
     with SQLiteLedger.open(database) as restarted:
-        assert restarted.schema_version == 4
-        assert restarted._connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert restarted.schema_version == 5
+        assert restarted._connection.execute("PRAGMA user_version").fetchone()[0] == 5
         [row] = restarted._connection.execute(
             "SELECT ack_json FROM bridge_record WHERE bridge_instance_id = ?",
             (bridge_instance_id,),
         ).fetchall()
-        migrated_ack = BridgeCommitAckV1.model_validate_json(row["ack_json"])
+        migrated_ack = BridgeCommitAckV2.model_validate_json(row["ack_json"])
         duplicate = ConsciousEngine(
             restarted,
             brain_id,
             actor_id=brain_id,
         ).commit_bridge_record(bridge_instance_id, gap)
 
-    assert migrated_ack == current_ack
-    assert duplicate == current_ack
+    assert migrated_ack.semantic_status == "legacy_raw_only"
+    assert migrated_ack.semantic_complete is False
+    assert migrated_ack.derived_event_count == 0
+    assert migrated_ack.raw_event_id == current_ack.raw_event_id
+    assert migrated_ack.frame.aggregate_semantic_complete is False
+    assert migrated_ack.frame.semantic_evidence.legacy_raw_only_records == 1
+    assert migrated_ack.frame.semantic_evidence.semantic_gap_records == 1
+    assert duplicate == migrated_ack
 
 
 def test_current_database_rejects_ack_tampered_to_deterministic_legacy_shape(

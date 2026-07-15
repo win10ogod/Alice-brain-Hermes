@@ -19,6 +19,7 @@ from alice_brain_hermes.runtime.semantic_ingest import (
     HermesSpan,
     build_raw_event,
     build_semantic_plan,
+    match_hermes_span,
     span_context_fingerprint,
 )
 from tests.protocol.test_models import HOOK_CASES
@@ -45,6 +46,7 @@ def tool_observation(
     *,
     hook: str,
     status: str = "ok",
+    error_type: object = None,
     tool_call_id: str = "tool-reused",
 ) -> HermesObservationV1:
     payload: dict[str, object] = {
@@ -54,12 +56,14 @@ def tool_observation(
         "extensions": {},
     }
     if hook == "post_tool_call":
+        if error_type is None and status == "error":
+            error_type = "SyntheticError"
         payload.update(
             {
                 "result": {"stdout": "TOP SECRET RAW RESULT"},
                 "duration_ms": 12.5,
                 "status": status,
-                "error_type": "SyntheticError" if status == "error" else None,
+                "error_type": error_type,
                 "error_message": "TOP SECRET ERROR" if status == "error" else None,
             }
         )
@@ -139,6 +143,19 @@ def test_pre_tool_builds_complete_pc_e_st_rd_chain_without_copying_raw_values() 
         assert secret not in encoded
     assert "args_sha256" in encoded
     assert "middleware_trace_sha256" in encoded
+    energy = first.derived_events[2]
+    assert energy.payload["evidence_basis"] == {}
+    assert set(energy.payload["unknown_dimensions"]) == {
+        "deficits",
+        "salience",
+        "urgency",
+        "valence",
+        "arousal",
+        "control",
+        "resources",
+        "cost",
+        "personality_relevance",
+    }
 
 
 @pytest.mark.parametrize(
@@ -148,7 +165,6 @@ def test_pre_tool_builds_complete_pc_e_st_rd_chain_without_copying_raw_values() 
         ("error", ["action.dispatched", "action.receipt"], True, "failure"),
         ("timeout", ["action.dispatched", "action.receipt"], None, None),
         ("cancelled", ["action.dispatched", "action.receipt"], None, None),
-        ("error+thread_missing_result", ["action.dispatched", "action.receipt"], None, None),
         ("blocked", ["action.blocked"], False, None),
     ],
 )
@@ -178,11 +194,76 @@ def test_matched_post_tool_maps_execution_separately_from_outcome(
     assert terminal.payload["execution_confirmed"] is execution
     assert terminal.payload["outcome"] == outcome
     assert terminal.payload.get("effect_confirmed") is None
+    assert terminal.payload["source_status"] == status
+    assert terminal.payload["source_error_type"] == (
+        "SyntheticError" if status == "error" else None
+    )
     assert plan.span_close == matched
     encoded = "\n".join(event.canonical_json() for event in plan.derived_events)
     assert "TOP SECRET RAW RESULT" not in encoded
     assert "TOP SECRET ERROR" not in encoded
     assert "result_sha256" in encoded
+
+
+def test_thread_missing_result_is_real_error_shape_with_unknown_execution() -> None:
+    instance = new_id()
+    source = stream(instance)
+    record = tool_observation(
+        instance,
+        9,
+        hook="post_tool_call",
+        status="error",
+        error_type="thread_missing_result",
+    )
+    matched = HermesSpan(
+        bridge_instance_id=instance,
+        span_kind="tool",
+        external_id="tool-reused",
+        occurrence_capture_seq=7,
+        context_fingerprint=span_context_fingerprint(record),
+        action_id="hermes-action-7",
+    )
+
+    plan = build_semantic_plan(
+        source,
+        record,
+        raw_event=build_raw_event(source, record),
+        matched_span=matched,
+    )
+
+    receipt = plan.derived_events[-1]
+    assert receipt.payload["status"] == "unknown"
+    assert receipt.payload["execution_confirmed"] is None
+    assert receipt.payload["outcome"] is None
+    assert receipt.payload["source_status"] == "error"
+    assert receipt.payload["source_error_type"] == "thread_missing_result"
+
+
+@pytest.mark.parametrize("status", ["success", "failure", "OK", " error "])
+def test_non_host_post_tool_status_is_one_semantic_gap(status: str) -> None:
+    instance = new_id()
+    source = stream(instance)
+    record = tool_observation(
+        instance, 9, hook="post_tool_call", status=status, error_type=None
+    )
+    matched = HermesSpan(
+        bridge_instance_id=instance,
+        span_kind="tool",
+        external_id="tool-reused",
+        occurrence_capture_seq=7,
+        context_fingerprint=span_context_fingerprint(record),
+        action_id="hermes-action-7",
+    )
+
+    plan = build_semantic_plan(
+        source,
+        record,
+        raw_event=build_raw_event(source, record),
+        matched_span=matched,
+    )
+
+    assert plan.semantic_status == "gap"
+    assert [event.event_type for event in plan.derived_events] == ["semantic.gap"]
 
 
 def test_unmatched_post_tool_is_raw_plus_semantic_gap_not_fabricated_action() -> None:
@@ -237,10 +318,98 @@ def test_pre_and_matched_blocked_post_reduce_to_non_executed_action() -> None:
     assert action.outcome is None
 
 
+def test_late_tool_receipt_uses_closed_occurrence_without_redispatch() -> None:
+    instance = new_id()
+    source = stream(instance)
+    pre = tool_observation(instance, 1, hook="pre_tool_call")
+    pre_raw = build_raw_event(source, pre)
+    pre_plan = build_semantic_plan(source, pre, raw_event=pre_raw)
+    assert pre_plan.span_open is not None
+    first_post = tool_observation(
+        instance, 2, hook="post_tool_call", status="timeout"
+    )
+    first_raw = build_raw_event(source, first_post)
+    first_plan = build_semantic_plan(
+        source,
+        first_post,
+        raw_event=first_raw,
+        matched_span=pre_plan.span_open,
+    )
+    closed = HermesSpan(
+        **{**pre_plan.span_open.canonical_data(), "closed_capture_seq": 2}
+    )
+    late_post = tool_observation(instance, 3, hook="post_tool_call", status="ok")
+    late_raw = build_raw_event(source, late_post)
+
+    matched, reason = match_hermes_span(late_post, (closed,))
+    late_plan = build_semantic_plan(
+        source,
+        late_post,
+        raw_event=late_raw,
+        matched_span=matched,
+        forced_gap_reason=reason,
+    )
+
+    assert [event.event_type for event in late_plan.derived_events] == [
+        "action.receipt"
+    ]
+    assert late_plan.derived_events[0].payload["late"] is True
+    assert late_plan.span_close is None
+    state = reduce_many(
+        BrainState.genesis(source.brain_id),
+        (
+            pre_raw,
+            *pre_plan.derived_events,
+            first_raw,
+            *first_plan.derived_events,
+            late_raw,
+            *late_plan.derived_events,
+        ),
+    )
+    [action] = state.action_records
+    assert action.outcome is not None and action.outcome.value == "success"
+
+
+def test_two_indistinguishable_open_occurrences_are_explicitly_ambiguous() -> None:
+    instance = new_id()
+    source = stream(instance)
+    completion = tool_observation(instance, 9, hook="post_tool_call")
+    context_fingerprint = span_context_fingerprint(completion)
+    candidates = tuple(
+        HermesSpan(
+            bridge_instance_id=instance,
+            span_kind="tool",
+            external_id="tool-reused",
+            occurrence_capture_seq=occurrence,
+            context_fingerprint=context_fingerprint,
+            action_id=f"action-{occurrence}",
+        )
+        for occurrence in (3, 8)
+    )
+
+    matched, reason = match_hermes_span(completion, candidates)
+    plan = build_semantic_plan(
+        source,
+        completion,
+        raw_event=build_raw_event(source, completion),
+        matched_span=matched,
+        forced_gap_reason=reason,
+    )
+
+    assert matched is None
+    assert reason == "ambiguous_open_span"
+    assert plan.semantic_status == "gap"
+    assert [event.event_type for event in plan.derived_events] == ["semantic.gap"]
+
+
 @pytest.mark.parametrize(
     ("hook", "context", "payload", "_required"),
     [case for case in HOOK_CASES if case[0] not in {"pre_tool_call", "post_tool_call"}],
-    ids=[case[0] for case in HOOK_CASES if case[0] not in {"pre_tool_call", "post_tool_call"}],
+    ids=[
+        case[0]
+        for case in HOOK_CASES
+        if case[0] not in {"pre_tool_call", "post_tool_call"}
+    ],
 )
 def test_every_non_tool_hook_has_one_attributed_semantic_event(
     hook: str,
@@ -273,10 +442,18 @@ def test_every_non_tool_hook_has_one_attributed_semantic_event(
 
     assert plan.semantic_status == "applied"
     assert plan.semantic_complete is True
-    assert len(plan.derived_events) == 1
-    assert plan.derived_events[0].event_type.startswith("semantic.")
-    assert plan.derived_events[0].event_type != "observation.recorded"
-    assert plan.derived_events[0].payload["raw_payload_sha256"]
+    expected_count = 2 if hook == "subagent_start" else 1
+    assert len(plan.derived_events) == expected_count
+    assert plan.derived_events[-1].event_type.startswith("semantic.")
+    assert plan.derived_events[-1].event_type != "observation.recorded"
+    assert plan.derived_events[-1].payload["raw_payload_sha256"]
+    if hook == "subagent_start":
+        registration = plan.derived_events[0]
+        assert registration.event_type == "identity.actor_registered"
+        assert registration.payload["kind"] == "external_agent"
+        assert registration.payload["parent_actor_id"] == source.brain_id
+        assert registration.payload["actor_id"] != source.brain_id
+        assert "child_goal" not in registration.canonical_json()
 
 
 def test_exact_bridge_gap_is_explicitly_incomplete_without_derived_backfill() -> None:

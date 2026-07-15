@@ -47,6 +47,13 @@ def _empty_frame_v3(*, brain_id: str, state_sequence: int) -> object:
         memory={},
         capabilities={},
         semantic_context={},
+        aggregate_semantic_complete=True,
+        semantic_evidence={
+            "semantic_records": 1,
+            "legacy_raw_only_records": 0,
+            "semantic_gap_records": 0,
+            "dropped_events": 0,
+        },
         unresolved_evidence=False,
         capture_coverage={},
         freshness={
@@ -80,6 +87,43 @@ def test_ack_v2_binds_raw_and_bounded_contiguous_derived_batch() -> None:
     assert ack.event_id == raw_event_id
     assert ack.event_sequence == 4
     assert ack.frame.state_sequence == ack.last_event_sequence
+    assert ack.frame.semantic_schema_version == 1
+    assert ack.frame.aggregate_semantic_complete is True
+
+
+def test_ack_v2_rejects_raw_event_id_reused_as_derived_identity() -> None:
+    raw_event_id = new_id()
+    with pytest.raises(ValidationError, match="raw event ID"):
+        models_module.BridgeCommitAckV2(
+            record_fingerprint="a" * 64,
+            raw_event_id=raw_event_id,
+            raw_event_sequence=4,
+            derived_event_ids=(raw_event_id,),
+            derived_event_count=1,
+            last_event_sequence=5,
+            semantic_status="applied",
+            semantic_complete=True,
+            semantic_fingerprint="b" * 64,
+            frame=_empty_frame_v3(brain_id=new_id(), state_sequence=5),
+            through_capture_seq=1,
+        )
+
+
+def test_ack_v2_rejects_arbitrary_multi_event_semantic_gap() -> None:
+    with pytest.raises(ValidationError, match="zero or one"):
+        models_module.BridgeCommitAckV2(
+            record_fingerprint="a" * 64,
+            raw_event_id=new_id(),
+            raw_event_sequence=4,
+            derived_event_ids=(new_id(), new_id()),
+            derived_event_count=2,
+            last_event_sequence=6,
+            semantic_status="gap",
+            semantic_complete=False,
+            semantic_fingerprint="b" * 64,
+            frame=_empty_frame_v3(brain_id=new_id(), state_sequence=6),
+            through_capture_seq=1,
+        )
 
 
 @pytest.mark.parametrize(
@@ -671,7 +715,10 @@ def test_capabilities_report_unobserved_streams_and_transport_limits() -> None:
     assert capabilities["reasoning_capture"] == "unobserved"
     assert capabilities["bridge_close_recovery"] == "opaque_token_v1"
     assert capabilities["limits"]["max_response_bytes"] == 1_048_576
-    assert capabilities["limits"]["max_response_bytes"] <= models_module.MAX_PROTOCOL_BYTES
+    assert (
+        capabilities["limits"]["max_response_bytes"]
+        <= models_module.MAX_PROTOCOL_BYTES
+    )
     assert capabilities["limits"]["max_request_bytes"] == (
         models_module.TASK6_MAX_DETACHED_RECORD_BYTES
         + models_module.MAX_BRIDGE_COMMIT_ENVELOPE_BYTES

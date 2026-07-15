@@ -9,6 +9,7 @@ from typing import Literal
 from uuid import UUID
 
 from alice_brain_hermes.core.events import EventEnvelope, new_event, thaw_json
+from alice_brain_hermes.core.personality import ENERGY_DIMENSIONS
 from alice_brain_hermes.ids import validate_id
 from alice_brain_hermes.protocol.models import (
     HOOK_EVENT_TYPES,
@@ -39,7 +40,7 @@ def _json_fingerprint(value: object) -> str:
 
 def _derived_id(raw_event_id: str, role: str) -> str:
     digest = bytearray(
-        hashlib.sha256(f"{raw_event_id}\x00{role}".encode("utf-8")).digest()[:16]
+        hashlib.sha256(f"{raw_event_id}\x00{role}".encode()).digest()[:16]
     )
     digest[6] = (digest[6] & 0x0F) | 0x40
     digest[8] = (digest[8] & 0x3F) | 0x80
@@ -61,12 +62,16 @@ class HermesSpan:
     occurrence_capture_seq: int
     context_fingerprint: str
     action_id: str | None = None
+    closed_capture_seq: int | None = None
 
     def __post_init__(self) -> None:
         validate_id(self.bridge_instance_id)
         if self.span_kind not in {"tool", "api"}:
             raise ValueError("Hermes span kind must be tool or api")
-        if not isinstance(self.external_id, str) or not 1 <= len(self.external_id) <= 512:
+        if (
+            not isinstance(self.external_id, str)
+            or not 1 <= len(self.external_id) <= 512
+        ):
             raise ValueError("Hermes span external ID must be non-blank and bounded")
         if (
             isinstance(self.occurrence_capture_seq, bool)
@@ -86,16 +91,68 @@ class HermesSpan:
             or len(self.action_id) > 512
         ):
             raise ValueError("Hermes span action ID must be non-blank and bounded")
+        if self.closed_capture_seq is not None and (
+            isinstance(self.closed_capture_seq, bool)
+            or not isinstance(self.closed_capture_seq, int)
+            or self.closed_capture_seq < self.occurrence_capture_seq
+        ):
+            raise ValueError("Hermes span close must follow its occurrence")
 
     def canonical_data(self) -> dict[str, object]:
         return {
             "action_id": self.action_id,
             "bridge_instance_id": self.bridge_instance_id,
+            "closed_capture_seq": self.closed_capture_seq,
             "context_fingerprint": self.context_fingerprint,
             "external_id": self.external_id,
             "occurrence_capture_seq": self.occurrence_capture_seq,
             "span_kind": self.span_kind,
         }
+
+
+def match_hermes_span(
+    record: HermesObservationV1,
+    candidates: tuple[HermesSpan, ...],
+) -> tuple[HermesSpan | None, str | None]:
+    """Correlate a completion against one bounded occurrence cache."""
+    if record.hook == "post_tool_call":
+        span_kind: SpanKind = "tool"
+        external_id = record.context.tool_call_id
+    elif record.hook in {"post_api_request", "api_request_error"}:
+        span_kind = "api"
+        external_id = record.context.api_request_id
+    else:
+        return None, None
+    context_fingerprint = span_context_fingerprint(record)
+    eligible = tuple(
+        span
+        for span in candidates
+        if span.bridge_instance_id == record.bridge_instance_id
+        and span.span_kind == span_kind
+        and span.external_id == external_id
+        and span.context_fingerprint == context_fingerprint
+        and span.occurrence_capture_seq < record.capture_seq
+    )
+    open_spans = tuple(span for span in eligible if span.closed_capture_seq is None)
+    if len(open_spans) > 1:
+        return None, "ambiguous_open_span"
+    if len(open_spans) == 1:
+        return open_spans[0], None
+    closed_spans = tuple(
+        span
+        for span in eligible
+        if span.closed_capture_seq is not None
+        and span.closed_capture_seq < record.capture_seq
+    )
+    if not closed_spans:
+        return None, None
+    return max(
+        closed_spans,
+        key=lambda span: (
+            span.closed_capture_seq or 0,
+            span.occurrence_capture_seq,
+        ),
+    ), None
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,10 +318,12 @@ def _pre_tool_plan(
             "arousal": 0.0,
             "control": 0.5,
             "cost": 0.5,
-            "deficits": {"execution_evidence": 1.0},
+            "deficits": {},
+            "evidence_basis": {},
             "personality_relevance": 0.5,
             "resources": 0.5,
             "salience": 0.5,
+            "unknown_dimensions": list(ENERGY_DIMENSIONS),
             "urgency": 0.5,
             "valence": 0.0,
         },
@@ -391,16 +450,21 @@ def _post_tool_plan(
     if matched_span.action_id is None:
         raise ValueError("matched tool span is missing its action identity")
     action_id = matched_span.action_id
-    raw_status = record.payload.status.strip().casefold()
-    if raw_status in {"ok", "success"}:
+    raw_status = record.payload.status
+    raw_error_type = record.payload.error_type
+    if raw_error_type is not None and (
+        not isinstance(raw_error_type, str) or not raw_error_type.strip()
+    ):
+        return _semantic_gap(
+            stream, record, raw_event, reason="invalid_post_tool_error_type"
+        )
+    if raw_status == "ok":
         receipt_status, execution, outcome = "success", True, "success"
-    elif raw_status in {"error", "failure"}:
+    elif raw_status == "error" and raw_error_type == "thread_missing_result":
+        receipt_status, execution, outcome = "unknown", None, None
+    elif raw_status == "error":
         receipt_status, execution, outcome = "failure", True, "failure"
-    elif raw_status in {
-        "error+thread_missing_result",
-        "timeout",
-        "cancelled",
-    }:
+    elif raw_status in {"timeout", "cancelled"}:
         receipt_status, execution, outcome = "unknown", None, None
     elif raw_status == "blocked":
         receipt_status, execution, outcome = "blocked", False, None
@@ -411,6 +475,9 @@ def _post_tool_plan(
     result_sha256 = _json_fingerprint(record.payload.result)
     error_type_sha256 = _json_fingerprint(record.payload.error_type)
     error_message_sha256 = _json_fingerprint(record.payload.error_message)
+    late = matched_span.closed_capture_seq is not None
+    if late and raw_status == "blocked":
+        return _semantic_gap(stream, record, raw_event, reason="late_blocked_status")
     evidence = {
         "action_id": action_id,
         "duration_ms": record.payload.duration_ms,
@@ -418,9 +485,11 @@ def _post_tool_plan(
         "error_message_sha256": error_message_sha256,
         "error_type_sha256": error_type_sha256,
         "execution_confirmed": execution,
+        "late": late,
         "outcome": outcome,
-        "raw_status": raw_status,
         "result_sha256": result_sha256,
+        "source_error_type": raw_error_type,
+        "source_status": raw_status,
         "status": receipt_status,
     }
     if raw_status == "blocked":
@@ -434,6 +503,17 @@ def _post_tool_plan(
             action_id=action_id,
         )
         events = (blocked,)
+    elif late:
+        receipt = _derived_event(
+            stream,
+            record,
+            raw_event,
+            role="action.receipt.late",
+            event_type="action.receipt",
+            payload=evidence,
+            action_id=action_id,
+        )
+        events = (receipt,)
     else:
         dispatched = _derived_event(
             stream,
@@ -459,7 +539,7 @@ def _post_tool_plan(
         semantic_status="applied",
         semantic_complete=True,
         derived_events=events,
-        span_close=matched_span,
+        span_close=None if late else matched_span,
     )
 
 
@@ -515,8 +595,38 @@ def _attributed_plan(
             span_kind="api",
             external_id=record.context.api_request_id,
         )
-        span_close = matched_span
+        span_close = (
+            None if matched_span.closed_capture_seq is not None else matched_span
+        )
         occurrence = matched_span.occurrence_capture_seq
+    preceding: tuple[EventEnvelope, ...] = ()
+    if record.hook == "subagent_start":
+        child_actor_id = _derived_id(
+            record.bridge_instance_id,
+            f"subagent.child.{record.context.child_session_id}",
+        )
+        registration = _derived_event(
+            stream,
+            record,
+            raw_event,
+            role="subagent.actor_registered",
+            event_type="identity.actor_registered",
+            payload={
+                "actor_id": child_actor_id,
+                "attributes": {
+                    "child_session_id_sha256": _json_fingerprint(
+                        record.context.child_session_id
+                    ),
+                    "child_subagent_id_sha256": _json_fingerprint(
+                        record.payload.child_subagent_id
+                    ),
+                    "source": "hermes_observer_v1",
+                },
+                "kind": "external_agent",
+                "parent_actor_id": stream.brain_id,
+            },
+        )
+        preceding = (registration,)
     event = _derived_event(
         stream,
         record,
@@ -527,17 +637,24 @@ def _attributed_plan(
             "capture_seq": record.capture_seq,
             "context_sha256": span_context_fingerprint(record),
             "hook": record.hook,
+            "late": bool(
+                matched_span is not None
+                and matched_span.closed_capture_seq is not None
+            ),
             "occurrence_capture_seq": occurrence,
             "raw_payload_sha256": _json_fingerprint(
                 record.payload.model_dump(mode="json")
             ),
             "source": "hermes_observer_v1",
         },
+        causation_id=(
+            raw_event.event_id if not preceding else preceding[-1].event_id
+        ),
     )
     return SemanticPlan(
         semantic_status="applied",
         semantic_complete=True,
-        derived_events=(event,),
+        derived_events=(*preceding, event),
         span_open=span_open,
         span_close=span_close,
     )
@@ -549,6 +666,7 @@ def build_semantic_plan(
     *,
     raw_event: EventEnvelope,
     matched_span: HermesSpan | None = None,
+    forced_gap_reason: str | None = None,
 ) -> SemanticPlan:
     if record.bridge_instance_id != stream.bridge_instance_id:
         raise ValueError("bridge record does not match semantic stream")
@@ -571,6 +689,10 @@ def build_semantic_plan(
         raise TypeError("semantic ingestion requires a typed bridge record")
     if raw_event.event_type != HOOK_EVENT_TYPES[record.hook]:
         raise ValueError("raw event does not represent the observation hook")
+    if forced_gap_reason is not None:
+        if not forced_gap_reason.strip() or len(forced_gap_reason) > 160:
+            raise ValueError("forced semantic gap reason must be non-blank and bounded")
+        return _semantic_gap(stream, record, raw_event, reason=forced_gap_reason)
     if record.hook == "pre_tool_call":
         if matched_span is not None:
             raise ValueError("pre-tool observation cannot close a span")
@@ -581,10 +703,11 @@ def build_semantic_plan(
 
 
 __all__ = [
-    "HermesSpan",
     "MAX_DERIVED_EVENTS_PER_RECORD",
+    "HermesSpan",
     "SemanticPlan",
     "build_raw_event",
     "build_semantic_plan",
+    "match_hermes_span",
     "span_context_fingerprint",
 ]

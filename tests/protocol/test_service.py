@@ -11,10 +11,11 @@ from alice_brain_hermes.core.events import new_event
 from alice_brain_hermes.ids import new_id
 from alice_brain_hermes.protocol.models import (
     MAX_BRIDGE_COMMIT_ENVELOPE_BYTES,
+    PROTOCOL_VERSION,
     TASK6_MAX_DETACHED_RECORD_BYTES,
     BrainProfileV1,
     CapabilityProfileV1,
-    ConsciousnessFrameV2,
+    ConsciousnessFrameV3,
     CoverageV1,
     ProtocolLimitsV1,
 )
@@ -127,7 +128,7 @@ def initialize(connection, request_id: int = 1) -> dict[str, object]:
                 request_id,
                 "initialize",
                 {
-                    "protocol_version": 1,
+                    "protocol_version": PROTOCOL_VERSION,
                     "capabilities": CapabilityProfileV1().model_dump(mode="json"),
                 },
             )
@@ -359,7 +360,10 @@ def test_capability_mismatch_never_downgrades_or_initializes(service) -> None:
             request(
                 1,
                 "initialize",
-                {"protocol_version": 1, "capabilities": incompatible},
+                {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "capabilities": incompatible,
+                },
             )
         )
     )
@@ -452,7 +456,11 @@ def test_typed_bridge_uses_opaque_binding_and_server_provenance(service) -> None
     )
 
     assert committed["result"]["through_capture_seq"] == 1
-    stored = service.runtime.ledger.list_events(brain["brain_id"])[-1]
+    stored = next(
+        event
+        for event in service.runtime.ledger.list_events(brain["brain_id"])
+        if event.event_type == "hermes.observer.pre_tool_call"
+    )
     assert stored.actor_id == brain["brain_id"]
     assert stored.adapter_id == service.server_adapter_id
     assert stored.payload["payload"]["args"] == {"command": "full command"}
@@ -928,7 +936,7 @@ def test_negotiated_frame_limit_rejects_before_bridge_commit_without_writes(
                 1,
                 "initialize",
                 {
-                    "protocol_version": 1,
+                    "protocol_version": PROTOCOL_VERSION,
                     "capabilities": CapabilityProfileV1(limits=limits).model_dump(
                         mode="json"
                     ),
@@ -1003,7 +1011,7 @@ def test_full_success_response_limit_rejects_before_bridge_commit(
                 1,
                 "initialize",
                 {
-                    "protocol_version": 1,
+                    "protocol_version": PROTOCOL_VERSION,
                     "capabilities": CapabilityProfileV1(limits=limits).model_dump(
                         mode="json"
                     ),
@@ -1026,7 +1034,7 @@ def test_full_success_response_limit_rejects_before_bridge_commit(
     )["result"]["binding"]
     original_projection = SQLiteLedger._project_bridge_frame
 
-    def large_projection(*args, **kwargs) -> ConsciousnessFrameV2:
+    def large_projection(*args, **kwargs) -> ConsciousnessFrameV3:
         frame = original_projection(*args, **kwargs)
         values = frame.model_dump(mode="python")
         values["semantic_context"] = {
@@ -1035,7 +1043,7 @@ def test_full_success_response_limit_rejects_before_bridge_commit(
             "turn_id": None,
             "reason": "x" * 5_000,
         }
-        return ConsciousnessFrameV2.model_validate(values)
+        return ConsciousnessFrameV3.model_validate(values)
 
     monkeypatch.setattr(
         SQLiteLedger, "_project_bridge_frame", staticmethod(large_projection)
@@ -1077,7 +1085,7 @@ def test_full_success_response_limit_rejects_before_bridge_commit(
                 5,
                 "initialize",
                 {
-                    "protocol_version": 1,
+                    "protocol_version": PROTOCOL_VERSION,
                     "capabilities": CapabilityProfileV1(
                         limits=generous_limits
                     ).model_dump(mode="json"),
@@ -1126,7 +1134,7 @@ def test_ack_larger_than_legacy_64k_persists_when_negotiated_wire_fits(
                 1,
                 "initialize",
                 {
-                    "protocol_version": 1,
+                    "protocol_version": PROTOCOL_VERSION,
                     "capabilities": CapabilityProfileV1(limits=limits).model_dump(
                         mode="json"
                     ),
@@ -1149,7 +1157,7 @@ def test_ack_larger_than_legacy_64k_persists_when_negotiated_wire_fits(
     )["result"]["binding"]
     original_projection = SQLiteLedger._project_bridge_frame
 
-    def large_projection(*args, **kwargs) -> ConsciousnessFrameV2:
+    def large_projection(*args, **kwargs) -> ConsciousnessFrameV3:
         frame = original_projection(*args, **kwargs)
         values = frame.model_dump(mode="python")
         values["semantic_context"] = {
@@ -1158,7 +1166,7 @@ def test_ack_larger_than_legacy_64k_persists_when_negotiated_wire_fits(
             "turn_id": None,
             "reason": "x" * 70_000,
         }
-        return ConsciousnessFrameV2.model_validate(values)
+        return ConsciousnessFrameV3.model_validate(values)
 
     monkeypatch.setattr(
         SQLiteLedger, "_project_bridge_frame", staticmethod(large_projection)
@@ -1215,7 +1223,7 @@ def test_bridge_record_has_no_hidden_limits_below_negotiated_profile(
                 1,
                 "initialize",
                 {
-                    "protocol_version": 1,
+                    "protocol_version": PROTOCOL_VERSION,
                     "capabilities": CapabilityProfileV1(limits=limits).model_dump(
                         mode="json"
                     ),
@@ -1280,7 +1288,7 @@ def test_near_boundary_complete_commit_succeeds_and_record_plus_one_is_atomic(
                 1,
                 "initialize",
                 {
-                    "protocol_version": 1,
+                    "protocol_version": PROTOCOL_VERSION,
                     "capabilities": CapabilityProfileV1(limits=limits).model_dump(
                         mode="json"
                     ),

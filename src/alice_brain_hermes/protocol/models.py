@@ -778,10 +778,44 @@ class ConsciousnessFrameV2(_ConsciousnessFrameBase):
     schema_version: Literal[2] = 2
 
 
+class FrameSemanticEvidenceV1(_StrictModel):
+    """Cumulative persisted semantic health at one frame boundary."""
+
+    schema_version: Literal[1] = 1
+    semantic_records: int = Field(ge=0)
+    legacy_raw_only_records: int = Field(ge=0)
+    semantic_gap_records: int = Field(ge=0)
+    dropped_events: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _counts_are_possible(self) -> FrameSemanticEvidenceV1:
+        if self.legacy_raw_only_records > self.semantic_records:
+            raise ValueError("semantic frame evidence counts are inconsistent")
+        if self.dropped_events and not self.semantic_gap_records:
+            raise ValueError("dropped events require explicit semantic gap evidence")
+        return self
+
+
 class ConsciousnessFrameV3(_ConsciousnessFrameBase):
     """Bounded projection through the final event of one semantic batch."""
 
     schema_version: Literal[FRAME_SCHEMA_VERSION] = FRAME_SCHEMA_VERSION
+    semantic_schema_version: Literal[1] = 1
+    aggregate_semantic_complete: bool
+    semantic_evidence: FrameSemanticEvidenceV1
+
+    @model_validator(mode="after")
+    def _aggregate_semantic_evidence_is_truthful(self) -> ConsciousnessFrameV3:
+        expected = (
+            self.trace_complete
+            and self.semantic_evidence.legacy_raw_only_records == 0
+            and self.semantic_evidence.semantic_gap_records == 0
+        )
+        if self.aggregate_semantic_complete is not expected:
+            raise ValueError(
+                "aggregate semantic completeness must match cumulative evidence"
+            )
+        return self
 
 
 class BridgeCommitAckV1(_StrictModel):
@@ -846,6 +880,8 @@ class BridgeCommitAckV2(_StrictModel):
     def _semantic_batch(self) -> BridgeCommitAckV2:
         if self.derived_event_count != len(self.derived_event_ids):
             raise ValueError("derived event count must match derived event IDs")
+        if self.raw_event_id in self.derived_event_ids:
+            raise ValueError("raw event ID cannot also be a derived event ID")
         if self.last_event_sequence != (
             self.raw_event_sequence + self.derived_event_count
         ):
@@ -861,6 +897,8 @@ class BridgeCommitAckV2(_StrictModel):
             raise ValueError(
                 "not-applicable and legacy batches cannot claim derived events"
             )
+        if self.semantic_status == "gap" and self.derived_event_count not in {0, 1}:
+            raise ValueError("semantic gaps contain zero or one derived gap event")
         if (
             self.frame.state_sequence != self.last_event_sequence
             or self.frame.freshness.projected_at_state_sequence
@@ -1171,6 +1209,7 @@ __all__ = [
     "CoverageV1",
     "DaemonDiscoveryV1",
     "FrameFreshnessV1",
+    "FrameSemanticEvidenceV1",
     "HermesHook",
     "HermesObservationRecordV1",
     "HermesObservationV1",

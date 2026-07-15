@@ -743,7 +743,8 @@ def test_long_history_replay_and_frame_projection_have_fixed_work_budget(
         ledger._connection = CommitCountingConnection()
         acknowledgement = engine.commit_bridge_record(instance, _observation(instance))
         ledger._connection = original_connection
-        assert acknowledgement.event_sequence == history_length + 1
+        assert acknowledgement.raw_event_sequence == history_length + 1
+        assert acknowledgement.derived_event_count == 1
 
         ledger._connection = LongCountingConnection()
         frame = ledger.project_bridge_frame(
@@ -753,16 +754,16 @@ def test_long_history_replay_and_frame_projection_have_fixed_work_budget(
         )
         ledger._connection = original_connection
 
-        assert engine.state.last_sequence == history_length + 1
+        assert engine.state.last_sequence == acknowledgement.last_event_sequence
         assert engine.state.raw_lifecycle_counts["future.lifecycle.event"] == (
             history_length
         )
-        assert engine.state.working_set.raw_lifecycle_counts.total == 2
+        assert engine.state.working_set.raw_lifecycle_counts.total == 3
         assert (
             ledger._connection.execute(
                 "SELECT COUNT(*) FROM events WHERE brain_id = ?", (brain_id,)
             ).fetchone()[0]
-            == history_length + 1
+            == history_length + 2
         )
         work = frame.omission_counts["working_set"]
         assert work["projection_records_visited"] <= (work["projection_record_budget"])
@@ -772,7 +773,11 @@ def test_long_history_replay_and_frame_projection_have_fixed_work_budget(
         assert work["ledger_events_scanned"] == 0
         assert len(short_statements) <= 12
         assert len(long_statements) <= 12
-        assert not any(" from events" in statement for statement in long_statements)
+        assert not any(
+            "order by event.sequence asc" in statement
+            or "order by sequence asc" in statement
+            for statement in long_statements
+        )
         assert len(commit_statements) <= 20
         assert not any(
             "order by event.sequence asc" in statement
