@@ -381,6 +381,68 @@ def test_worker_start_failure_after_spawn_keeps_the_only_live_worker(
     assert bridge.worker_started is False
 
 
+def test_worker_start_unknown_after_spawn_retains_owner_and_prevents_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+
+    real_thread = threading.Thread
+    spawned: list[RaiseAfterSpawnAndProbeFailure] = []
+
+    class RaiseAfterSpawnAndProbeFailure:
+        def __init__(self, **kwargs: object) -> None:
+            self.thread = real_thread(**kwargs)  # type: ignore[arg-type]
+            self.probe_failed = False
+
+        def start(self) -> None:
+            self.thread.start()
+            spawned.append(self)
+            raise MemoryError("thread.start failed after spawning")
+
+        def is_alive(self) -> bool:
+            if not self.probe_failed:
+                self.probe_failed = True
+                raise KeyboardInterrupt("worker liveness probe failed")
+            return self.thread.is_alive()
+
+        def join(self, timeout: float | None = None) -> None:
+            self.thread.join(timeout)
+
+    monkeypatch.setattr(
+        bridge_module.threading,
+        "Thread",
+        RaiseAfterSpawnAndProbeFailure,
+    )
+    bridge = HookBridge(
+        tmp_path,
+        reconnect_delay_seconds=0.01,
+        start_worker_on_capture=False,
+    )
+
+    bridge.start_worker()
+    try:
+        assert len(spawned) == 1
+        assert bridge._worker is spawned[0]  # type: ignore[attr-defined]
+        assert spawned[0].thread.is_alive() is True
+
+        bridge.start_worker()
+        assert len(spawned) == 1
+        assert bridge._worker is spawned[0]  # type: ignore[attr-defined]
+        assert bridge.worker_started is True
+        assert bridge.health.worker_started is True
+        assert bridge.health.trace_complete is False
+        assert bridge.health.last_error == "MemoryError"
+    finally:
+        bridge.stop_worker_for_test()
+        for spawned_worker in spawned:
+            spawned_worker.join(timeout=2)
+
+    assert all(not spawned_worker.thread.is_alive() for spawned_worker in spawned)
+    assert bridge._worker is None  # type: ignore[attr-defined]
+    assert bridge.worker_started is False
+
+
 def test_connection_health_allocation_failure_is_conservatively_contained(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -837,6 +899,64 @@ def test_worker_survives_persistent_wait_memoryerror_and_still_commits(
     assert bridge.health.worker_started is False
 
 
+def test_worker_survives_persistent_stop_probe_commits_once_and_stops(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    committed = threading.Event()
+
+    class CommitProbe(_FakeClient):
+        def call(
+            self,
+            method: str,
+            params: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            result = super().call(method, params)
+            if method == "bridge.commit":
+                committed.set()
+            return result
+
+    client = CommitProbe(calls)
+    bridge = HookBridge(
+        tmp_path,
+        bridge_instance_id=new_id(),
+        reconnect_delay_seconds=0.01,
+        client_factory=lambda *_args, **_kwargs: client,
+        start_worker_on_capture=False,
+    )
+    delegate = bridge._stop_event  # type: ignore[attr-defined]
+    faulting = _FaultingEvent(delegate, method="is_set", failures=None)
+    bridge._stop_event = faulting  # type: ignore[attr-defined]
+    bridge.start_worker()
+    worker = bridge._worker  # type: ignore[attr-defined]
+
+    try:
+        assert faulting.fault_observed.wait(2)
+        _session_start(HermesHooks(bridge))
+        assert committed.wait(2)
+
+        bridge.stop_worker_for_test()
+    finally:
+        if worker is not None and worker.is_alive():
+            bridge._stop_event = delegate  # type: ignore[attr-defined]
+            delegate.set()
+            bridge._wake_event.set()  # type: ignore[attr-defined]
+            worker.join(timeout=2)
+
+    commits = [params for method, params in calls if method == "bridge.commit"]
+    assert len(commits) == 1
+    assert commits[0]["record"]["capture_seq"] == 1  # type: ignore[index]
+    assert bridge.last_ack is not None
+    assert bridge.last_ack.through_capture_seq == 1
+    assert bridge.retained_record is None
+    assert bridge._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert bridge._worker is None  # type: ignore[attr-defined]
+    assert bridge.worker_started is False
+    assert bridge.health.worker_started is False
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_error == "MemoryError"
+
+
 def test_worker_exit_clears_pointer_and_allows_restart(tmp_path: Path) -> None:
     bridge = HookBridge(tmp_path, start_worker_on_capture=False)
     bridge._stop_event.set()  # type: ignore[attr-defined]
@@ -856,6 +976,108 @@ def test_worker_exit_clears_pointer_and_allows_restart(tmp_path: Path) -> None:
     bridge.stop_worker_for_test()
     assert bridge.worker_started is False
     assert bridge.health.worker_started is False
+
+
+def test_worker_test_stop_can_restart_and_commit_exactly_once(tmp_path: Path) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    client = _FakeClient(calls)
+    bridge = HookBridge(
+        tmp_path,
+        bridge_instance_id=new_id(),
+        reconnect_delay_seconds=0.01,
+        client_factory=lambda *_args, **_kwargs: client,
+        start_worker_on_capture=False,
+    )
+
+    bridge.start_worker()
+    _wait_until(lambda: bridge.worker_started)
+    first_worker = bridge._worker  # type: ignore[attr-defined]
+    bridge.stop_worker_for_test()
+    assert bridge._worker is None  # type: ignore[attr-defined]
+
+    bridge.start_worker()
+    _wait_until(lambda: bridge.worker_started)
+    second_worker = bridge._worker  # type: ignore[attr-defined]
+    assert second_worker is not None
+    assert second_worker is not first_worker
+
+    _session_start(HermesHooks(bridge))
+    _wait_until(lambda: bridge.last_ack is not None)
+    bridge.stop_worker_for_test()
+
+    commits = [params for method, params in calls if method == "bridge.commit"]
+    assert len(commits) == 1
+    assert commits[0]["record"]["capture_seq"] == 1  # type: ignore[index]
+    assert bridge.last_ack is not None
+    assert bridge.last_ack.through_capture_seq == 1
+    assert bridge.retained_record is None
+    assert bridge._worker is None  # type: ignore[attr-defined]
+
+
+def test_worker_stop_and_restart_are_serialized_by_the_worker_lock(
+    tmp_path: Path,
+) -> None:
+    entered_stop = threading.Event()
+    release_stop = threading.Event()
+    restart_finished = threading.Event()
+    thread_errors: list[BaseException] = []
+
+    class BlockingSetEvent:
+        def __init__(self, delegate: threading.Event) -> None:
+            self.delegate = delegate
+
+        def is_set(self) -> bool:
+            return self.delegate.is_set()
+
+        def set(self) -> None:
+            entered_stop.set()
+            assert release_stop.wait(2)
+            self.delegate.set()
+
+        def clear(self) -> None:
+            self.delegate.clear()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            return self.delegate.wait(timeout)
+
+    bridge = HookBridge(
+        tmp_path,
+        reconnect_delay_seconds=0.01,
+        start_worker_on_capture=False,
+    )
+    bridge._stop_event = BlockingSetEvent(bridge._stop_event)  # type: ignore[attr-defined]
+
+    def stop() -> None:
+        try:
+            bridge.stop_worker_for_test()
+        except BaseException as error:
+            thread_errors.append(error)
+
+    def restart() -> None:
+        try:
+            bridge.start_worker()
+            restart_finished.set()
+        except BaseException as error:
+            thread_errors.append(error)
+
+    stopper = threading.Thread(target=stop)
+    restarter = threading.Thread(target=restart)
+    stopper.start()
+    assert entered_stop.wait(2)
+    restarter.start()
+    assert restart_finished.wait(0.1) is False
+    release_stop.set()
+    stopper.join(timeout=2)
+    restarter.join(timeout=2)
+
+    assert stopper.is_alive() is False
+    assert restarter.is_alive() is False
+    assert thread_errors == []
+    assert restart_finished.is_set()
+    assert bridge.worker_started is True
+
+    bridge.stop_worker_for_test()
+    assert bridge.worker_started is False
 
 
 def test_gap_ack_health_allocation_failure_retains_exact_retry(
@@ -1607,6 +1829,54 @@ def _closed_stream(
         "last_seen": timestamp,
         "closed_final_seq": final_capture_seq,
     }
+
+
+def test_clean_closed_worker_cannot_be_restarted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class ClosingClient(_FakeClient):
+        def call(
+            self,
+            method: str,
+            params: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            if method == "bridge.close":
+                assert params is not None
+                self.calls.append((method, dict(params)))
+                return _closed_stream(bridge, self, int(params["final_capture_seq"]))
+            return super().call(method, params)
+
+    client = ClosingClient(calls)
+    bridge = HookBridge(
+        tmp_path,
+        bridge_instance_id=new_id(),
+        reconnect_delay_seconds=0.01,
+        client_factory=lambda *_args, **_kwargs: client,
+        start_worker_on_capture=False,
+    )
+    bridge.request_clean_close()
+    _wait_until(lambda: any(method == "bridge.close" for method, _ in calls))
+    _wait_until(lambda: bridge._worker is None)  # type: ignore[attr-defined]
+    assert bridge.stop_requested is True
+
+    constructions = 0
+
+    def unexpected_thread(**_kwargs: object) -> threading.Thread:
+        nonlocal constructions
+        constructions += 1
+        raise AssertionError("clean-closed bridge attempted to restart")
+
+    monkeypatch.setattr(bridge_module.threading, "Thread", unexpected_thread)
+    bridge.start_worker()
+
+    assert constructions == 0
+    assert bridge._worker is None  # type: ignore[attr-defined]
+    assert bridge.worker_started is False
 
 
 def test_capture_after_close_request_before_seal_extends_final_cursor(

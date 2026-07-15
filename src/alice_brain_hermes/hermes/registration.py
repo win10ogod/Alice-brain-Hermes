@@ -253,6 +253,7 @@ class _BootstrapCaptureBuffer:
         self._worker_retained: _BootstrapCapture | None = None
         self._worker: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._stop_requested = False
         self._start_worker_on_capture = start_worker_on_capture
         self._health = _BootstrapHealth()
         self._handed_off_dropped_events = 0
@@ -605,6 +606,9 @@ class _BootstrapCaptureBuffer:
                     return
                 self._worker = None
             try:
+                if self._stop_requested:
+                    self._stop_event.clear()
+                    self._stop_requested = False
                 with self._capture_lock:
                     previous_health = self._health
                     updated_health = replace(self._health, worker_started=True)
@@ -620,10 +624,14 @@ class _BootstrapCaptureBuffer:
                     except BaseException as start_error:
                         try:
                             started = worker.is_alive()
-                        except BaseException as probe_error:
-                            self._worker = None
-                            self._health = previous_health
-                            raise start_error from probe_error
+                        except BaseException:
+                            # The start result is unknown.  Keep the ownership
+                            # pointer so a possibly live worker cannot be joined
+                            # by a duplicate bootstrap worker.
+                            self._health = updated_health
+                            self.mark_unrepresented_callback(start_error)
+                            self.mark_worker_degraded(start_error)
+                            return
                         if not started:
                             self._worker = None
                             self._health = previous_health
@@ -802,7 +810,13 @@ class _BootstrapCaptureBuffer:
                 time.sleep(min(timeout, 0.05))
 
     def worker_stop_requested(self) -> bool:
-        return self._stop_event.is_set()
+        if self._stop_requested:
+            return True
+        try:
+            return self._stop_event.is_set()
+        except BaseException as error:
+            self.mark_worker_degraded(error)
+            return False
 
     def _publish_worker_exit(self, worker: threading.Thread) -> None:
         try:
@@ -815,9 +829,11 @@ class _BootstrapCaptureBuffer:
             self.mark_unrepresented_callback(error)
 
     def stop_worker_for_test(self) -> None:
-        self._stop_event.set()
-        self._wake.set()
-        worker = self._worker
+        with self._worker_lock:
+            self._stop_requested = True
+            self._stop_event.set()
+            self._wake.set()
+            worker = self._worker
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=2.0)
             if worker.is_alive():

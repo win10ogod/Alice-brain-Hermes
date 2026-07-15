@@ -1036,6 +1036,11 @@ class HookBridge:
                     return
                 self._worker = None
             try:
+                if self._stop_requested:
+                    if self._close_sealed:
+                        return
+                    self._stop_event.clear()
+                    self._stop_requested = False
                 with self._health_lock:
                     previous_health = self._health
                     updated_health = replace(self._health, worker_started=True)
@@ -1050,10 +1055,13 @@ class HookBridge:
                     except BaseException as start_error:
                         try:
                             started = worker.is_alive()
-                        except BaseException as probe_error:
-                            self._worker = None
-                            self._health = previous_health
-                            raise start_error from probe_error
+                        except BaseException:
+                            # The start result is unknown.  Retaining ownership is
+                            # the only safe choice: clearing the pointer could let
+                            # a second worker race a thread that did spawn.
+                            self._health = updated_health
+                            self._mark_emergency_failure(start_error)
+                            return
                         if not started:
                             self._worker = None
                             self._health = previous_health
@@ -1066,6 +1074,18 @@ class HookBridge:
                 self._mark_emergency_failure(error)
                 return
 
+    def _worker_stop_requested(self) -> bool:
+        if self._stop_requested:
+            return True
+        try:
+            return self._stop_event.is_set()
+        except BaseException as error:
+            # Production stop paths publish the non-throwing latch first.  A
+            # hostile Event probe therefore degrades health without making an
+            # otherwise live worker inert.
+            self._mark_emergency_failure(error)
+            return False
+
     def _run_worker(self) -> None:
         current_worker = self._worker
         if current_worker is None:
@@ -1076,7 +1096,7 @@ class HookBridge:
         try:
             while True:
                 try:
-                    if self._stop_event.is_set():
+                    if self._worker_stop_requested():
                         return
                     try:
                         record = self._select_next_record()
@@ -1679,6 +1699,7 @@ class HookBridge:
                 or stream.closed_final_seq != final
             ):
                 raise DaemonClientError("bridge.close result is invalid")
+            self._stop_requested = True
             self._stop_event.set()
             return True
         except (
@@ -1729,6 +1750,7 @@ class HookBridge:
             ):
                 raise DaemonClientError("bridge.close.recover result is invalid")
             self._close_client(client)
+            self._stop_requested = True
             self._stop_event.set()
             self._publish_connection("disconnected")
             return True
@@ -1740,10 +1762,11 @@ class HookBridge:
     def stop_worker_for_test(self) -> None:
         """Bounded test cleanup; it does not issue daemon.shutdown or stream close."""
 
-        self._stop_requested = True
-        self._stop_event.set()
-        self._wake_event.set()
-        worker = self._worker
+        with self._worker_lock:
+            self._stop_requested = True
+            self._stop_event.set()
+            self._wake_event.set()
+            worker = self._worker
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=2.0)
             if worker.is_alive():
