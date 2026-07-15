@@ -513,12 +513,7 @@ class ProtocolConnection:
             raise ProtocolFault("shutting_down", "daemon is shutting down")
         if method == "daemon.status":
             self._only(params, set())
-            return {
-                "brain_ids": list(self.service.runtime.brain_ids),
-                "engine_count": self.service.runtime.engine_count,
-                "scheduler_count": self.service.runtime.scheduler_count,
-                "continuous_runtime": True,
-            }
+            return self.service.runtime.status_snapshot().model_dump(mode="json")
         if method == "identity.get":
             self._only(params, {"brain_id"})
             brain_id = self._selected_brain_id(params.get("brain_id"))

@@ -27,6 +27,7 @@ from alice_brain_hermes.protocol.diagnostics import (
     IdentitySnapshotV1,
     TracePageV1,
 )
+from alice_brain_hermes.protocol.status import DaemonRuntimeStatusV1
 from alice_brain_hermes.runtime.discovery import (
     _private_home,
     load_discovery_and_credential,
@@ -299,13 +300,7 @@ def _validate_status_payloads(
         "running_scheduler_count",
         "degraded_brain_count",
     }
-    runtime_fields = {
-        "brain_ids",
-        "engine_count",
-        "scheduler_count",
-        "continuous_runtime",
-    }
-    valid = set(health) == health_fields and set(runtime) == runtime_fields
+    valid = set(health) == health_fields
     valid = valid and all(
         isinstance(health.get(field), str) and bool(health[field])
         for field in ("instance_nonce", "process_marker")
@@ -324,21 +319,31 @@ def _validate_status_payloads(
         type(health.get(field)) is int and int(health[field]) >= 0
         for field in count_fields
     )
-    brain_ids = runtime.get("brain_ids")
-    valid = valid and isinstance(brain_ids, list)
-    valid = valid and all(
-        isinstance(item, str) and bool(item) for item in brain_ids or []
-    )
-    valid = valid and len(set(brain_ids or [])) == len(brain_ids or [])
-    valid = valid and all(
-        type(runtime.get(field)) is int and int(runtime[field]) >= 0
-        for field in ("engine_count", "scheduler_count")
-    )
-    valid = valid and runtime.get("continuous_runtime") is True
     valid = valid and type(health.get("protocol_version")) is int
-    valid = valid and health.get("brain_count") == len(brain_ids or [])
-    valid = valid and health.get("engine_count") == runtime.get("engine_count")
-    valid = valid and health.get("scheduler_count") == runtime.get("scheduler_count")
+    health_ready = (
+        health.get("brain_count") == health.get("engine_count")
+        and health.get("brain_count") == health.get("scheduler_count")
+        and health.get("brain_count") == health.get("running_scheduler_count")
+    )
+    valid = valid and health.get("runtime_ready") is health_ready
+    try:
+        encoded = json.dumps(
+            runtime,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        typed_runtime = DaemonRuntimeStatusV1.model_validate_json(
+            encoded,
+            strict=True,
+        )
+    except (TypeError, ValueError, ValidationError):
+        valid = False
+    else:
+        valid = valid and typed_runtime.schema_versions.protocol == health.get(
+            "protocol_version"
+        )
     if not valid:
         raise _CliFailure(
             "daemon_status_invalid",
@@ -500,14 +505,28 @@ def _status(home: Path, *, timeout_seconds: float) -> dict[str, object]:
         "protocol_version": discovery.protocol_version,
         "package_version": discovery.package_version,
         "shutting_down": health["shutting_down"],
-        "runtime_ready": health["runtime_ready"],
-        "brain_count": health["brain_count"],
-        "engine_count": health["engine_count"],
-        "scheduler_count": health["scheduler_count"],
-        "running_scheduler_count": health["running_scheduler_count"],
-        "degraded_brain_count": health["degraded_brain_count"],
+        "runtime_ready": (
+            health["runtime_ready"] is True and runtime["runtime_ready"] is True
+        ),
+        "brain_count": len(runtime["brain_ids"]),
+        "engine_count": runtime["engine_count"],
+        "scheduler_count": runtime["scheduler_count"],
+        "running_scheduler_count": runtime["scheduler_health"][
+            "running_scheduler_count"
+        ],
+        "degraded_brain_count": runtime["scheduler_health"]["degraded_brain_count"],
         "brain_ids": runtime["brain_ids"],
+        "runtime_mode": runtime["runtime_mode"],
+        "cognition_mode": runtime["cognition_mode"],
         "continuous_runtime": runtime["continuous_runtime"],
+        "scheduler_health": runtime["scheduler_health"],
+        "bridge_connection": runtime["bridge_connection"],
+        "trace_complete": runtime["trace_complete"],
+        "semantic_complete": runtime["semantic_complete"],
+        "dropped_events": runtime["dropped_events"],
+        "semantic_evidence": runtime["semantic_evidence"],
+        "unobserved_hermes_fields": runtime["unobserved_hermes_fields"],
+        "schema_versions": runtime["schema_versions"],
     }
     return {
         "daemon": daemon,
@@ -959,6 +978,8 @@ def _doctor(home: Path, *, timeout_seconds: float) -> tuple[dict[str, object], i
                         daemon.get("runtime_ready") is True
                         and daemon.get("shutting_down") is False
                         and daemon.get("degraded_brain_count") == 0
+                        and isinstance(daemon.get("scheduler_health"), dict)
+                        and daemon["scheduler_health"].get("status") == "healthy"
                     )
                     checks.append(
                         {
@@ -980,20 +1001,45 @@ def _doctor(home: Path, *, timeout_seconds: float) -> tuple[dict[str, object], i
                         "cognition_mode",
                         "dropped_events",
                         "scheduler_health",
+                        "semantic_complete",
                         "trace_complete",
                         "unobserved_hermes_fields",
+                        "schema_versions",
                     }
                     missing = sorted(required_observability - set(daemon))
+                    failed_evidence: list[str] = []
+                    if not missing:
+                        if daemon.get("trace_complete") is not True:
+                            failed_evidence.append("trace_complete")
+                        if daemon.get("semantic_complete") is not True:
+                            failed_evidence.append("semantic_complete")
+                        dropped = daemon.get("dropped_events")
+                        if type(dropped) is not int or dropped != 0:
+                            failed_evidence.append("dropped_events")
+                        bridge = daemon.get("bridge_connection")
+                        if (
+                            not isinstance(bridge, dict)
+                            or bridge.get("state") == "degraded"
+                        ):
+                            failed_evidence.append("bridge_connection")
+                    observable = not missing and not failed_evidence
                     checks.append(
                         {
                             "id": "integration_observability",
-                            "status": "fail" if missing else "pass",
+                            "status": "pass" if observable else "fail",
                             "summary": (
                                 "daemon status lacks required bridge/trace evidence"
                                 if missing
-                                else "bridge and trace evidence are available"
+                                else (
+                                    "persisted bridge or semantic evidence is degraded"
+                                    if failed_evidence
+                                    else "bridge and trace evidence are available"
+                                )
                             ),
-                            "data": {"missing_fields": missing},
+                            "data": {
+                                "missing_fields": missing,
+                                "failed_evidence": failed_evidence,
+                            },
                         }
                     )
     healthy = not any(item["status"] == "fail" for item in checks)

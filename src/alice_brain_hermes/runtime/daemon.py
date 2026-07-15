@@ -25,6 +25,7 @@ from alice_brain_hermes.core.events import EventEnvelope
 from alice_brain_hermes.errors import (
     BridgeBindingError,
     BridgeClosedError,
+    LedgerIntegrityError,
     RuntimeOwnedError,
     SchedulerShutdownError,
 )
@@ -33,6 +34,13 @@ from alice_brain_hermes.protocol.models import (
     BrainProfileV1,
     DaemonDiscoveryV1,
     LoopbackEndpointV1,
+)
+from alice_brain_hermes.protocol.status import (
+    BridgeConnectionSummaryV1,
+    DaemonRuntimeStatusV1,
+    RuntimeSchemaVersionsV1,
+    SchedulerHealthSummaryV1,
+    SemanticEvidenceSummaryV1,
 )
 from alice_brain_hermes.runtime.discovery import (
     CredentialFile,
@@ -895,6 +903,89 @@ class HermesDaemonRuntime:
                 "running_scheduler_count": len(running),
                 "degraded_brain_count": len(degraded),
             }
+        finally:
+            self._end_operation()
+
+    def status_snapshot(self) -> DaemonRuntimeStatusV1:
+        """Return one bounded status projection from persisted evidence."""
+
+        self._begin_operation()
+        try:
+            # Use the same creation lock order as dynamic persistence. A status
+            # sample may truthfully report a transient degraded registry, but it
+            # can never pair a newer registry with an older persisted ledger.
+            with self._engine_creation_gate:
+                persisted = tuple(sorted(self.ledger.list_brain_ids()))
+                observability = self.ledger.observability_snapshot()
+                sqlite_schema_version = self.ledger.schema_version
+                with self._registry_lock:
+                    engines = dict(self._engines)
+                    schedulers = dict(self._schedulers)
+                    fail_stopped = self._fatal_error is not None
+            if observability.brain_count != len(persisted):
+                raise LedgerIntegrityError(
+                    "persisted observability coverage does not match runtime brains"
+                )
+
+            scheduler_health = {
+                brain_id: scheduler.health for brain_id, scheduler in schedulers.items()
+            }
+            running = sum(health.running for health in scheduler_health.values())
+            degraded = sum(
+                health.status != "healthy" for health in scheduler_health.values()
+            )
+            writers_ready = (
+                set(engines) == set(persisted)
+                and set(schedulers) == set(persisted)
+                and running == len(persisted)
+            )
+            healthy = not fail_stopped and writers_ready and degraded == 0
+            scheduler_summary = SchedulerHealthSummaryV1(
+                status="healthy" if healthy else "degraded",
+                fail_stopped=fail_stopped,
+                brain_count=len(persisted),
+                engine_count=len(engines),
+                scheduler_count=len(schedulers),
+                running_scheduler_count=running,
+                degraded_brain_count=degraded,
+            )
+
+            if observability.disconnected_open_bridges:
+                bridge_state = "degraded"
+            elif observability.connected_open_bridges:
+                bridge_state = "connected"
+            elif observability.total_bridges:
+                bridge_state = "idle"
+            else:
+                bridge_state = "never_connected"
+            bridge_summary = BridgeConnectionSummaryV1(
+                state=bridge_state,
+                total_bridges=observability.total_bridges,
+                connected_open_bridges=observability.connected_open_bridges,
+                disconnected_open_bridges=observability.disconnected_open_bridges,
+                clean_closed_bridges=observability.clean_closed_bridges,
+                abandoned_bridges=observability.abandoned_bridges,
+            )
+            return DaemonRuntimeStatusV1(
+                brain_ids=persisted,
+                engine_count=len(engines),
+                scheduler_count=len(schedulers),
+                runtime_ready=writers_ready,
+                scheduler_health=scheduler_summary,
+                bridge_connection=bridge_summary,
+                trace_complete=observability.trace_complete,
+                semantic_complete=observability.semantic_complete,
+                dropped_events=observability.dropped_events,
+                semantic_evidence=SemanticEvidenceSummaryV1(
+                    semantic_records=observability.semantic_records,
+                    legacy_raw_only_records=observability.legacy_raw_only_records,
+                    semantic_gap_records=observability.semantic_gap_records,
+                ),
+                schema_versions=RuntimeSchemaVersionsV1(
+                    semantic=observability.semantic_schema_version,
+                    sqlite=sqlite_schema_version,
+                ),
+            )
         finally:
             self._end_operation()
 

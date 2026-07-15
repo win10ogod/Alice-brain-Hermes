@@ -187,7 +187,7 @@ def test_status_payload_rejects_unknown_or_identity_collision_fields() -> None:
         "instance_nonce": "nonce",
         "process_marker": "marker",
         "shutting_down": False,
-        "protocol_version": 1,
+        "protocol_version": 2,
         "runtime_ready": True,
         "brain_count": 0,
         "engine_count": 0,
@@ -196,10 +196,53 @@ def test_status_payload_rejects_unknown_or_identity_collision_fields() -> None:
         "degraded_brain_count": 0,
     }
     runtime = {
+        "schema_version": 1,
+        "runtime_mode": "continuous_daemon",
+        "cognition_mode": "local",
+        "continuous_runtime": True,
         "brain_ids": [],
         "engine_count": 0,
         "scheduler_count": 0,
-        "continuous_runtime": True,
+        "runtime_ready": True,
+        "scheduler_health": {
+            "status": "healthy",
+            "fail_stopped": False,
+            "brain_count": 0,
+            "engine_count": 0,
+            "scheduler_count": 0,
+            "running_scheduler_count": 0,
+            "degraded_brain_count": 0,
+        },
+        "bridge_connection": {
+            "state": "never_connected",
+            "total_bridges": 0,
+            "connected_open_bridges": 0,
+            "disconnected_open_bridges": 0,
+            "clean_closed_bridges": 0,
+            "abandoned_bridges": 0,
+        },
+        "trace_complete": True,
+        "semantic_complete": True,
+        "dropped_events": 0,
+        "semantic_evidence": {
+            "semantic_records": 0,
+            "legacy_raw_only_records": 0,
+            "semantic_gap_records": 0,
+        },
+        "unobserved_hermes_fields": [
+            "chunk_capture",
+            "reasoning_capture",
+            "unregistered_host_state",
+        ],
+        "schema_versions": {
+            "protocol": 2,
+            "observer": 1,
+            "record": 1,
+            "gap": 1,
+            "frame": 3,
+            "semantic": 1,
+            "sqlite": 5,
+        },
     }
 
     cli._validate_status_payloads(health, runtime)
@@ -207,6 +250,15 @@ def test_status_payload_rejects_unknown_or_identity_collision_fields() -> None:
         cli._validate_status_payloads({**health, "pid": 999}, runtime)
 
     assert failure.value.code == "daemon_status_invalid"
+    with pytest.raises(cli._CliFailure):
+        cli._validate_status_payloads(health, {**runtime, "brain_count": 0})
+    changed_schema = dict(runtime)
+    changed_schema["schema_versions"] = {
+        **runtime["schema_versions"],
+        "protocol": 1,
+    }
+    with pytest.raises(cli._CliFailure):
+        cli._validate_status_payloads(health, changed_schema)
 
 
 def test_runtime_home_precedence_uses_project_env_not_alice_brain_home(
@@ -336,6 +388,19 @@ def test_start_is_idempotent_status_is_live_and_stop_is_authenticated(
         assert status_data["daemon"]["instance_nonce"] == first_data["instance_nonce"]
         assert status_data["daemon"]["pid"] == first_pid
         assert status_data["daemon"]["continuous_runtime"] is True
+        assert status_data["daemon"]["runtime_mode"] == "continuous_daemon"
+        assert status_data["daemon"]["cognition_mode"] == "local"
+        assert status_data["daemon"]["scheduler_health"]["status"] == "healthy"
+        assert status_data["daemon"]["bridge_connection"]["state"] == (
+            "never_connected"
+        )
+        assert status_data["daemon"]["trace_complete"] is True
+        assert status_data["daemon"]["semantic_complete"] is True
+        assert status_data["daemon"]["dropped_events"] == 0
+
+        doctor = _success(_run_cli(home, "doctor"))
+        assert doctor["data"]["healthy"] is True
+        assert {item["status"] for item in doctor["data"]["checks"]} == {"pass"}
 
         stopped = _success(_run_cli(home, "stop", timeout=20))
         assert stopped["command"] == "daemon.stop"
@@ -760,3 +825,96 @@ def test_doctor_never_claims_green_without_bridge_and_trace_evidence(
     )
     assert integration["status"] == "fail"
     assert "bridge_connection" in integration["data"]["missing_fields"]
+
+
+@pytest.mark.parametrize(
+    ("changes", "failed_evidence"),
+    [
+        ({"trace_complete": False, "semantic_complete": False}, "trace_complete"),
+        ({"semantic_complete": False}, "semantic_complete"),
+        (
+            {
+                "trace_complete": False,
+                "semantic_complete": False,
+                "dropped_events": 2,
+            },
+            "dropped_events",
+        ),
+        (
+            {
+                "bridge_connection": {
+                    "state": "degraded",
+                    "total_bridges": 1,
+                    "connected_open_bridges": 0,
+                    "disconnected_open_bridges": 1,
+                    "clean_closed_bridges": 0,
+                    "abandoned_bridges": 0,
+                }
+            },
+            "bridge_connection",
+        ),
+    ],
+)
+def test_doctor_fails_visible_persisted_integration_gaps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changes: dict[str, object],
+    failed_evidence: str,
+) -> None:
+    from alice_brain_hermes import cli
+
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    daemon: dict[str, object] = {
+        "runtime_ready": True,
+        "shutting_down": False,
+        "degraded_brain_count": 0,
+        "instance_nonce": "nonce",
+        "scheduler_health": {"status": "healthy"},
+        "bridge_connection": {
+            "state": "never_connected",
+            "total_bridges": 0,
+            "connected_open_bridges": 0,
+            "disconnected_open_bridges": 0,
+            "clean_closed_bridges": 0,
+            "abandoned_bridges": 0,
+        },
+        "cognition_mode": "local",
+        "trace_complete": True,
+        "semantic_complete": True,
+        "dropped_events": 0,
+        "unobserved_hermes_fields": [
+            "chunk_capture",
+            "reasoning_capture",
+            "unregistered_host_state",
+        ],
+        "schema_versions": {
+            "protocol": 2,
+            "observer": 1,
+            "record": 1,
+            "gap": 1,
+            "frame": 3,
+            "semantic": 1,
+            "sqlite": 5,
+        },
+    }
+    daemon.update(changes)
+    monkeypatch.setattr(cli, "_validate_existing_home", lambda _home: None)
+    monkeypatch.setattr(cli, "_discovery_exists", lambda _home: True)
+    monkeypatch.setattr(
+        cli,
+        "_status",
+        lambda _home, *, timeout_seconds: {
+            "running": True,
+            "daemon": daemon,
+        },
+    )
+
+    data, exit_code = cli._doctor(home, timeout_seconds=1.0)
+
+    assert exit_code == 4
+    integration = next(
+        item for item in data["checks"] if item["id"] == "integration_observability"
+    )
+    assert integration["status"] == "fail"
+    assert failed_evidence in integration["data"]["failed_evidence"]

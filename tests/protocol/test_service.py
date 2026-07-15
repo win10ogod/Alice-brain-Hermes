@@ -14,6 +14,7 @@ from alice_brain_hermes.protocol.models import (
     PROTOCOL_VERSION,
     TASK6_MAX_DETACHED_RECORD_BYTES,
     BrainProfileV1,
+    BridgeGapV1,
     CapabilityProfileV1,
     ConsciousnessFrameV3,
     CoverageV1,
@@ -329,6 +330,126 @@ def test_health_requires_auth_but_not_initialize(service) -> None:
 
     assert response["result"]["instance_nonce"] == service.instance_nonce
     assert response["result"]["runtime_ready"] is True
+
+
+def test_daemon_status_is_typed_complete_zero_evidence_for_fresh_runtime(
+    service,
+) -> None:
+    connection = service.new_connection()
+    assert "result" in initialize(connection)
+
+    result = decode(connection.handle_frame(request(2, "daemon.status")))["result"]
+
+    assert result == {
+        "schema_version": 1,
+        "runtime_mode": "continuous_daemon",
+        "cognition_mode": "local",
+        "continuous_runtime": True,
+        "brain_ids": [],
+        "engine_count": 0,
+        "scheduler_count": 0,
+        "runtime_ready": True,
+        "scheduler_health": {
+            "status": "healthy",
+            "fail_stopped": False,
+            "brain_count": 0,
+            "engine_count": 0,
+            "scheduler_count": 0,
+            "running_scheduler_count": 0,
+            "degraded_brain_count": 0,
+        },
+        "bridge_connection": {
+            "state": "never_connected",
+            "total_bridges": 0,
+            "connected_open_bridges": 0,
+            "disconnected_open_bridges": 0,
+            "clean_closed_bridges": 0,
+            "abandoned_bridges": 0,
+        },
+        "trace_complete": True,
+        "semantic_complete": True,
+        "dropped_events": 0,
+        "semantic_evidence": {
+            "semantic_records": 0,
+            "legacy_raw_only_records": 0,
+            "semantic_gap_records": 0,
+        },
+        "unobserved_hermes_fields": [
+            "chunk_capture",
+            "reasoning_capture",
+            "unregistered_host_state",
+        ],
+        "schema_versions": {
+            "protocol": PROTOCOL_VERSION,
+            "observer": 1,
+            "record": 1,
+            "gap": 1,
+            "frame": 3,
+            "semantic": 1,
+            "sqlite": 5,
+        },
+    }
+
+
+def test_daemon_status_reports_connected_disconnected_and_gap_evidence(
+    service: ProtocolService,
+) -> None:
+    bridge = service.new_connection()
+    assert "result" in initialize(bridge)
+    brain = decode(bridge.handle_frame(request(2, "brain.create", {"name": None})))[
+        "result"
+    ]
+    instance = new_id()
+    binding = decode(
+        bridge.handle_frame(
+            request(
+                3,
+                "brain.attach",
+                bridge_attach_params(brain["brain_id"], instance),
+            )
+        )
+    )["result"]["binding"]
+
+    connected = decode(bridge.handle_frame(request(4, "daemon.status")))["result"]
+
+    assert connected["scheduler_health"]["status"] == "healthy"
+    assert connected["bridge_connection"]["state"] == "connected"
+    assert connected["bridge_connection"]["connected_open_bridges"] == 1
+    assert connected["trace_complete"] is True
+    assert connected["semantic_complete"] is True
+
+    gap = BridgeGapV1(
+        bridge_instance_id=instance,
+        first_capture_seq=1,
+        last_capture_seq=2,
+        dropped_count=2,
+        cause_counts={"queue_full": 2},
+    )
+    assert "result" in decode(
+        bridge.handle_frame(
+            request(
+                5,
+                "bridge.commit",
+                {"binding": binding, "record": gap.model_dump(mode="json")},
+            )
+        )
+    )
+    degraded_trace = decode(bridge.handle_frame(request(6, "daemon.status")))["result"]
+
+    assert degraded_trace["bridge_connection"]["state"] == "connected"
+    assert degraded_trace["trace_complete"] is False
+    assert degraded_trace["semantic_complete"] is False
+    assert degraded_trace["dropped_events"] == 2
+    assert degraded_trace["semantic_evidence"]["semantic_gap_records"] == 1
+
+    bridge.close()
+    inspector = service.new_connection()
+    assert "result" in initialize(inspector)
+    disconnected = decode(inspector.handle_frame(request(2, "daemon.status")))["result"]
+
+    assert disconnected["bridge_connection"]["state"] == "degraded"
+    assert disconnected["bridge_connection"]["disconnected_open_bridges"] == 1
+    assert disconnected["trace_complete"] is False
 
 
 def test_each_connection_has_isolated_exact_initialization_state(service) -> None:
