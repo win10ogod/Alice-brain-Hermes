@@ -20,6 +20,7 @@
 - No provider request, tool argument/result, stream, reasoning field, multimodal input, context, model, retry, or output limit is rewritten or reduced.
 - Hermes 0.18.2 has no stream-chunk or separate reasoning hook. Capabilities report these as `unobserved`; trace completeness never claims they were captured.
 - Full mode requires the project-owned continuous daemon. No embedded or external-project fallback is allowed.
+- The repository license and Python package license expression are exactly `MIT`; both wheel and sdist include the root `LICENSE` file.
 - Run `python -m compileall -q src`, Ruff, and focused tests at every task boundary.
 
 ---
@@ -494,3 +495,50 @@ Expected: all tests pass; the installed E2E records at least two off-turn C0 tic
 
 Commit: `git add src docs tests scripts README.md pyproject.toml uv.lock && git commit -m "feat: ship independent Alice-brain-Hermes"`
 
+### Task 9: MIT Release License
+
+**Files:**
+- Create: `LICENSE`
+- Modify: `pyproject.toml`
+- Modify: `README.md`
+- Modify: `tests/test_package.py`
+
+**Interfaces:**
+- Consumes: the existing Hatchling wheel and sdist build.
+- Produces: repository-level MIT terms, `License-Expression: MIT`, and packaged license files in both release artifacts.
+
+- [ ] **Step 1: Write failing metadata and artifact tests**
+
+```python
+from importlib.metadata import metadata
+from pathlib import Path
+
+
+def test_project_declares_mit_license() -> None:
+    assert "MIT License" in Path("LICENSE").read_text(encoding="utf-8")
+    assert 'license = "MIT"' in Path("pyproject.toml").read_text(encoding="utf-8")
+    assert metadata("alice-brain-hermes")["License-Expression"] == "MIT"
+```
+
+- [ ] **Step 2: Verify the license tests fail before metadata changes**
+
+Run: `uv run pytest tests/test_package.py -v`
+
+Expected: the root `LICENSE` and MIT package expression are absent.
+
+- [ ] **Step 3: Add the standard MIT text and PEP 639 metadata**
+
+Set `license = "MIT"` and `license-files = ["LICENSE"]` in `[project]`, add the
+standard MIT grant and warranty text with copyright year `2026`, and document
+the license in `README.md`.
+
+- [ ] **Step 4: Build and verify both release formats**
+
+Run: `uv build && uv run pytest tests/test_package.py -v && uv run python scripts/check_independence.py dist/*.whl && unzip -l dist/*.whl | grep '/licenses/LICENSE$' && tar -tf dist/*.tar.gz | grep '/LICENSE$'`
+
+Expected: tests and independence audit pass; wheel metadata contains
+`License-Expression: MIT`, and both wheel and sdist contain `LICENSE`.
+
+- [ ] **Step 5: Commit**
+
+Commit: `git add LICENSE README.md pyproject.toml tests/test_package.py docs/superpowers && git commit -m "docs: license Alice-brain-Hermes under MIT"`

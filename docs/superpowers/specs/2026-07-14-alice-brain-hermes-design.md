@@ -109,3 +109,9 @@ alice-brain-hermes doctor|trace|identity
 - Hermes hooks、CLI、action grounding、identity、重啟與能力保持測試通過。
 - 專案可獨立封裝、版本化與發佈。
 
+## 10. 發布授權
+
+`Alice-brain-Hermes` 採用 MIT License。儲存庫根目錄必須包含標準
+`LICENSE`，Python 專案中繼資料必須發佈 `License-Expression: MIT` 並把
+授權檔納入 wheel 與 sdist。授權設定只描述本專案，不引用或包入獨立的
+`Alice-brain` 原始碼。
