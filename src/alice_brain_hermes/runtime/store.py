@@ -128,6 +128,8 @@ _SQLITE_MUTATING_NO_ARGUMENT_PRAGMAS = frozenset(
 _IDENTITY_WORKER_FAILURE_CODE = re.compile(
     r"^(?:invalid_structured_choice|llm_error\.[A-Za-z0-9_]{1,80})$"
 )
+_IDENTITY_ADAPTER_ID = "alice-brain-hermes-identity-v1"
+_IDENTITY_PURPOSE = "identity_self_naming"
 
 
 _CREATE_BASE_SCHEMA = """
@@ -913,6 +915,30 @@ class SQLiteLedger:
                     "identity name registry is not replay-derived"
                 )
 
+        reserved_event_ids: set[str] = set()
+        event_cursor = self._connection.execute(
+            "SELECT event_id, brain_id, sequence, body_fingerprint, "
+            "envelope_fingerprint, envelope_json FROM events "
+            "ORDER BY brain_id, sequence"
+        )
+        while event_rows := event_cursor.fetchmany(512):
+            for event_row in event_rows:
+                event = self._decode_event(event_row)
+                if (
+                    event.adapter_id == _IDENTITY_ADAPTER_ID
+                    or event.payload.get("purpose") == _IDENTITY_PURPOSE
+                ):
+                    reserved_event_ids.add(event.event_id)
+
+        covered_event_leases: dict[str, str] = {}
+
+        def cover(event: EventEnvelope, lease_id: str) -> None:
+            if event.event_id in covered_event_leases:
+                raise LedgerIntegrityError(
+                    "identity naming evidence is covered by multiple leases"
+                )
+            covered_event_leases[event.event_id] = lease_id
+
         lease_rows = self._connection.execute(
             "SELECT lease_id, brain_id, request_sequence, status, requested_at, "
             "expires_at, request_event_id, choice_fingerprint, choice_json, "
@@ -937,11 +963,11 @@ class SQLiteLedger:
                 or request.actor_id != status.brain_id
                 or request.sequence != status.state_sequence
                 or request.event_type != "cognition.requested"
-                or request.adapter_id != "alice-brain-hermes-identity-v1"
+                or request.adapter_id != _IDENTITY_ADAPTER_ID
                 or request.payload
                 != {
                     "schema_version": 1,
-                    "purpose": "identity_self_naming",
+                    "purpose": _IDENTITY_PURPOSE,
                     "lease_id": status.lease_id,
                     "requested_at": status.requested_at.isoformat(),
                     "expires_at": status.expires_at.isoformat(),
@@ -950,6 +976,7 @@ class SQLiteLedger:
                 raise LedgerIntegrityError(
                     "identity naming request event does not match its lease"
                 )
+            cover(request, status.lease_id)
             if status.status == "superseded" and status.failure_code not in {
                 "expired",
                 "identity_already_named",
@@ -987,7 +1014,7 @@ class SQLiteLedger:
             if (
                 terminal.brain_id != status.brain_id
                 or terminal.actor_id != status.brain_id
-                or terminal.adapter_id != "alice-brain-hermes-identity-v1"
+                or terminal.adapter_id != _IDENTITY_ADAPTER_ID
                 or terminal.sequence is None
                 or terminal.sequence <= status.state_sequence
             ):
@@ -1030,12 +1057,12 @@ class SQLiteLedger:
                     or deliberated.event_type != "c1.deliberated"
                     or completed.actor_id != status.brain_id
                     or deliberated.actor_id != status.brain_id
-                    or completed.adapter_id != "alice-brain-hermes-identity-v1"
-                    or deliberated.adapter_id != "alice-brain-hermes-identity-v1"
+                    or completed.adapter_id != _IDENTITY_ADAPTER_ID
+                    or deliberated.adapter_id != _IDENTITY_ADAPTER_ID
                     or completed.payload
                     != {
                         "schema_version": 1,
-                        "purpose": "identity_self_naming",
+                        "purpose": _IDENTITY_PURPOSE,
                         "lease_id": status.lease_id,
                         "choice_fingerprint": choice_fingerprint,
                         "structured": True,
@@ -1044,7 +1071,7 @@ class SQLiteLedger:
                     or deliberated.payload
                     != {
                         "schema_version": 1,
-                        "purpose": "identity_self_naming",
+                        "purpose": _IDENTITY_PURPOSE,
                         "lease_id": status.lease_id,
                         "name": status.choice.name,
                         "reason": status.choice.reason,
@@ -1054,7 +1081,7 @@ class SQLiteLedger:
                     or terminal.payload
                     != {
                         "schema_version": 1,
-                        "purpose": "identity_self_naming",
+                        "purpose": _IDENTITY_PURPOSE,
                         "lease_id": status.lease_id,
                         "name": status.choice.name,
                         "reason": status.choice.reason,
@@ -1065,6 +1092,9 @@ class SQLiteLedger:
                     raise LedgerIntegrityError(
                         "completed identity naming event does not match its choice"
                     )
+                cover(completed, status.lease_id)
+                cover(deliberated, status.lease_id)
+                cover(terminal, status.lease_id)
             else:
                 if (
                     status.status != "failed"
@@ -1076,7 +1106,7 @@ class SQLiteLedger:
                     )
                 failure_payload: dict[str, object] = {
                     "schema_version": 1,
-                    "purpose": "identity_self_naming",
+                    "purpose": _IDENTITY_PURPOSE,
                     "lease_id": status.lease_id,
                     "failure_code": status.failure_code,
                     "terminal_at": status.terminal_at.isoformat(),
@@ -1092,6 +1122,12 @@ class SQLiteLedger:
                     raise LedgerIntegrityError(
                         "failed identity naming event does not match its lease"
                     )
+                cover(terminal, status.lease_id)
+
+        if set(covered_event_leases) != reserved_event_ids:
+            raise LedgerIntegrityError(
+                "identity naming reserved evidence is not bijectively lease-bound"
+            )
 
     @staticmethod
     def _legacy_semantic_fingerprint(
@@ -2285,12 +2321,12 @@ class SQLiteLedger:
             actor_id,
             {
                 "schema_version": 1,
-                "purpose": "identity_self_naming",
+                "purpose": _IDENTITY_PURPOSE,
                 "lease_id": lease_id,
                 "requested_at": now.isoformat(),
                 "expires_at": expires_at.isoformat(),
             },
-            adapter_id="alice-brain-hermes-identity-v1",
+            adapter_id=_IDENTITY_ADAPTER_ID,
         )
         with self._transaction(immediate=True):
             self._require_identity_head_in_transaction(expected_state)
@@ -2306,16 +2342,12 @@ class SQLiteLedger:
                 pending = self._identity_status_from_row(pending_row)
                 if pending.expires_at > now:
                     return IdentityNamingClaimResult(lease=None, successor=None)
-                superseded = self._connection.execute(
-                    "UPDATE identity_naming_lease SET status = 'superseded', "
-                    "failure_code = 'expired', terminal_at = ? "
-                    "WHERE lease_id = ? AND status = 'pending'",
-                    (now.isoformat(), pending.lease_id),
+                self._supersede_pending_identity_lease(
+                    pending.lease_id,
+                    now=now,
+                    requested_at=pending.requested_at,
+                    reason="expired",
                 )
-                if superseded.rowcount != 1:
-                    raise LedgerIntegrityError(
-                        "expired identity naming lease was not superseded"
-                    )
             if expected_state.identity.name is not None:
                 return IdentityNamingClaimResult(lease=None, successor=None)
             events, successor = self._insert_identity_event_batch_in_transaction(
@@ -2351,8 +2383,11 @@ class SQLiteLedger:
         lease_id: str,
         *,
         now: datetime,
+        requested_at: datetime,
         reason: str,
     ) -> None:
+        if now < requested_at:
+            raise ValueError("identity naming terminal time predates its request")
         updated = self._connection.execute(
             "UPDATE identity_naming_lease SET status = 'superseded', "
             "failure_code = ?, terminal_at = ? "
@@ -2389,6 +2424,7 @@ class SQLiteLedger:
             status = self._identity_status_from_row(row)
             if status.brain_id != expected_state.brain_id:
                 raise ValueError("identity naming lease changed brain identity")
+            self._require_identity_head_in_transaction(expected_state)
             if status.status == "completed":
                 if status.choice != choice:
                     raise IdempotencyConflictError(
@@ -2406,11 +2442,13 @@ class SQLiteLedger:
                 )
             if status.status == "superseded":
                 return IdentityNamingTerminalResult("superseded", None)
-            self._require_identity_head_in_transaction(expected_state)
+            if now < status.requested_at:
+                raise ValueError("identity naming terminal time predates its request")
             if now >= status.expires_at:
                 self._supersede_pending_identity_lease(
                     lease_id,
                     now=now,
+                    requested_at=status.requested_at,
                     reason="expired",
                 )
                 return IdentityNamingTerminalResult("superseded", None)
@@ -2418,6 +2456,7 @@ class SQLiteLedger:
                 self._supersede_pending_identity_lease(
                     lease_id,
                     now=now,
+                    requested_at=status.requested_at,
                     reason="identity_already_named",
                 )
                 return IdentityNamingTerminalResult("superseded", None)
@@ -2437,13 +2476,13 @@ class SQLiteLedger:
                     actor_id,
                     {
                         "schema_version": 1,
-                        "purpose": "identity_self_naming",
+                        "purpose": _IDENTITY_PURPOSE,
                         "lease_id": lease_id,
                         "failure_code": "name_conflict",
                         "choice_fingerprint": choice_fingerprint,
                         "terminal_at": now.isoformat(),
                     },
-                    adapter_id="alice-brain-hermes-identity-v1",
+                    adapter_id=_IDENTITY_ADAPTER_ID,
                 )
                 events, successor = self._insert_identity_event_batch_in_transaction(
                     expected_state,
@@ -2474,13 +2513,13 @@ class SQLiteLedger:
                 actor_id,
                 {
                     "schema_version": 1,
-                    "purpose": "identity_self_naming",
+                    "purpose": _IDENTITY_PURPOSE,
                     "lease_id": lease_id,
                     "choice_fingerprint": choice_fingerprint,
                     "structured": True,
                     "terminal_at": now.isoformat(),
                 },
-                adapter_id="alice-brain-hermes-identity-v1",
+                adapter_id=_IDENTITY_ADAPTER_ID,
             )
             deliberated = new_event(
                 "c1.deliberated",
@@ -2488,14 +2527,14 @@ class SQLiteLedger:
                 actor_id,
                 {
                     "schema_version": 1,
-                    "purpose": "identity_self_naming",
+                    "purpose": _IDENTITY_PURPOSE,
                     "lease_id": lease_id,
                     "name": choice.name,
                     "reason": choice.reason,
                     "source_event_id": completed.event_id,
                     "terminal_at": now.isoformat(),
                 },
-                adapter_id="alice-brain-hermes-identity-v1",
+                adapter_id=_IDENTITY_ADAPTER_ID,
             )
             named = new_event(
                 "identity.named",
@@ -2503,14 +2542,14 @@ class SQLiteLedger:
                 actor_id,
                 {
                     "schema_version": 1,
-                    "purpose": "identity_self_naming",
+                    "purpose": _IDENTITY_PURPOSE,
                     "lease_id": lease_id,
                     "name": choice.name,
                     "reason": choice.reason,
                     "source_event_id": deliberated.event_id,
                     "terminal_at": now.isoformat(),
                 },
-                adapter_id="alice-brain-hermes-identity-v1",
+                adapter_id=_IDENTITY_ADAPTER_ID,
             )
             events, successor = self._insert_identity_event_batch_in_transaction(
                 expected_state,
@@ -2562,6 +2601,7 @@ class SQLiteLedger:
             status = self._identity_status_from_row(self._identity_lease_row(lease_id))
             if status.brain_id != expected_state.brain_id:
                 raise ValueError("identity naming lease changed brain identity")
+            self._require_identity_head_in_transaction(expected_state)
             if status.status == "failed":
                 if status.failure_code != failure_code or status.choice is not None:
                     raise IdempotencyConflictError(
@@ -2570,11 +2610,13 @@ class SQLiteLedger:
                 return IdentityNamingTerminalResult("failed", None)
             if status.status in {"completed", "superseded"}:
                 return IdentityNamingTerminalResult("superseded", None)
-            self._require_identity_head_in_transaction(expected_state)
+            if now < status.requested_at:
+                raise ValueError("identity naming terminal time predates its request")
             if now >= status.expires_at:
                 self._supersede_pending_identity_lease(
                     lease_id,
                     now=now,
+                    requested_at=status.requested_at,
                     reason="expired",
                 )
                 return IdentityNamingTerminalResult("superseded", None)
@@ -2582,6 +2624,7 @@ class SQLiteLedger:
                 self._supersede_pending_identity_lease(
                     lease_id,
                     now=now,
+                    requested_at=status.requested_at,
                     reason="identity_already_named",
                 )
                 return IdentityNamingTerminalResult("superseded", None)
@@ -2591,12 +2634,12 @@ class SQLiteLedger:
                 actor_id,
                 {
                     "schema_version": 1,
-                    "purpose": "identity_self_naming",
+                    "purpose": _IDENTITY_PURPOSE,
                     "lease_id": lease_id,
                     "failure_code": failure_code,
                     "terminal_at": now.isoformat(),
                 },
-                adapter_id="alice-brain-hermes-identity-v1",
+                adapter_id=_IDENTITY_ADAPTER_ID,
             )
             events, successor = self._insert_identity_event_batch_in_transaction(
                 expected_state,

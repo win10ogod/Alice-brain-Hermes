@@ -992,6 +992,7 @@ def test_identity_naming_rpc_is_lease_bound_causal_and_idempotent(service) -> No
     assert completed["result"] == {"status": "completed"}
     assert exact_retry["result"] == {"status": "completed"}
     assert conflict["error"]["code"] == "idempotency_conflict"
+    assert conflict["error"]["message"] == "idempotency key conflicts"
     state = service.runtime.ledger.replay(brain["brain_id"])
     assert state.identity.name == "Mira"
     assert [

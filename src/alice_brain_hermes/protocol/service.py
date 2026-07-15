@@ -347,7 +347,7 @@ class ProtocolConnection:
             return self._error(
                 request_id,
                 "idempotency_conflict",
-                "bridge idempotency key conflicts",
+                "idempotency key conflicts",
             )
         except CaptureGapRequiredError:
             return self._error(

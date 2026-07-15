@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 from alice_brain_hermes.core.events import EventEnvelope, new_event
-from alice_brain_hermes.errors import IdempotencyConflictError, SchemaVersionError
+from alice_brain_hermes.errors import (
+    EventConflictError,
+    IdempotencyConflictError,
+    SchemaVersionError,
+)
 from alice_brain_hermes.ids import new_id
 from alice_brain_hermes.protocol.identity import IdentityChoiceV1
 from alice_brain_hermes.runtime.engine import ConsciousEngine
@@ -371,3 +375,326 @@ def test_restart_rejects_regenerated_broken_identity_causal_chain(
 
     with pytest.raises(SchemaVersionError, match="identity"):
         SQLiteLedger.open(database)
+
+
+@pytest.mark.parametrize("terminal", ["complete", "fail"])
+def test_pending_terminal_rejects_time_before_request_without_mutation(
+    tmp_path: Path,
+    terminal: str,
+) -> None:
+    database = tmp_path / f"identity-{terminal}.db"
+    with SQLiteLedger.open(database) as ledger:
+        engine = _engine(ledger)
+        lease = engine.claim_identity_naming(now=NOW)
+        assert lease is not None
+        before_state = engine.state
+        before_events = ledger.list_events(engine.brain_id)
+
+        with pytest.raises(ValueError, match="predates"):
+            if terminal == "complete":
+                engine.complete_identity_naming(
+                    lease.lease_id,
+                    _choice(),
+                    now=NOW - timedelta(microseconds=1),
+                )
+            else:
+                engine.fail_identity_naming(
+                    lease.lease_id,
+                    "llm_error.TimeoutError",
+                    now=NOW - timedelta(microseconds=1),
+                )
+
+        assert engine.state == before_state
+        assert ledger.list_events(engine.brain_id) == before_events
+        assert ledger.identity_naming_status(lease.lease_id).status == "pending"
+
+    with SQLiteLedger.open(database) as restarted:
+        assert restarted.replay(lease.brain_id) == before_state
+        assert restarted.identity_naming_status(lease.lease_id).status == "pending"
+
+
+@pytest.mark.parametrize("terminal", ["complete", "fail"])
+def test_pre_request_time_cannot_supersede_a_named_pending_lease(
+    tmp_path: Path,
+    terminal: str,
+) -> None:
+    database = tmp_path / f"identity-named-{terminal}.db"
+    with SQLiteLedger.open(database) as ledger:
+        engine = _engine(ledger)
+        lease = engine.claim_identity_naming(now=NOW)
+        assert lease is not None
+        engine.append(
+            new_event(
+                "identity.named",
+                engine.brain_id,
+                engine.brain_id,
+                {"name": "Externally named"},
+            )
+        )
+        before_state = engine.state
+        before_events = ledger.list_events(engine.brain_id)
+
+        with pytest.raises(ValueError, match="predates"):
+            if terminal == "complete":
+                engine.complete_identity_naming(
+                    lease.lease_id,
+                    _choice(),
+                    now=NOW - timedelta(microseconds=1),
+                )
+            else:
+                engine.fail_identity_naming(
+                    lease.lease_id,
+                    "llm_error.TimeoutError",
+                    now=NOW - timedelta(microseconds=1),
+                )
+
+        assert engine.state == before_state
+        assert ledger.list_events(engine.brain_id) == before_events
+        assert ledger.identity_naming_status(lease.lease_id).status == "pending"
+
+    with SQLiteLedger.open(database) as restarted:
+        assert restarted.replay(lease.brain_id) == before_state
+        assert restarted.identity_naming_status(lease.lease_id).status == "pending"
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed", "superseded"])
+def test_terminal_retry_rejects_a_stale_engine(
+    tmp_path: Path,
+    terminal: str,
+) -> None:
+    with SQLiteLedger.open(tmp_path / f"identity-stale-{terminal}.db") as ledger:
+        writer = _engine(ledger)
+        lease = writer.claim_identity_naming(now=NOW)
+        assert lease is not None
+        stale = ConsciousEngine(
+            ledger,
+            writer.brain_id,
+            actor_id=writer.brain_id,
+        )
+        if terminal == "completed":
+            assert (
+                writer.complete_identity_naming(
+                    lease.lease_id,
+                    _choice(),
+                    now=NOW + timedelta(seconds=1),
+                )
+                == "completed"
+            )
+            retry = lambda: stale.complete_identity_naming(  # noqa: E731
+                lease.lease_id,
+                _choice(),
+                now=NOW + timedelta(seconds=2),
+            )
+        elif terminal == "failed":
+            assert (
+                writer.fail_identity_naming(
+                    lease.lease_id,
+                    "llm_error.TimeoutError",
+                    now=NOW + timedelta(seconds=1),
+                )
+                == "failed"
+            )
+            retry = lambda: stale.fail_identity_naming(  # noqa: E731
+                lease.lease_id,
+                "llm_error.TimeoutError",
+                now=NOW + timedelta(seconds=2),
+            )
+        else:
+            assert (
+                writer.complete_identity_naming(
+                    lease.lease_id,
+                    _choice(),
+                    now=lease.expires_at,
+                )
+                == "superseded"
+            )
+            writer.pulse(0.25)
+            retry = lambda: stale.complete_identity_naming(  # noqa: E731
+                lease.lease_id,
+                _choice(),
+                now=lease.expires_at + timedelta(seconds=1),
+            )
+
+        stale_state = stale.state
+        with pytest.raises(EventConflictError, match="divergence"):
+            retry()
+        assert stale.state == stale_state
+        assert stale.is_stale is True
+
+
+def test_restart_rejects_identity_events_orphaned_by_deleted_lease(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "identity-orphan.db"
+    with SQLiteLedger.open(database) as ledger:
+        engine = _engine(ledger)
+        lease = engine.claim_identity_naming(now=NOW)
+        assert lease is not None
+        assert (
+            engine.complete_identity_naming(
+                lease.lease_id,
+                _choice(),
+                now=NOW + timedelta(seconds=1),
+            )
+            == "completed"
+        )
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "DELETE FROM identity_naming_lease WHERE lease_id = ?",
+            (lease.lease_id,),
+        )
+
+    with pytest.raises(SchemaVersionError, match="identity"):
+        SQLiteLedger.open(database)
+
+
+def test_restart_rejects_stray_reserved_identity_evidence(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "identity-stray.db"
+    with SQLiteLedger.open(database) as ledger:
+        engine = _engine(ledger)
+        lease = engine.claim_identity_naming(now=NOW)
+        assert lease is not None
+        ledger.append(
+            new_event(
+                "cognition.failed",
+                engine.brain_id,
+                engine.brain_id,
+                {
+                    "schema_version": 1,
+                    "purpose": "identity_self_naming",
+                    "lease_id": lease.lease_id,
+                    "failure_code": "llm_error.StrayError",
+                    "terminal_at": (NOW + timedelta(seconds=1)).isoformat(),
+                },
+                adapter_id="alice-brain-hermes-identity-v1",
+            )
+        )
+
+    with pytest.raises(SchemaVersionError, match="identity"):
+        SQLiteLedger.open(database)
+
+
+def test_restart_rejects_identity_causal_evidence_crossed_between_leases(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "identity-crossed-leases.db"
+    with SQLiteLedger.open(database) as ledger:
+        engine = _engine(ledger)
+        first = engine.claim_identity_naming(now=NOW)
+        assert first is not None
+        assert (
+            engine.fail_identity_naming(
+                first.lease_id,
+                "llm_error.TimeoutError",
+                now=NOW + timedelta(seconds=1),
+            )
+            == "failed"
+        )
+        second = engine.claim_identity_naming(now=NOW + timedelta(seconds=2))
+        assert second is not None
+        assert (
+            engine.complete_identity_naming(
+                second.lease_id,
+                _choice(),
+                now=NOW + timedelta(seconds=3),
+            )
+            == "completed"
+        )
+        crossed_sequence = engine.state.last_sequence - 1
+
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT envelope_json FROM events WHERE brain_id = ? AND sequence = ?",
+            (engine.brain_id, crossed_sequence),
+        ).fetchone()
+        event = EventEnvelope.model_validate_json(row[0])
+        crossed = event.model_copy(
+            update={"payload": {**event.payload, "lease_id": first.lease_id}}
+        ).revalidated()
+        connection.execute(
+            "UPDATE events SET body_fingerprint = ?, envelope_fingerprint = ?, "
+            "envelope_json = ? WHERE brain_id = ? AND sequence = ?",
+            (
+                crossed.body_fingerprint(),
+                crossed.envelope_fingerprint(),
+                crossed.canonical_json(),
+                engine.brain_id,
+                crossed_sequence,
+            ),
+        )
+
+    with pytest.raises(SchemaVersionError, match="identity"):
+        SQLiteLedger.open(database)
+
+
+@pytest.mark.parametrize(
+    ("event_type", "purpose", "adapter_id"),
+    [
+        ("cognition.completed", "ordinary_cognition", "alice-brain-hermes-identity-v1"),
+        ("cognition.requested", "identity_self_naming", "ordinary-cognition-v1"),
+        (
+            "identity.unknown_evidence",
+            "ordinary_cognition",
+            "alice-brain-hermes-identity-v1",
+        ),
+    ],
+)
+def test_restart_rejects_half_reserved_or_unknown_identity_evidence(
+    tmp_path: Path,
+    event_type: str,
+    purpose: str,
+    adapter_id: str,
+) -> None:
+    database = tmp_path / f"identity-half-reserved-{event_type}.db"
+    with SQLiteLedger.open(database) as ledger:
+        engine = _engine(ledger)
+        ledger.append(
+            new_event(
+                event_type,
+                engine.brain_id,
+                engine.brain_id,
+                {"purpose": purpose, "evidence": "unbound"},
+                adapter_id=adapter_id,
+            )
+        )
+
+    with pytest.raises(SchemaVersionError, match="identity"):
+        SQLiteLedger.open(database)
+
+
+def test_restart_ignores_nonreserved_cognition_evidence(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "identity-general-cognition.db"
+    with SQLiteLedger.open(database) as ledger:
+        engine = _engine(ledger)
+        ledger.append(
+            new_event(
+                "cognition.requested",
+                engine.brain_id,
+                engine.brain_id,
+                {
+                    "purpose": "ordinary_cognition",
+                    "request": "ordinary adapter evidence",
+                },
+                adapter_id="ordinary-cognition-v1",
+            )
+        )
+        ledger.append(
+            new_event(
+                "cognition.completed",
+                engine.brain_id,
+                engine.brain_id,
+                {
+                    "purpose": "ordinary_cognition",
+                    "result": "ordinary evidence from another adapter",
+                },
+                adapter_id="another-cognition-v1",
+            )
+        )
+
+    with SQLiteLedger.open(database) as restarted:
+        assert restarted.replay(engine.brain_id).last_sequence == 3
