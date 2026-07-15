@@ -45,6 +45,7 @@ _BOOTSTRAP_MAX_DEPTH = 6
 _BOOTSTRAP_MAX_NODES = 1_024
 _BOOTSTRAP_MAX_ITEMS = 64
 _BOOTSTRAP_MAX_STRING_BYTES = 16_384
+_EMPTY_BOOTSTRAP_COPY_STATS: MappingProxyType[str, int] = MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,7 @@ class _DispatchReservation:
 
     buffer: _BootstrapCaptureBuffer
     capture_seq: int
+    fallback_gap: _BootstrapCapture
 
 
 @dataclass(slots=True)
@@ -248,11 +250,36 @@ class _BootstrapCaptureBuffer:
         self._start_worker_on_capture = start_worker_on_capture
         self._health = _BootstrapHealth()
         self._handed_off_dropped_events = 0
+        self._health_reconciliation_required = False
         self._context: str | None = None
 
     @property
     def health(self) -> _BootstrapHealth:
-        return self._health
+        with self._capture_lock:
+            health = self._health
+            if not self._health_reconciliation_required:
+                return health
+            pending_gap_ranges, pending_dropped_events = (
+                self._pending_gap_metrics_locked()
+            )
+            return _BootstrapHealth(
+                trace_complete=False,
+                dropped_events=(
+                    self._handed_off_dropped_events + pending_dropped_events
+                ),
+                pending_records=health.pending_records,
+                pending_gap_ranges=pending_gap_ranges,
+                worker_started=health.worker_started,
+                degraded=True,
+                last_error=health.last_error or "health_reconciliation_required",
+                worker_error=health.worker_error,
+                registration_attempts=health.registration_attempts,
+                registration_failures=health.registration_failures,
+                registration_complete=health.registration_complete,
+                registered_hook_count=health.registered_hook_count,
+                missing_hooks=health.missing_hooks,
+                registration_error=health.registration_error,
+            )
 
     def read_context(self) -> str | None:
         return self._context
@@ -269,6 +296,7 @@ class _BootstrapCaptureBuffer:
                     self._record_gap_locked(
                         capture_seq,
                         "invalid_source_schema",
+                        fallback_gap=reservation.fallback_gap,
                     )
                 else:
                     stats = _BootstrapCopyStats()
@@ -296,11 +324,23 @@ class _BootstrapCaptureBuffer:
                     try:
                         self._queue.put_nowait(capture)
                     except queue.Full:
-                        self._record_gap_locked(capture_seq, "queue_full")
+                        self._record_gap_locked(
+                            capture_seq,
+                            "queue_full",
+                            fallback_gap=reservation.fallback_gap,
+                        )
                     except BaseException:
-                        self._record_gap_locked(capture_seq, "callback_internal")
+                        self._record_gap_locked(
+                            capture_seq,
+                            "callback_internal",
+                            fallback_gap=reservation.fallback_gap,
+                        )
             except BaseException:
-                self._record_gap_locked(capture_seq, "callback_internal")
+                self._record_gap_locked(
+                    capture_seq,
+                    "callback_internal",
+                    fallback_gap=reservation.fallback_gap,
+                )
         self._defer_or_notify_worker()
 
     def _reserve_locked(self) -> _DispatchReservation:
@@ -308,15 +348,17 @@ class _BootstrapCaptureBuffer:
         if attempt is not None and attempt.reservation is not None:
             raise RuntimeError("one Hermes callback may reserve only one capture")
         capture_seq = self._next_capture_seq
+        fallback_gap = self._new_gap(capture_seq, "callback_internal")
+        reservation = _DispatchReservation(self, capture_seq, fallback_gap)
         updated_health = replace(
             self._health,
             pending_records=self._health.pending_records + 1,
         )
-        self._next_capture_seq = capture_seq + 1
-        self._health = updated_health
-        reservation = _DispatchReservation(self, capture_seq)
         if attempt is not None:
             attempt.reservation = reservation
+        self._next_capture_seq = capture_seq + 1
+        self._health = updated_health
+        if attempt is not None:
             attempt.notify_buffer = self
         return reservation
 
@@ -335,6 +377,7 @@ class _BootstrapCaptureBuffer:
                 self._record_gap_locked(
                     reservation.capture_seq,
                     "callback_internal",
+                    fallback_gap=reservation.fallback_gap,
                 )
         except BaseException as error:
             self.mark_worker_degraded(error)
@@ -425,15 +468,31 @@ class _BootstrapCaptureBuffer:
         self._overflow.append(gap)
         return 1
 
-    def _record_gap_locked(self, capture_seq: int, cause: str) -> None:
-        gap = _BootstrapCapture(
+    @staticmethod
+    def _new_gap(capture_seq: int, cause: str) -> _BootstrapCapture:
+        return _BootstrapCapture(
             capture_seq=capture_seq,
             last_capture_seq=capture_seq,
             hook=None,
             detached_kwargs=None,
-            copy_stats=MappingProxyType({}),
+            copy_stats=_EMPTY_BOOTSTRAP_COPY_STATS,
             gap_cause_counts=MappingProxyType({cause: 1}),
         )
+
+    def _record_gap_locked(
+        self,
+        capture_seq: int,
+        cause: str,
+        *,
+        fallback_gap: _BootstrapCapture | None = None,
+    ) -> None:
+        try:
+            gap = self._new_gap(capture_seq, cause)
+        except BaseException:
+            if fallback_gap is None or fallback_gap.capture_seq != capture_seq:
+                raise
+            gap = fallback_gap
+        self._health_reconciliation_required = True
         pending_state = self._replace_pending_with_gap_locked(gap)
         if pending_state == "missing":
             self._retain_new_gap_locked(gap)
@@ -470,6 +529,7 @@ class _BootstrapCaptureBuffer:
             dropped_events=dropped_events,
             pending_gap_ranges=pending_gap_ranges,
         )
+        self._health_reconciliation_required = False
 
     def _notify_worker(self) -> None:
         try:
@@ -547,6 +607,7 @@ class _BootstrapCaptureBuffer:
             self._handed_off_dropped_events = handed_off_dropped_events
             self._worker_retained = None
             self._health = updated_health
+            self._health_reconciliation_required = False
 
     def mark_worker_degraded(self, error: BaseException) -> None:
         error_name = type(error).__name__[:160]

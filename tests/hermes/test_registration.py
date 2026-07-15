@@ -586,6 +586,326 @@ def test_bootstrap_shape_failure_reserves_exact_callback_internal_gap(
 
 
 @pytest.mark.parametrize(
+    "failure_type",
+    [RuntimeError, KeyboardInterrupt, MemoryError],
+    ids=["exception", "keyboard-interrupt", "memory-error"],
+)
+def test_reservation_constructor_failure_retries_the_original_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    original_reservation = registration._DispatchReservation  # type: ignore[attr-defined]
+    calls = 0
+
+    def fail_once(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise failure_type("reservation construction failed")
+        return original_reservation(*args, **kwargs)
+
+    monkeypatch.setattr(registration, "_DispatchReservation", fail_once)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    (retained,) = bootstrap.pending_for_test()
+    assert calls == 2
+    assert (retained.capture_seq, retained.last_capture_seq) == (1, 1)
+    assert retained.gap_cause == "callback_internal"
+    assert bootstrap._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.pending_records == 1
+    assert bootstrap.health.pending_gap_ranges == 1
+
+
+@pytest.mark.parametrize(
+    "failure_type",
+    [RuntimeError, KeyboardInterrupt, MemoryError],
+    ids=["exception", "keyboard-interrupt", "memory-error"],
+)
+def test_persistent_reservation_constructor_failure_publishes_no_false_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+
+    def fail_persistently(*_args: object, **_kwargs: object) -> object:
+        raise failure_type("reservation construction failed")
+
+    monkeypatch.setattr(registration, "_DispatchReservation", fail_persistently)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    assert bootstrap.pending_for_test() == ()
+    assert bootstrap._next_capture_seq == 1  # type: ignore[attr-defined]
+    assert bootstrap.health.pending_records == 0
+    assert bootstrap.health.pending_gap_ranges == 0
+    assert bootstrap.health.dropped_events == 0
+    assert bootstrap.health.degraded is True
+    assert bootstrap.health.last_error == failure_type.__name__
+
+
+@pytest.mark.parametrize("persistent", [False, True], ids=["once", "persistent"])
+def test_reserve_health_construction_failure_never_publishes_a_cursor_early(
+    monkeypatch: pytest.MonkeyPatch,
+    persistent: bool,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    original_replace = registration.replace
+    calls = 0
+
+    def fail_reserve_health(instance: object, **changes: object) -> object:
+        nonlocal calls
+        if set(changes) == {"pending_records"}:
+            calls += 1
+            if persistent or calls == 1:
+                raise MemoryError("reserve health construction failed")
+        return original_replace(instance, **changes)
+
+    monkeypatch.setattr(registration, "replace", fail_reserve_health)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    if persistent:
+        assert bootstrap.pending_for_test() == ()
+        assert bootstrap._next_capture_seq == 1  # type: ignore[attr-defined]
+        assert bootstrap.health.pending_records == 0
+        assert bootstrap.health.degraded is True
+        assert bootstrap.health.last_error == "MemoryError"
+    else:
+        (retained,) = bootstrap.pending_for_test()
+        assert retained.capture_seq == 1
+        assert retained.gap_cause == "callback_internal"
+        assert bootstrap._next_capture_seq == 2  # type: ignore[attr-defined]
+        assert bootstrap.health.pending_records == 1
+
+
+@pytest.mark.parametrize("persistent", [False, True], ids=["once", "persistent"])
+def test_attempt_reservation_assignment_failure_never_publishes_a_cursor_early(
+    monkeypatch: pytest.MonkeyPatch,
+    persistent: bool,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    assignments = 0
+
+    class HostileAttempt:
+        def __init__(self) -> None:
+            self._reservation: object | None = None
+            self.notify_buffer: object | None = None
+
+        @property
+        def reservation(self) -> object | None:
+            return self._reservation
+
+        @reservation.setter
+        def reservation(self, value: object) -> None:
+            nonlocal assignments
+            assignments += 1
+            if persistent or assignments == 1:
+                raise MemoryError("attempt reservation publication failed")
+            self._reservation = value
+
+    monkeypatch.setattr(registration, "_DispatchAttempt", HostileAttempt)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    if persistent:
+        assert bootstrap.pending_for_test() == ()
+        assert bootstrap._next_capture_seq == 1  # type: ignore[attr-defined]
+        assert bootstrap.health.pending_records == 0
+        assert bootstrap.health.degraded is True
+        assert bootstrap.health.last_error == "MemoryError"
+    else:
+        (retained,) = bootstrap.pending_for_test()
+        assert retained.capture_seq == 1
+        assert retained.gap_cause == "callback_internal"
+        assert bootstrap._next_capture_seq == 2  # type: ignore[attr-defined]
+        assert bootstrap.health.pending_records == 1
+
+
+@pytest.mark.parametrize(
+    "constructor_name",
+    ["_BootstrapCapture", "MappingProxyType"],
+    ids=["capture", "mapping-proxy"],
+)
+def test_persistent_fallback_evidence_construction_failure_publishes_no_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    constructor_name: str,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+
+    def fail_persistently(*_args: object, **_kwargs: object) -> object:
+        raise MemoryError("fallback evidence construction failed")
+
+    monkeypatch.setattr(registration, constructor_name, fail_persistently)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="invalid",
+            session_id="session",
+        )
+        is None
+    )
+
+    assert bootstrap.pending_for_test() == ()
+    assert bootstrap._next_capture_seq == 1  # type: ignore[attr-defined]
+    assert bootstrap.health.pending_records == 0
+    assert bootstrap.health.degraded is True
+    assert bootstrap.health.last_error == "MemoryError"
+
+
+@pytest.mark.parametrize(
+    "constructor_name",
+    ["_BootstrapCapture", "MappingProxyType"],
+    ids=["capture", "mapping-proxy"],
+)
+def test_post_reservation_evidence_failure_uses_preconstructed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    constructor_name: str,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    original_constructor = getattr(registration, constructor_name)
+    calls = 0
+
+    def allow_preconstructed_fallback_only(
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise MemoryError("post-reservation evidence construction failed")
+        return original_constructor(*args, **kwargs)
+
+    monkeypatch.setattr(
+        registration,
+        constructor_name,
+        allow_preconstructed_fallback_only,
+    )
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    (retained,) = bootstrap.pending_for_test()
+    assert (retained.capture_seq, retained.last_capture_seq) == (1, 1)
+    assert retained.gap_cause == "callback_internal"
+    assert bootstrap._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert bootstrap.health.trace_complete is False
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.pending_records == 1
+    assert bootstrap.health.pending_gap_ranges == 1
+
+
+def test_persistent_gap_health_failure_exposes_conservative_reconciled_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    original_replace = registration.replace
+
+    def fail_gap_health(instance: object, **changes: object) -> object:
+        if {
+            "trace_complete",
+            "dropped_events",
+            "pending_gap_ranges",
+        } <= changes.keys():
+            raise MemoryError("gap health construction failed")
+        return original_replace(instance, **changes)
+
+    monkeypatch.setattr(registration, "replace", fail_gap_health)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="invalid",
+            session_id="session",
+        )
+        is None
+    )
+
+    (retained,) = bootstrap.pending_for_test()
+    health = bootstrap.health
+    assert retained.capture_seq == 1
+    assert retained.gap_cause == "invalid_source_schema"
+    assert health.trace_complete is False
+    assert health.dropped_events == 1
+    assert health.pending_records == 1
+    assert health.pending_gap_ranges == 1
+    assert health.degraded is True
+    assert health.last_error == "MemoryError"
+
+
+@pytest.mark.parametrize(
     "failure",
     [RuntimeError("copy failed"), KeyboardInterrupt(), MemoryError()],
     ids=["exception", "keyboard-interrupt", "memory-error"],
