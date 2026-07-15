@@ -9,7 +9,6 @@ import os
 import re
 import sqlite3
 import threading
-import unicodedata
 from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -49,8 +48,10 @@ from alice_brain_hermes.ids import new_id, validate_id
 from alice_brain_hermes.protocol.identity import (
     IDENTITY_NAMING_LEASE_SECONDS,
     IdentityChoiceV1,
+    IdentityNameNormalizationError,
     IdentityNamingLeaseStatusV1,
     IdentityNamingLeaseV1,
+    identity_name_normalization_key,
 )
 from alice_brain_hermes.protocol.models import (
     HOOK_EVENT_TYPES,
@@ -305,6 +306,9 @@ CREATE TABLE identity_name_registry (
     FOREIGN KEY (source_event_id) REFERENCES events(event_id)
 ) WITHOUT ROWID;
 
+CREATE UNIQUE INDEX identity_name_normalized
+ON identity_name_registry(normalized_name);
+
 CREATE TABLE identity_naming_lease (
     lease_id TEXT PRIMARY KEY,
     brain_id TEXT NOT NULL,
@@ -342,8 +346,11 @@ CREATE TABLE identity_naming_lease (
          AND terminal_at IS NOT NULL)
         OR
         (status = 'superseded'
-         AND failure_code IS NOT NULL
-         AND terminal_event_id IS NULL
+         AND choice_json IS NULL
+         AND failure_code IN ('expired', 'identity_already_named')
+         AND ((failure_code = 'expired' AND terminal_event_id IS NULL)
+              OR (failure_code = 'identity_already_named'
+                  AND terminal_event_id IS NOT NULL))
          AND terminal_at IS NOT NULL)
     ),
     FOREIGN KEY (brain_id) REFERENCES brains(brain_id),
@@ -685,6 +692,8 @@ class SQLiteLedger:
                         final_states=final_states
                     )
                     self._install_identity_schema(final_states=final_states)
+                except SchemaVersionError:
+                    raise
                 except Exception as error:
                     raise SchemaVersionError(
                         "SQLite v2 to v6 migration failed"
@@ -713,6 +722,8 @@ class SQLiteLedger:
                     self._install_identity_schema(
                         final_states=self._startup_audited_final_states
                     )
+                except SchemaVersionError:
+                    raise
                 except Exception as error:
                     raise SchemaVersionError(
                         f"SQLite v{version} to v6 migration failed"
@@ -738,6 +749,8 @@ class SQLiteLedger:
                     self._install_identity_schema(
                         final_states=self._startup_audited_final_states
                     )
+                except SchemaVersionError:
+                    raise
                 except Exception as error:
                     raise SchemaVersionError(
                         "SQLite v5 to v6 migration failed"
@@ -766,7 +779,7 @@ class SQLiteLedger:
 
     @staticmethod
     def _normalized_identity_name(name: str) -> str:
-        return unicodedata.normalize("NFKC", name).casefold()
+        return identity_name_normalization_key(name)
 
     def _last_identity_name_event_in_transaction(
         self,
@@ -802,17 +815,27 @@ class SQLiteLedger:
                 brain_id,
                 state.identity.name,
             )
-            self._connection.execute(
-                "INSERT INTO identity_name_registry("
-                "brain_id, normalized_name, display_name, source_event_id) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    brain_id,
-                    self._normalized_identity_name(state.identity.name),
-                    state.identity.name,
-                    source.event_id,
-                ),
-            )
+            try:
+                self._connection.execute(
+                    "INSERT INTO identity_name_registry("
+                    "brain_id, normalized_name, display_name, source_event_id) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        brain_id,
+                        self._normalized_identity_name(state.identity.name),
+                        state.identity.name,
+                        source.event_id,
+                    ),
+                )
+            except IdentityNameNormalizationError as error:
+                raise SchemaVersionError(
+                    "identity name migration violates the stable Unicode 14.0 "
+                    "normalization boundary"
+                ) from error
+            except sqlite3.IntegrityError as error:
+                raise SchemaVersionError(
+                    "identity name migration has a normalized-name collision"
+                ) from error
 
     @staticmethod
     def _identity_timestamp(value: object, *, field: str) -> datetime:
@@ -887,6 +910,7 @@ class SQLiteLedger:
 
     def _validate_identity_rows_in_transaction(
         self,
+        historical_states: Mapping[str, Mapping[int, BrainState]],
         final_states: Mapping[str, BrainState],
     ) -> None:
         registry_rows = self._connection.execute(
@@ -901,6 +925,11 @@ class SQLiteLedger:
         }
         if set(registry) != set(expected_named):
             raise LedgerIntegrityError("identity name registry coverage is invalid")
+        normalized_names = [row["normalized_name"] for row in registry_rows]
+        if len(set(normalized_names)) != len(normalized_names):
+            raise LedgerIntegrityError(
+                "identity name registry normalized names are not unique"
+            )
         for brain_id, name in expected_named.items():
             if name is None:
                 raise AssertionError("named identity unexpectedly became null")
@@ -949,6 +978,13 @@ class SQLiteLedger:
             status = self._identity_status_from_row(row)
             if status.brain_id not in final_states:
                 raise LedgerIntegrityError("identity naming lease brain is missing")
+            predecessor = historical_states.get(status.brain_id, {}).get(
+                status.state_sequence - 1
+            )
+            if predecessor is None or predecessor.identity.name is not None:
+                raise LedgerIntegrityError(
+                    "identity naming request did not follow an unnamed state"
+                )
             request_row = self._connection.execute(
                 "SELECT event_id, brain_id, sequence, body_fingerprint, "
                 "envelope_fingerprint, envelope_json FROM events "
@@ -977,13 +1013,6 @@ class SQLiteLedger:
                     "identity naming request event does not match its lease"
                 )
             cover(request, status.lease_id)
-            if status.status == "superseded" and status.failure_code not in {
-                "expired",
-                "identity_already_named",
-            }:
-                raise LedgerIntegrityError(
-                    "identity naming supersession reason is invalid"
-                )
             if status.status == "failed":
                 failure_code = status.failure_code
                 if failure_code is None:
@@ -1000,6 +1029,45 @@ class SQLiteLedger:
                         "identity naming failure origin is invalid"
                     )
             terminal_id = status.terminal_event_id
+            if status.status == "superseded":
+                if status.failure_code == "expired":
+                    if terminal_id is not None:
+                        raise LedgerIntegrityError(
+                            "expired identity naming lease has a terminal event"
+                        )
+                    continue
+                if terminal_id is None:
+                    raise LedgerIntegrityError(
+                        "named identity supersession lacks its source event"
+                    )
+                source_row = self._connection.execute(
+                    "SELECT event_id, brain_id, sequence, body_fingerprint, "
+                    "envelope_fingerprint, envelope_json FROM events "
+                    "WHERE event_id = ?",
+                    (terminal_id,),
+                ).fetchone()
+                if source_row is None:
+                    raise LedgerIntegrityError(
+                        "named identity supersession source event is missing"
+                    )
+                source = self._decode_event(source_row)
+                source_name = source.payload.get("name")
+                source_state = historical_states.get(status.brain_id, {}).get(
+                    source.sequence or -1
+                )
+                if (
+                    source.brain_id != status.brain_id
+                    or source.sequence is None
+                    or source.sequence <= status.state_sequence
+                    or source.event_type not in {"brain.created", "identity.named"}
+                    or not isinstance(source_name, str)
+                    or source_state is None
+                    or source_state.identity.name != source_name
+                ):
+                    raise LedgerIntegrityError(
+                        "named identity supersession source is invalid"
+                    )
+                continue
             if terminal_id is None:
                 continue
             terminal_row = self._connection.execute(
@@ -1365,7 +1433,15 @@ class SQLiteLedger:
                 ) from error
         if version == SQLITE_SCHEMA_VERSION:
             try:
-                self._validate_identity_rows_in_transaction(final_states)
+                self._validate_identity_rows_in_transaction(
+                    historical_states,
+                    final_states,
+                )
+            except IdentityNameNormalizationError as error:
+                raise SchemaVersionError(
+                    "SQLite v6 identity data violates the stable Unicode 14.0 "
+                    "normalization boundary"
+                ) from error
             except Exception as error:
                 raise SchemaVersionError(
                     f"SQLite v{version} identity data integrity check failed"
@@ -1873,6 +1949,30 @@ class SQLiteLedger:
             ),
         )
 
+    def _current_identity_name_source_in_transaction(
+        self,
+        state: BrainState,
+    ) -> EventEnvelope:
+        name = state.identity.name
+        if name is None:
+            raise LedgerIntegrityError("unnamed identity has no naming source")
+        source = self._last_identity_name_event_in_transaction(state.brain_id, name)
+        row = self._connection.execute(
+            "SELECT normalized_name, display_name, source_event_id "
+            "FROM identity_name_registry WHERE brain_id = ?",
+            (state.brain_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["normalized_name"] != self._normalized_identity_name(name)
+            or row["display_name"] != name
+            or row["source_event_id"] != source.event_id
+        ):
+            raise LedgerIntegrityError(
+                "named identity registry lost its current source event"
+            )
+        return source
+
     def create_brain_foundation(
         self, brain_id: str, *, name: str | None
     ) -> EventEnvelope:
@@ -2340,14 +2440,26 @@ class SQLiteLedger:
             ).fetchone()
             if pending_row is not None:
                 pending = self._identity_status_from_row(pending_row)
-                if pending.expires_at > now:
+                if pending.expires_at > now and expected_state.identity.name is None:
                     return IdentityNamingClaimResult(lease=None, successor=None)
-                self._supersede_pending_identity_lease(
-                    pending.lease_id,
-                    now=now,
-                    requested_at=pending.requested_at,
-                    reason="expired",
-                )
+                if pending.expires_at <= now:
+                    self._supersede_pending_identity_lease(
+                        pending.lease_id,
+                        now=now,
+                        requested_at=pending.requested_at,
+                        reason="expired",
+                    )
+                else:
+                    source = self._current_identity_name_source_in_transaction(
+                        expected_state
+                    )
+                    self._supersede_pending_identity_lease(
+                        pending.lease_id,
+                        now=now,
+                        requested_at=pending.requested_at,
+                        reason="identity_already_named",
+                        terminal_event_id=source.event_id,
+                    )
             if expected_state.identity.name is not None:
                 return IdentityNamingClaimResult(lease=None, successor=None)
             events, successor = self._insert_identity_event_batch_in_transaction(
@@ -2385,14 +2497,24 @@ class SQLiteLedger:
         now: datetime,
         requested_at: datetime,
         reason: str,
+        terminal_event_id: str | None = None,
     ) -> None:
         if now < requested_at:
             raise ValueError("identity naming terminal time predates its request")
+        if reason == "expired":
+            if terminal_event_id is not None:
+                raise ValueError("expired identity lease cannot cite a name event")
+        elif reason == "identity_already_named":
+            if terminal_event_id is None:
+                raise ValueError("named identity lease requires its source event")
+            terminal_event_id = validate_id(terminal_event_id)
+        else:
+            raise ValueError("identity naming supersession reason is invalid")
         updated = self._connection.execute(
             "UPDATE identity_naming_lease SET status = 'superseded', "
-            "failure_code = ?, terminal_at = ? "
+            "failure_code = ?, terminal_event_id = ?, terminal_at = ? "
             "WHERE lease_id = ? AND status = 'pending'",
-            (reason, now.isoformat(), lease_id),
+            (reason, terminal_event_id, now.isoformat(), lease_id),
         )
         if updated.rowcount != 1:
             raise LedgerIntegrityError("identity naming lease supersession was lost")
@@ -2453,11 +2575,15 @@ class SQLiteLedger:
                 )
                 return IdentityNamingTerminalResult("superseded", None)
             if expected_state.identity.name is not None:
+                source = self._current_identity_name_source_in_transaction(
+                    expected_state
+                )
                 self._supersede_pending_identity_lease(
                     lease_id,
                     now=now,
                     requested_at=status.requested_at,
                     reason="identity_already_named",
+                    terminal_event_id=source.event_id,
                 )
                 return IdentityNamingTerminalResult("superseded", None)
 
@@ -2621,11 +2747,15 @@ class SQLiteLedger:
                 )
                 return IdentityNamingTerminalResult("superseded", None)
             if expected_state.identity.name is not None:
+                source = self._current_identity_name_source_in_transaction(
+                    expected_state
+                )
                 self._supersede_pending_identity_lease(
                     lease_id,
                     now=now,
                     requested_at=status.requested_at,
                     reason="identity_already_named",
+                    terminal_event_id=source.event_id,
                 )
                 return IdentityNamingTerminalResult("superseded", None)
             failed = new_event(
@@ -3574,6 +3704,29 @@ class SQLiteLedger:
                 target_sequences[brain_id].add(int(row["ledger_sequence"]))
                 if version == SQLITE_SCHEMA_VERSION:
                     target_sequences[brain_id].add(int(row["predecessor_sequence"]))
+        if version == SQLITE_SCHEMA_VERSION:
+            identity_targets = self._connection.execute(
+                "SELECT lease.brain_id, lease.request_sequence, lease.status, "
+                "lease.failure_code, terminal.sequence AS terminal_sequence "
+                "FROM identity_naming_lease AS lease "
+                "LEFT JOIN events AS terminal "
+                "ON terminal.event_id = lease.terminal_event_id "
+                "ORDER BY lease.brain_id, lease.request_sequence"
+            ).fetchall()
+            for row in identity_targets:
+                brain_id = row["brain_id"]
+                if brain_id not in target_sequences:
+                    raise LedgerIntegrityError(
+                        "identity naming lease references an unknown brain"
+                    )
+                request_sequence = int(row["request_sequence"])
+                target_sequences[brain_id].add(request_sequence - 1)
+                if (
+                    row["status"] == "superseded"
+                    and row["failure_code"] == "identity_already_named"
+                    and row["terminal_sequence"] is not None
+                ):
+                    target_sequences[brain_id].add(int(row["terminal_sequence"]))
 
         historical_states: dict[str, dict[int, BrainState]] = {}
         final_states: dict[str, BrainState] = {}

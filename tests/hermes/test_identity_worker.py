@@ -181,6 +181,7 @@ def test_worker_uses_host_defaults_and_commits_only_exact_structured_choice() ->
         {"name": "", "reason": "why"},
         {"name": "Mira", "reason": ""},
         {"name": "Å", "reason": "not already normalized"},
+        {"name": "\U0001e030", "reason": "outside Unicode 14"},
         {"name": "Mi\x00ra", "reason": "contains a control"},
         {"name": "Mira\ufdd0", "reason": "contains a noncharacter"},
         {"name": "😀" * 129, "reason": "exceeds the UTF-8 byte bound"},
