@@ -78,6 +78,13 @@ events; a pending observation adds one terminal drop. Bootstrap health exposes
 `trace_complete=false`, the exact `late_after_close` count, no pending record,
 and the terminal error.
 
+The stored receipt disposition is authoritative for retry accounting;
+`close_sealed` only suppresses child restart. If a reservation was accepted
+normally, bootstrap publication failed, and the child clean-sealed before the
+exact retry, the duplicate still returns `accepted` and bootstrap completes
+the normal `mark_handed_off()` path. It is never reclassified as late merely
+because the child is terminal at retry time.
+
 ## Verification
 
 Adversarial tests cover:
@@ -91,7 +98,8 @@ Adversarial tests cover:
 - bootstrap outer/child cleanup and missing/non-callable child stop;
 - a normal child stop followed by an unknown strict liveness probe;
 - terminal observation and gap disposition, retry idempotency, exact capture
-  sequence, no normal handoff, and no commit/ACK.
+  sequence, no normal handoff or commit/ACK for late receipts, and normal
+  handoff for a stored accepted receipt retried after the child seals.
 
 The two Hermes test files, race-prone tests in repeated fresh processes, the
 full suite, Ruff lint/format, compile checks, and `git diff --check` form the

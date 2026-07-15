@@ -129,8 +129,8 @@ Add these tests:
 
 Dual-signal tests make both stop-event and wake-event `set` fail persistently.
 Unknown probes raise `MemoryError` after bounded join. Tests assert degraded
-health, retained identity on failure, no second thread construction, and no
-live outer/child after a successful stop return.
+health, retained owner identity on failure, no second thread construction, and
+no live outer/child after a successful stop return.
 
 - [ ] **Step 2: Run the focused tests and verify RED**
 
@@ -207,6 +207,7 @@ Add these tests:
 - `test_terminal_capture_duplicate_returns_same_late_disposition`
 - `test_bootstrap_terminal_observation_is_accounted_without_handoff_or_ack`
 - `test_bootstrap_terminal_retry_is_idempotent_after_publication_failure`
+- `test_bootstrap_accepted_duplicate_hands_off_after_child_seals`
 - `test_bootstrap_terminal_gap_moves_drop_without_double_counting`
 
 Use a real clean-sealed HookBridge. Assert no `start_worker`, reconnect,
@@ -217,9 +218,11 @@ keeps the same total drop while moving out of pending.
 
 - [ ] **Step 2: Run the focused tests and verify RED**
 
-Run the four node IDs. Expected: failures show `capture_reserved` returning
+Run the five node IDs. Expected: failures show `capture_reserved` returning
 `None`, bootstrap repeatedly trying to restart the terminal child, and the
-reservation remaining pending.
+reservation remaining pending. The crossing-seal regression additionally
+shows an accepted receipt remaining pending when terminal state incorrectly
+overrides its stored disposition.
 
 - [ ] **Step 3: Bind disposition to the exact receipt**
 
@@ -240,8 +243,10 @@ the terminal error, then clears retained state atomically.
 In `_bootstrap_worker_main`, do not restart a child whose `close_sealed` is
 true. Process its next reservation and branch on the returned disposition:
 `late_after_close` calls only `mark_late_after_close`; `accepted` calls only
-`mark_handed_off`. A terminal-before-call child returning any other disposition
-is an error and remains pending.
+`mark_handed_off`. The receipt disposition is authoritative even if the child
+seal changed between initial acceptance and an exact retry; `close_sealed`
+only controls whether restart is attempted. A value outside the two contract
+dispositions is an error and remains pending.
 
 - [ ] **Step 5: Run focused and all terminal/capture tests**
 
@@ -253,7 +258,8 @@ uv run pytest -q tests/hermes/test_registration.py -k 'terminal or handoff or ca
 ```
 
 Expected: PASS with one terminal receipt, zero commit/ACK, exact late/drop
-health, and prior normal handoff behavior unchanged.
+health, and an accepted receipt retaining normal handoff semantics across a
+later child seal.
 
 - [ ] **Step 6: Commit Task 3**
 
