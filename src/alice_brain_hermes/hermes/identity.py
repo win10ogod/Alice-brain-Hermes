@@ -346,8 +346,12 @@ class IdentityNamingWorker:
         """Start one daemon thread without coupling it to bridge delivery."""
 
         with self._lifecycle_lock:
-            if self._thread is not None and self._thread.is_alive():
-                return
+            owner = self._thread
+            if owner is not None:
+                if owner.is_alive():
+                    return
+                if self._thread is owner:
+                    self._thread = None
             self._stop_requested = False
             self._stop.clear()
             thread = threading.Thread(
@@ -356,7 +360,21 @@ class IdentityNamingWorker:
                 daemon=True,
             )
             self._thread = thread
-            thread.start()
+            try:
+                thread.start()
+            except BaseException:
+                # Thread.start() may fail either before launch or after the new
+                # worker has become live. Clear only a definitely dead object;
+                # an alive or unprobeable owner must remain authoritative so a
+                # retry cannot create a second worker.
+                try:
+                    owner_is_alive = thread.is_alive()
+                except BaseException:
+                    pass
+                else:
+                    if not owner_is_alive and self._thread is thread:
+                        self._thread = None
+                raise
 
     def stop_for_test(self, *, timeout: float = 5.0) -> None:
         """Stop and join the owned thread; production wiring owns final shutdown."""

@@ -525,6 +525,79 @@ def test_ambiguous_worker_started_probe_retains_owner_and_blocks_second_start() 
     assert worker._thread is owner
 
 
+def test_prelaunch_thread_start_failure_clears_known_dead_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StartBeforeLaunchFailure(BaseException):
+        pass
+
+    class NeverStartedThread:
+        join_calls = 0
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            raise StartBeforeLaunchFailure()
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, _timeout: float) -> None:
+            type(self).join_calls += 1
+
+    monkeypatch.setattr(threading, "Thread", NeverStartedThread)
+    worker = IdentityNamingWorker(
+        mode=IdentityLlmMode.NAME_WHEN_UNNAMED,
+        lease_port=LeasePort(None),
+        llm_factory=lambda: object(),
+    )
+
+    with pytest.raises(StartBeforeLaunchFailure):
+        worker.start()
+
+    assert worker._thread is None
+    assert worker.worker_started is False
+    worker.stop_for_test()
+    assert NeverStartedThread.join_calls == 0
+
+
+def test_postlaunch_thread_start_failure_retains_live_owner_and_blocks_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StartAfterLaunchFailure(BaseException):
+        pass
+
+    class LiveThread:
+        instances = 0
+
+        def __init__(self, **_kwargs: object) -> None:
+            type(self).instances += 1
+
+        def start(self) -> None:
+            raise StartAfterLaunchFailure()
+
+        def is_alive(self) -> bool:
+            return True
+
+    monkeypatch.setattr(threading, "Thread", LiveThread)
+    worker = IdentityNamingWorker(
+        mode=IdentityLlmMode.NAME_WHEN_UNNAMED,
+        lease_port=LeasePort(None),
+        llm_factory=lambda: object(),
+    )
+
+    with pytest.raises(StartAfterLaunchFailure):
+        worker.start()
+    owner = worker._thread
+
+    assert owner is not None
+    assert worker.worker_started is True
+    worker.start()
+    assert worker._thread is owner
+    assert LiveThread.instances == 1
+
+
 @pytest.mark.parametrize("failure_stage", ["join", "post_join_probe"])
 def test_stop_probe_failure_retains_owner_and_prevents_a_second_worker(
     failure_stage: str,
