@@ -24,3 +24,7 @@ uv run pytest
 ```
 
 Python 3.11 through 3.13 is supported.
+
+## License
+
+Alice-brain-Hermes is released under the [MIT License](LICENSE).
