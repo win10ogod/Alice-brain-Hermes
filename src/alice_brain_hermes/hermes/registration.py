@@ -246,6 +246,7 @@ class _BootstrapCaptureBuffer:
         self._queue: queue.Queue[_BootstrapCapture] = queue.Queue(queue_capacity)
         self._overflow: deque[_BootstrapCapture] = deque()
         self._capture_lock = threading.RLock()
+        self._worker_lifecycle_lock = threading.Lock()
         self._worker_lock = threading.Lock()
         self._wake = threading.Event()
         self._next_capture_seq = 1
@@ -596,6 +597,10 @@ class _BootstrapCaptureBuffer:
             self._start_worker()
 
     def _start_worker(self) -> None:
+        with self._worker_lifecycle_lock:
+            self._start_worker_under_lifecycle_lock()
+
+    def _start_worker_under_lifecycle_lock(self) -> None:
         with self._worker_lock:
             existing = self._worker
             if existing is not None:
@@ -844,36 +849,78 @@ class _BootstrapCaptureBuffer:
         if bridge is not None and owned is not bridge:
             raise RuntimeError("bootstrap transport bridge identity changed")
 
-        cleanup_error: BaseException | None = None
-        cleanup_complete = False
         try:
             stop = getattr(owned, "stop_worker_for_test", None)
-            if stop is not None:
-                stop()
-                if owned.worker_started:
-                    raise RuntimeError("bootstrap transport bridge did not stop")
-            cleanup_complete = True
+            if not callable(stop):
+                raise RuntimeError("bootstrap transport bridge has no callable stop")
+            stop()
+            strict_probe = getattr(owned, "_worker_alive_strict", None)
+            if not callable(strict_probe):
+                raise RuntimeError(
+                    "bootstrap transport bridge has no strict liveness probe"
+                )
+            try:
+                alive = strict_probe()
+            except BaseException as error:
+                raise RuntimeError(
+                    "bootstrap transport bridge liveness is unknown"
+                ) from error
+            if alive:
+                raise RuntimeError("bootstrap transport bridge did not stop")
         except BaseException as error:
-            cleanup_error = error
-        if cleanup_complete:
-            with self._worker_lock:
-                if self._transport_bridge is owned:
-                    self._transport_bridge = None
-        if cleanup_error is not None:
-            self.mark_worker_degraded(cleanup_error)
+            self.mark_worker_degraded(error.__cause__ or error)
+            raise
+        with self._worker_lock:
+            if self._transport_bridge is owned:
+                self._transport_bridge = None
 
     def stop_worker_for_test(self) -> None:
-        with self._worker_lock:
-            self._stop_requested = True
-            self._stop_event.set()
-            self._wake.set()
-            worker = self._worker
-        if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=4.0)
-            if worker.is_alive():
-                raise RuntimeError(
-                    "bootstrap worker did not stop within the test bound"
-                )
+        with self._worker_lifecycle_lock:
+            with self._worker_lock:
+                self._stop_requested = True
+                try:
+                    self._stop_event.set()
+                except BaseException as error:
+                    self.mark_worker_degraded(error)
+                try:
+                    self._wake.set()
+                except BaseException as error:
+                    self.mark_worker_degraded(error)
+                worker = self._worker
+            if worker is not None:
+                if worker is threading.current_thread():
+                    error = RuntimeError("bootstrap worker cannot join itself")
+                    self.mark_worker_degraded(error)
+                    raise error
+                try:
+                    worker.join(timeout=4.0)
+                except BaseException as error:
+                    self.mark_worker_degraded(error)
+                try:
+                    alive = worker.is_alive()
+                except BaseException as error:
+                    self.mark_worker_degraded(error)
+                    raise RuntimeError(
+                        "bootstrap worker liveness is unknown"
+                    ) from error
+                if alive:
+                    error = RuntimeError(
+                        "bootstrap worker did not stop within the test bound"
+                    )
+                    self.mark_worker_degraded(error)
+                    raise error
+                with self._worker_lock:
+                    if self._worker is worker:
+                        self._worker = None
+                try:
+                    with self._capture_lock:
+                        self._health = replace(
+                            self._health,
+                            worker_started=False,
+                        )
+                except BaseException as error:
+                    self.mark_worker_degraded(error)
+            self._stop_transport_bridge()
 
     def pending_for_test(self) -> tuple[_BootstrapCapture, ...]:
         with self._capture_lock, self._queue.mutex:

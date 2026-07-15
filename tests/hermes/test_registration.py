@@ -11,6 +11,7 @@ import sys
 import tarfile
 import textwrap
 import threading
+import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -1900,15 +1901,23 @@ def test_bootstrap_start_unknown_after_spawn_retains_owner_and_prevents_duplicat
             return None
 
     class FakeBridge:
-        worker_started = True
         projections = FakeProjections()
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
-            return None
+            self.alive = True
 
-        @staticmethod
-        def start_worker() -> None:
-            return None
+        @property
+        def worker_started(self) -> bool:
+            return self.alive
+
+        def start_worker(self) -> None:
+            self.alive = True
+
+        def stop_worker_for_test(self) -> None:
+            self.alive = False
+
+        def _worker_alive_strict(self) -> bool:
+            return self.alive
 
     monkeypatch.setattr(
         registration.threading,
@@ -1961,15 +1970,23 @@ def test_bootstrap_worker_survives_wait_memoryerror_and_hands_off_exact_capture(
             return None
 
     class FakeBridge:
-        worker_started = True
         projections = FakeProjections()
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
-            return None
+            self.alive = True
 
-        @staticmethod
-        def start_worker() -> None:
-            return None
+        @property
+        def worker_started(self) -> bool:
+            return self.alive
+
+        def start_worker(self) -> None:
+            self.alive = True
+
+        def stop_worker_for_test(self) -> None:
+            self.alive = False
+
+        def _worker_alive_strict(self) -> bool:
+            return self.alive
 
         @staticmethod
         def capture_reserved(**reservation: object) -> None:
@@ -2042,20 +2059,28 @@ def test_bootstrap_worker_survives_persistent_stop_probe_hands_off_once_and_stop
             return None
 
     class FakeBridge:
-        worker_started = True
         projections = FakeProjections()
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
-            return None
+            self.alive = True
 
-        @staticmethod
-        def start_worker() -> None:
-            return None
+        @property
+        def worker_started(self) -> bool:
+            return self.alive
+
+        def start_worker(self) -> None:
+            self.alive = True
 
         @staticmethod
         def capture_reserved(**reservation: object) -> None:
             captures.append(reservation)
             handed_off.set()
+
+        def stop_worker_for_test(self) -> None:
+            self.alive = False
+
+        def _worker_alive_strict(self) -> bool:
+            return self.alive
 
     class PersistentStopProbeFailure:
         def __init__(self, delegate: threading.Event) -> None:
@@ -2126,15 +2151,23 @@ def test_bootstrap_worker_exit_clears_pointer_and_allows_restart(
             return None
 
     class FakeBridge:
-        worker_started = True
         projections = FakeProjections()
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
-            return None
+            self.alive = True
 
-        @staticmethod
-        def start_worker() -> None:
-            return None
+        @property
+        def worker_started(self) -> bool:
+            return self.alive
+
+        def start_worker(self) -> None:
+            self.alive = True
+
+        def stop_worker_for_test(self) -> None:
+            self.alive = False
+
+        def _worker_alive_strict(self) -> bool:
+            return self.alive
 
     bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
         queue_capacity=4,
@@ -2181,21 +2214,30 @@ def test_bootstrap_test_stop_can_restart_and_handoff_exact_capture(
             return None
 
     class FakeBridge:
-        worker_started = True
         projections = FakeProjections()
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.alive = True
             instances.append(self)
             bridge_started.set()
 
-        @staticmethod
-        def start_worker() -> None:
-            return None
+        @property
+        def worker_started(self) -> bool:
+            return self.alive
+
+        def start_worker(self) -> None:
+            self.alive = True
 
         @staticmethod
         def capture_reserved(**reservation: object) -> None:
             captures.append(reservation)
             handed_off.set()
+
+        def stop_worker_for_test(self) -> None:
+            self.alive = False
+
+        def _worker_alive_strict(self) -> bool:
+            return self.alive
 
     bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
         queue_capacity=4,
@@ -2269,15 +2311,23 @@ def test_bootstrap_stop_and_restart_are_serialized_by_the_worker_lock(
             return None
 
     class FakeBridge:
-        worker_started = True
         projections = FakeProjections()
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
-            return None
+            self.alive = True
 
-        @staticmethod
-        def start_worker() -> None:
-            return None
+        @property
+        def worker_started(self) -> bool:
+            return self.alive
+
+        def start_worker(self) -> None:
+            self.alive = True
+
+        def stop_worker_for_test(self) -> None:
+            self.alive = False
+
+        def _worker_alive_strict(self) -> bool:
+            return self.alive
 
     bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
         queue_capacity=4,
@@ -2318,6 +2368,195 @@ def test_bootstrap_stop_and_restart_are_serialized_by_the_worker_lock(
     assert restart_finished.is_set()
 
     bootstrap.stop_worker_for_test()
+
+
+def test_bootstrap_stop_contains_dual_signal_failure_and_stops_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+    from alice_brain_hermes.hermes import registration
+
+    real_bridge = bridge_module.HookBridge
+    child_started = threading.Event()
+    instances: list[Any] = []
+
+    class PersistentSetFailure:
+        def __init__(self, delegate: threading.Event) -> None:
+            self.delegate = delegate
+            self.fault_observed = threading.Event()
+
+        def is_set(self) -> bool:
+            return self.delegate.is_set()
+
+        def set(self) -> None:
+            self.fault_observed.set()
+            raise MemoryError("control signal unavailable")
+
+        def clear(self) -> None:
+            self.delegate.clear()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            return self.delegate.wait(timeout)
+
+    class TrackingBridge(real_bridge):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            kwargs["reconnect_delay_seconds"] = 60
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            instances.append(self)
+
+        def start_worker(self) -> None:
+            super().start_worker()
+            if self.worker_started:
+                child_started.set()
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(bridge_module, "HookBridge", TrackingBridge)
+    monkeypatch.setattr(bridge_module, "default_runtime_home", lambda: tmp_path)
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+    outer = bootstrap._worker  # type: ignore[attr-defined]
+    stop_delegate = bootstrap._stop_event  # type: ignore[attr-defined]
+    wake_delegate = bootstrap._wake  # type: ignore[attr-defined]
+    faulting_stop = PersistentSetFailure(stop_delegate)
+    faulting_wake = PersistentSetFailure(wake_delegate)
+    bootstrap._stop_event = faulting_stop  # type: ignore[attr-defined]
+    bootstrap._wake = faulting_wake  # type: ignore[attr-defined]
+
+    try:
+        assert child_started.wait(2)
+        assert len(instances) == 1
+        started = time.monotonic()
+        bootstrap.stop_worker_for_test()
+        elapsed = time.monotonic() - started
+    finally:
+        bootstrap._stop_event = stop_delegate  # type: ignore[attr-defined]
+        bootstrap._wake = wake_delegate  # type: ignore[attr-defined]
+        if outer is not None and outer.is_alive():
+            bootstrap._stop_requested = True  # type: ignore[attr-defined]
+            stop_delegate.set()
+            wake_delegate.set()
+            outer.join(timeout=2)
+        for instance in instances:
+            with suppress(BaseException):
+                instance.stop_worker_for_test()
+
+    assert elapsed < 1
+    assert faulting_stop.fault_observed.is_set()
+    assert faulting_wake.fault_observed.is_set()
+    assert bootstrap._worker is None  # type: ignore[attr-defined]
+    assert bootstrap._transport_bridge is None  # type: ignore[attr-defined]
+    assert all(instance.worker_started is False for instance in instances)
+    assert bootstrap.health.worker_started is False
+    assert bootstrap.health.degraded is True
+    assert bootstrap.health.last_error == "MemoryError"
+
+
+def test_bootstrap_stop_unknown_outer_liveness_retains_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    join_timeouts: list[float] = []
+    constructions = 0
+
+    class UnknownOwner:
+        @staticmethod
+        def is_alive() -> bool:
+            raise MemoryError("outer liveness unavailable")
+
+        @staticmethod
+        def join(timeout: float) -> None:
+            join_timeouts.append(timeout)
+
+    owner = UnknownOwner()
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    bootstrap._worker = owner  # type: ignore[attr-defined,assignment]
+
+    def unexpected_thread(**_kwargs: object) -> threading.Thread:
+        nonlocal constructions
+        constructions += 1
+        raise AssertionError("unknown outer ownership spawned a duplicate")
+
+    monkeypatch.setattr(registration.threading, "Thread", unexpected_thread)
+
+    with pytest.raises(RuntimeError, match="liveness is unknown"):
+        bootstrap.stop_worker_for_test()
+
+    assert join_timeouts == [4.0]
+    assert bootstrap._worker is owner  # type: ignore[attr-defined]
+    assert bootstrap.health.degraded is True
+    assert bootstrap.health.last_error == "MemoryError"
+
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+
+    assert constructions == 0
+    assert bootstrap._worker is owner  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("stop_attribute", ["missing", "noncallable"])
+def test_bootstrap_stop_retains_child_without_callable_stop(
+    stop_attribute: str,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    class UnstoppableChild:
+        @staticmethod
+        def _worker_alive_strict() -> bool:
+            return False
+
+    child = UnstoppableChild()
+    if stop_attribute == "noncallable":
+        child.stop_worker_for_test = None  # type: ignore[attr-defined]
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    bootstrap._transport_bridge = child  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="callable stop"):
+        bootstrap._stop_transport_bridge()  # type: ignore[attr-defined]
+
+    assert bootstrap._transport_bridge is child  # type: ignore[attr-defined]
+    assert bootstrap.health.degraded is True
+
+
+def test_bootstrap_stop_retains_child_when_strict_post_stop_probe_is_unknown() -> None:
+    from alice_brain_hermes.hermes import registration
+
+    stop_calls = 0
+
+    class ProbeUnknownChild:
+        worker_started = False
+
+        @staticmethod
+        def _worker_alive_strict() -> bool:
+            raise MemoryError("strict child liveness unavailable")
+
+        @staticmethod
+        def stop_worker_for_test() -> None:
+            nonlocal stop_calls
+            stop_calls += 1
+
+    child = ProbeUnknownChild()
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    bootstrap._transport_bridge = child  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="liveness is unknown"):
+        bootstrap._stop_transport_bridge()  # type: ignore[attr-defined]
+
+    assert stop_calls == 1
+    assert bootstrap._transport_bridge is child  # type: ignore[attr-defined]
+    assert bootstrap.health.degraded is True
+    assert bootstrap.health.last_error == "MemoryError"
 
 
 def test_bootstrap_stop_owns_child_bridge_and_restart_never_accumulates_workers(
@@ -2363,14 +2602,16 @@ def test_bootstrap_stop_owns_child_bridge_and_restart_never_accumulates_workers(
         assert len(instances) == 1
         first = instances[0]
         assert first.worker_started is True
-        assert len(
-            [
-                thread
-                for thread in threading.enumerate()
-                if thread.name == "alice-brain-hermes-bridge"
-                and thread.is_alive()
-            ]
-        ) == 1
+        assert (
+            len(
+                [
+                    thread
+                    for thread in threading.enumerate()
+                    if thread.name == "alice-brain-hermes-bridge" and thread.is_alive()
+                ]
+            )
+            == 1
+        )
 
         bootstrap.stop_worker_for_test()
         assert bootstrap._worker is None  # type: ignore[attr-defined]
@@ -2384,14 +2625,16 @@ def test_bootstrap_stop_owns_child_bridge_and_restart_never_accumulates_workers(
         second = instances[1]
         assert second is not first
         assert second.worker_started is True
-        assert len(
-            [
-                thread
-                for thread in threading.enumerate()
-                if thread.name == "alice-brain-hermes-bridge"
-                and thread.is_alive()
-            ]
-        ) == 1
+        assert (
+            len(
+                [
+                    thread
+                    for thread in threading.enumerate()
+                    if thread.name == "alice-brain-hermes-bridge" and thread.is_alive()
+                ]
+            )
+            == 1
+        )
 
         registration.on_session_start(
             telemetry_schema_version="hermes.observer.v1",
@@ -2448,9 +2691,12 @@ def test_bootstrap_child_cleanup_baseexception_still_publishes_outer_exit(
         def stop_worker_for_test(self) -> None:
             nonlocal stop_calls
             stop_calls += 1
-            if stop_calls == 1:
+            if stop_calls <= 2:
                 raise MemoryError("child bridge cleanup failed")
             self.alive = False
+
+        def _worker_alive_strict(self) -> bool:
+            return self.alive
 
     bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
         queue_capacity=4,
@@ -2461,9 +2707,10 @@ def test_bootstrap_child_cleanup_baseexception_still_publishes_outer_exit(
 
     bootstrap._start_worker()  # type: ignore[attr-defined]
     assert child_started.wait(2)
-    bootstrap.stop_worker_for_test()
+    with pytest.raises(MemoryError, match="child bridge cleanup failed"):
+        bootstrap.stop_worker_for_test()
 
-    assert stop_calls == 1
+    assert stop_calls == 2
     assert len(instances) == 1
     assert bootstrap._worker is None  # type: ignore[attr-defined]
     assert bootstrap._transport_bridge is instances[0]  # type: ignore[attr-defined]
@@ -2476,7 +2723,7 @@ def test_bootstrap_child_cleanup_baseexception_still_publishes_outer_exit(
     assert bootstrap.worker_started is True
     bootstrap.stop_worker_for_test()
 
-    assert stop_calls == 2
+    assert stop_calls == 3
     assert len(instances) == 1
     assert instances[0].worker_started is False
     assert bootstrap._worker is None  # type: ignore[attr-defined]
@@ -2528,6 +2775,9 @@ def test_bootstrap_restarts_dead_child_without_duplicate_handoff(
 
         def stop_worker_for_test(self) -> None:
             self.alive = False
+
+        def _worker_alive_strict(self) -> bool:
+            return self.alive
 
     bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
         queue_capacity=4,

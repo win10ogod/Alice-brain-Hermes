@@ -1223,6 +1223,91 @@ def test_worker_stop_and_restart_are_serialized_by_the_worker_lock(
     assert bridge.worker_started is False
 
 
+def test_bridge_stop_contains_dual_signal_failure_during_sixty_second_wait(
+    tmp_path: Path,
+) -> None:
+    bridge = HookBridge(
+        tmp_path,
+        reconnect_delay_seconds=60,
+        start_worker_on_capture=False,
+    )
+    stop_delegate = bridge._stop_event  # type: ignore[attr-defined]
+    wake_delegate = bridge._wake_event  # type: ignore[attr-defined]
+    faulting_stop = _FaultingEvent(stop_delegate, method="set", failures=None)
+    faulting_wake = _FaultingEvent(wake_delegate, method="set", failures=None)
+    bridge._stop_event = faulting_stop  # type: ignore[attr-defined]
+    bridge._wake_event = faulting_wake  # type: ignore[attr-defined]
+    bridge.start_worker()
+    worker = bridge._worker  # type: ignore[attr-defined]
+
+    try:
+        assert worker is not None
+        assert faulting_wake.wait_entered.wait(1)
+        started = time.monotonic()
+        bridge.stop_worker_for_test()
+        elapsed = time.monotonic() - started
+    finally:
+        if worker is not None and worker.is_alive():
+            bridge._stop_event = stop_delegate  # type: ignore[attr-defined]
+            bridge._wake_event = wake_delegate  # type: ignore[attr-defined]
+            bridge._stop_requested = True  # type: ignore[attr-defined]
+            stop_delegate.set()
+            wake_delegate.set()
+            worker.join(timeout=2)
+
+    assert elapsed < 1
+    assert faulting_stop.fault_observed.is_set()
+    assert faulting_wake.fault_observed.is_set()
+    assert bridge._worker is None  # type: ignore[attr-defined]
+    assert bridge.worker_started is False
+    assert bridge.health.worker_started is False
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_error == "MemoryError"
+
+
+def test_bridge_stop_unknown_liveness_retains_owner_and_prevents_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+
+    join_timeouts: list[float] = []
+    constructions = 0
+
+    class UnknownOwner:
+        @staticmethod
+        def is_alive() -> bool:
+            raise MemoryError("worker liveness unavailable")
+
+        @staticmethod
+        def join(timeout: float) -> None:
+            join_timeouts.append(timeout)
+
+    owner = UnknownOwner()
+    bridge = HookBridge(tmp_path, start_worker_on_capture=False)
+    bridge._worker = owner  # type: ignore[attr-defined,assignment]
+
+    def unexpected_thread(**_kwargs: object) -> threading.Thread:
+        nonlocal constructions
+        constructions += 1
+        raise AssertionError("unknown worker ownership spawned a duplicate")
+
+    monkeypatch.setattr(bridge_module.threading, "Thread", unexpected_thread)
+
+    with pytest.raises(RuntimeError, match="liveness is unknown"):
+        bridge.stop_worker_for_test()
+
+    assert join_timeouts == [2.0]
+    assert bridge._worker is owner  # type: ignore[attr-defined]
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_error == "MemoryError"
+
+    bridge.start_worker()
+
+    assert constructions == 0
+    assert bridge._worker is owner  # type: ignore[attr-defined]
+
+
 def test_gap_ack_health_allocation_failure_retains_exact_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

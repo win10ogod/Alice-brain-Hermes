@@ -504,6 +504,7 @@ class HookBridge:
         self._start_worker_on_capture = start_worker_on_capture
         self._capture_lock = threading.Lock()
         self._health_lock = threading.Lock()
+        self._worker_lifecycle_lock = threading.Lock()
         self._worker_lock = threading.Lock()
         self._wake_lock = threading.Lock()
         self._next_capture_seq = 1
@@ -1049,6 +1050,10 @@ class HookBridge:
             return gap
 
     def start_worker(self) -> None:
+        with self._worker_lifecycle_lock:
+            self._start_worker_under_lifecycle_lock()
+
+    def _start_worker_under_lifecycle_lock(self) -> None:
         with self._worker_lock:
             existing = self._worker
             if existing is not None:
@@ -1097,6 +1102,13 @@ class HookBridge:
             except BaseException as error:
                 self._mark_emergency_failure(error)
                 return
+
+    def _worker_alive_strict(self) -> bool:
+        with self._worker_lock:
+            worker = self._worker
+        if worker is None:
+            return False
+        return worker.is_alive()
 
     def _worker_stop_requested(self) -> bool:
         if self._stop_requested:
@@ -1794,15 +1806,50 @@ class HookBridge:
     def stop_worker_for_test(self) -> None:
         """Bounded test cleanup; it does not issue daemon.shutdown or stream close."""
 
-        with self._worker_lock:
-            self._stop_requested = True
-            self._stop_event.set()
-            self._wake_event.set()
-            worker = self._worker
-        if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=2.0)
-            if worker.is_alive():
-                raise RuntimeError("bridge worker did not stop within the test bound")
+        with self._worker_lifecycle_lock:
+            with self._worker_lock:
+                self._stop_requested = True
+                try:
+                    self._stop_event.set()
+                except BaseException as error:
+                    self._mark_emergency_failure(error)
+                try:
+                    with self._wake_lock:
+                        self._wake_requested = True
+                except BaseException as error:
+                    self._mark_emergency_failure(error)
+                try:
+                    self._wake_event.set()
+                except BaseException as error:
+                    self._mark_emergency_failure(error)
+                worker = self._worker
+            if worker is None:
+                return
+            if worker is threading.current_thread():
+                error = RuntimeError("bridge worker cannot join itself")
+                self._mark_emergency_failure(error)
+                raise error
+            try:
+                worker.join(timeout=2.0)
+            except BaseException as error:
+                self._mark_emergency_failure(error)
+            try:
+                alive = worker.is_alive()
+            except BaseException as error:
+                self._mark_emergency_failure(error)
+                raise RuntimeError("bridge worker liveness is unknown") from error
+            if alive:
+                error = RuntimeError("bridge worker did not stop within the test bound")
+                self._mark_emergency_failure(error)
+                raise error
+            with self._worker_lock:
+                if self._worker is worker:
+                    self._worker = None
+            try:
+                with self._health_lock:
+                    self._health = replace(self._health, worker_started=False)
+            except BaseException as error:
+                self._mark_emergency_failure(error)
 
 
 __all__ = [
