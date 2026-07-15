@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict
 from alice_brain_hermes.core.limits import MAX_WORLD_PROPOSITIONS_PER_LAYER
@@ -31,6 +31,89 @@ class ActionPhase(StrEnum):
 class ActionOutcome(StrEnum):
     SUCCESS = "success"
     FAILURE = "failure"
+
+
+class ActionReceiptStatus(StrEnum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+    UNKNOWN = "unknown"
+
+
+class ActionReceiptDisposition(StrEnum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    RESOLUTION = "resolution"
+    CORROBORATION = "corroboration"
+    CONFLICT = "conflict"
+
+
+MAX_ACTION_RECEIPT_HISTORY = 16
+MAX_ACTION_RECONSTRUCTION_HISTORY = 16
+
+
+class ActionReceiptRecord(BaseModel):
+    """One typed execution receipt with its exact attributed source status."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(
+        extra="forbid", frozen=True, strict=True, validate_default=True
+    )
+
+    event_id: str = Field(min_length=1, max_length=512)
+    status: ActionReceiptStatus
+    disposition: ActionReceiptDisposition
+    source_status: str | None = Field(default=None, min_length=1, max_length=160)
+    source_error_type: str | None = Field(default=None, min_length=1, max_length=160)
+    late: bool = False
+    execution_confirmed: bool | None = None
+    outcome: ActionOutcome | None = None
+    effect_observation_ids: tuple[str, ...] = ()
+    payload: FrozenJsonDict
+
+    @field_validator("effect_observation_ids", mode="before")
+    @classmethod
+    def _json_observation_ids(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("effect_observation_ids")
+    @classmethod
+    def _bounded_observation_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if (
+            len(value) > MAX_WORLD_PROPOSITIONS_PER_LAYER
+            or len(value) != len(set(value))
+            or any(not item.strip() for item in value)
+        ):
+            raise ValueError(
+                "receipt effect observation IDs must be unique, non-blank and bounded"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _status_matches_execution_claims(self) -> ActionReceiptRecord:
+        if self.status is ActionReceiptStatus.UNKNOWN:
+            if self.execution_confirmed is not None or self.outcome is not None:
+                raise ValueError("unknown receipt cannot confirm execution or outcome")
+            if self.disposition is not ActionReceiptDisposition.PENDING:
+                raise ValueError("unknown receipt disposition must remain pending")
+            return self
+        if self.execution_confirmed is not True:
+            raise ValueError("confirmed receipt must confirm execution")
+        if self.outcome is not ActionOutcome(self.status.value):
+            raise ValueError("confirmed receipt outcome must match its status")
+        if self.disposition is ActionReceiptDisposition.PENDING:
+            raise ValueError("confirmed receipt disposition cannot remain pending")
+        return self
+
+
+class ActionReconstructionRecord(BaseModel):
+    """One typed RD reconstruction linked to the receipt it interprets."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(
+        extra="forbid", frozen=True, strict=True, validate_default=True
+    )
+
+    event_id: str = Field(min_length=1, max_length=512)
+    after_receipt_event_id: str | None = Field(default=None, max_length=512)
+    payload: FrozenJsonDict
 
 
 class ThoughtBranch(BaseModel):
@@ -85,14 +168,61 @@ class ActionRecord(BaseModel):
     outcome: ActionOutcome | None = None
     effect_confirmed: bool | None = None
     receipt: FrozenJsonDict | None = None
+    receipt_history: tuple[ActionReceiptRecord, ...] = ()
+    receipt_history_evicted: int = Field(default=0, ge=0)
+    receipt_corroboration_count: int = Field(default=0, ge=0)
+    receipt_conflict_count: int = Field(default=0, ge=0)
     reconstruction: FrozenJsonDict | None = None
+    reconstruction_history: tuple[ActionReconstructionRecord, ...] = ()
+    reconstruction_history_evicted: int = Field(default=0, ge=0)
     proposed_event_id: str
     last_event_id: str
 
-    @field_validator("phase_history", mode="before")
+    @field_validator(
+        "phase_history",
+        "receipt_history",
+        "reconstruction_history",
+        mode="before",
+    )
     @classmethod
-    def _json_phase_history(cls, value: object) -> object:
+    def _json_histories(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("receipt_history")
+    @classmethod
+    def _bounded_receipt_history(
+        cls, value: tuple[ActionReceiptRecord, ...]
+    ) -> tuple[ActionReceiptRecord, ...]:
+        if len(value) > MAX_ACTION_RECEIPT_HISTORY:
+            raise ValueError("action receipt history exceeds its fixed bound")
+        return value
+
+    @field_validator("reconstruction_history")
+    @classmethod
+    def _bounded_reconstruction_history(
+        cls, value: tuple[ActionReconstructionRecord, ...]
+    ) -> tuple[ActionReconstructionRecord, ...]:
+        if len(value) > MAX_ACTION_RECONSTRUCTION_HISTORY:
+            raise ValueError("action reconstruction history exceeds its fixed bound")
+        return value
+
+    @model_validator(mode="after")
+    def _execution_claims_match_lifecycle(self) -> ActionRecord:
+        was_blocked = ActionPhase.BLOCKED in self.phase_history
+        was_dispatched = ActionPhase.DISPATCHED in self.phase_history
+        if was_blocked and was_dispatched:
+            raise ValueError("blocked action cannot claim dispatch")
+        if was_blocked and (
+            self.execution_confirmed is not False
+            or self.outcome is not None
+            or self.effect_confirmed is not None
+            or self.receipt is not None
+            or self.receipt_history
+        ):
+            raise ValueError("blocked action cannot claim execution or effect")
+        if self.outcome is not None and self.execution_confirmed is not True:
+            raise ValueError("action outcome requires confirmed execution")
+        return self
 
 
 def action_id_from_event(event: EventEnvelope) -> str:
@@ -139,7 +269,11 @@ def _transition(
         )
     values = {
         "phase": phase,
-        "phase_history": (*action.phase_history, phase),
+        "phase_history": (
+            action.phase_history
+            if phase in action.phase_history
+            else (*action.phase_history, phase)
+        ),
         "rd_phase": rd_phase,
         "last_event_id": event.event_id,
         **(updates or {}),
@@ -207,6 +341,21 @@ def _receipt_grounded_ids(event: EventEnvelope, *, trusted: bool) -> frozenset[s
     return linked_ids if trusted else frozenset()
 
 
+def _receipt_disposition(
+    action: ActionRecord, status: ActionReceiptStatus
+) -> ActionReceiptDisposition:
+    if status is ActionReceiptStatus.UNKNOWN:
+        return ActionReceiptDisposition.PENDING
+    incoming = ActionOutcome(status.value)
+    if action.outcome is None:
+        if action.phase is ActionPhase.DISPATCHED:
+            return ActionReceiptDisposition.CONFIRMED
+        return ActionReceiptDisposition.RESOLUTION
+    if action.outcome is incoming:
+        return ActionReceiptDisposition.CORROBORATION
+    return ActionReceiptDisposition.CONFLICT
+
+
 def reduce_actions(
     actions: tuple[ActionRecord, ...],
     event: EventEnvelope,
@@ -261,27 +410,13 @@ def reduce_actions(
             updates={"prepared_branch_id": branch_id},
         )
     elif event.event_type == "action.blocked":
-        if (
-            event.payload.get("status") != "blocked"
-            or event.payload.get("execution_confirmed") is not False
-            or event.payload.get("outcome") is not None
-            or event.payload.get("effect_confirmed") is not None
-        ):
-            raise DomainInvariantError(
-                "blocked action must explicitly record non-execution only"
-            )
         action = _transition(
             action,
             event,
             required=ActionPhase.PREPARED,
             phase=ActionPhase.BLOCKED,
             rd_phase=RDPhase.PREPARE,
-            updates={
-                "execution_confirmed": False,
-                "outcome": None,
-                "effect_confirmed": None,
-                "receipt": FrozenJsonDict(event.payload),
-            },
+            updates={"execution_confirmed": False},
         )
     elif event.event_type == "action.dispatched":
         action = _transition(
@@ -297,31 +432,120 @@ def reduce_actions(
             raise DomainInvariantError(
                 "receipt status must be success, failure or unknown"
             )
+        receipt_status = ActionReceiptStatus(status)
         execution = True if status in {"success", "failure"} else None
-        outcome = ActionOutcome(status) if execution is True else None
+        incoming_outcome = ActionOutcome(status) if execution is True else None
+        late = event.payload.get("late", False)
+        if not isinstance(late, bool):
+            raise DomainInvariantError("receipt late flag must be a boolean")
+        if action.phase is ActionPhase.DISPATCHED:
+            if late:
+                raise DomainInvariantError("initial receipt cannot be marked late")
+        elif action.phase in {ActionPhase.RECEIPT, ActionPhase.RECONSTRUCTED}:
+            if not late:
+                raise DomainInvariantError("additional receipt must be marked late")
+        else:
+            raise DomainInvariantError("action must be dispatched before receipt")
+        disposition = _receipt_disposition(action, receipt_status)
         grounded_ids = _receipt_grounded_ids(event, trusted=trusted_provenance)
-        action = _transition(
-            action,
-            event,
-            required=ActionPhase.DISPATCHED,
-            phase=ActionPhase.RECEIPT,
-            rd_phase=RDPhase.PREPARE,
-            updates={
-                "execution_confirmed": execution,
-                "outcome": outcome,
-                "effect_confirmed": True if grounded_ids else None,
-                "receipt": FrozenJsonDict(event.payload),
-            },
-        )
+        try:
+            receipt_record = ActionReceiptRecord(
+                event_id=event.event_id,
+                status=receipt_status,
+                disposition=disposition,
+                source_status=event.payload.get("source_status"),
+                source_error_type=event.payload.get("source_error_type"),
+                late=late,
+                execution_confirmed=execution,
+                outcome=incoming_outcome,
+                effect_observation_ids=tuple(sorted(grounded_ids)),
+                payload=event.payload,
+            )
+        except Exception as error:
+            raise DomainInvariantError("invalid action receipt") from error
+        updates = {
+            "execution_confirmed": (
+                True if execution is True else action.execution_confirmed
+            ),
+            "outcome": (incoming_outcome if action.outcome is None else action.outcome),
+            "effect_confirmed": (
+                True
+                if grounded_ids or action.effect_confirmed is True
+                else action.effect_confirmed
+            ),
+            "receipt": FrozenJsonDict(event.payload),
+            "receipt_history": (
+                *action.receipt_history,
+                receipt_record,
+            )[-MAX_ACTION_RECEIPT_HISTORY:],
+            "receipt_history_evicted": (
+                action.receipt_history_evicted
+                + int(len(action.receipt_history) >= MAX_ACTION_RECEIPT_HISTORY)
+            ),
+            "receipt_corroboration_count": (
+                action.receipt_corroboration_count
+                + int(disposition is ActionReceiptDisposition.CORROBORATION)
+            ),
+            "receipt_conflict_count": (
+                action.receipt_conflict_count
+                + int(disposition is ActionReceiptDisposition.CONFLICT)
+            ),
+        }
+        if action.phase is ActionPhase.RECEIPT:
+            action = ActionRecord.model_validate(
+                {
+                    **action.model_dump(mode="python"),
+                    **updates,
+                    "last_event_id": event.event_id,
+                }
+            )
+        else:
+            action = _transition(
+                action,
+                event,
+                required=action.phase,
+                phase=ActionPhase.RECEIPT,
+                rd_phase=RDPhase.PREPARE,
+                updates=updates,
+            )
     elif event.event_type == "action.reconstructed":
         reconstruction = _mapping(event.payload, field="reconstruction")
+        if action.phase not in {ActionPhase.BLOCKED, ActionPhase.RECEIPT}:
+            raise DomainInvariantError(
+                "action must have a blocked outcome or receipt before reconstruction"
+            )
+        try:
+            reconstruction_record = ActionReconstructionRecord(
+                event_id=event.event_id,
+                after_receipt_event_id=(
+                    action.receipt_history[-1].event_id
+                    if action.receipt_history
+                    else None
+                ),
+                payload=FrozenJsonDict(reconstruction),
+            )
+        except Exception as error:
+            raise DomainInvariantError("invalid action reconstruction") from error
         action = _transition(
             action,
             event,
-            required=ActionPhase.RECEIPT,
+            required=action.phase,
             phase=ActionPhase.RECONSTRUCTED,
             rd_phase=RDPhase.RECONSTRUCT,
-            updates={"reconstruction": FrozenJsonDict(reconstruction)},
+            updates={
+                "reconstruction": FrozenJsonDict(reconstruction),
+                "reconstruction_history": (
+                    *action.reconstruction_history,
+                    reconstruction_record,
+                )[-MAX_ACTION_RECONSTRUCTION_HISTORY:],
+                "reconstruction_history_evicted": (
+                    action.reconstruction_history_evicted
+                    + int(
+                        len(action.reconstruction_history)
+                        >= MAX_ACTION_RECONSTRUCTION_HISTORY
+                    )
+                ),
+            },
         )
     else:
         return actions, frozenset()
@@ -329,8 +553,14 @@ def reduce_actions(
 
 
 __all__ = [
+    "MAX_ACTION_RECEIPT_HISTORY",
+    "MAX_ACTION_RECONSTRUCTION_HISTORY",
     "ActionOutcome",
     "ActionPhase",
+    "ActionReceiptDisposition",
+    "ActionReceiptRecord",
+    "ActionReceiptStatus",
+    "ActionReconstructionRecord",
     "ActionRecord",
     "RDPhase",
     "ThoughtBranch",

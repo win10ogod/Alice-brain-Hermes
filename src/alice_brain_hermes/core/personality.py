@@ -22,6 +22,17 @@ _RATE_POLICIES: dict[str, tuple[float, float]] = {
     "narrative_ideal": (0.10, 0.10),
 }
 _FINITE_FLOAT_DECIMAL_PRECISION = 768
+ENERGY_DIMENSIONS = (
+    "deficits",
+    "salience",
+    "urgency",
+    "valence",
+    "arousal",
+    "control",
+    "resources",
+    "cost",
+    "personality_relevance",
+)
 
 
 @contextmanager
@@ -202,6 +213,8 @@ class EnergyVector(BaseModel):
     )
 
     action_id: str = Field(min_length=1, max_length=512)
+    evidence_basis: FrozenJsonDict = Field(default_factory=FrozenJsonDict)
+    unknown_dimensions: tuple[str, ...] = ENERGY_DIMENSIONS
     deficits: FrozenJsonDict = Field(default_factory=FrozenJsonDict)
     salience: float = Field(ge=0.0, le=1.0)
     urgency: float = Field(ge=0.0, le=1.0)
@@ -218,6 +231,48 @@ class EnergyVector(BaseModel):
         return _validate_numeric_map(
             value, lower=0.0, upper=1.0, label="energy deficits"
         )
+
+    @field_validator("evidence_basis")
+    @classmethod
+    def _validate_evidence_basis(cls, value: FrozenJsonDict) -> FrozenJsonDict:
+        known = frozenset(ENERGY_DIMENSIONS)
+        if len(value) > len(known):
+            raise ValueError("energy evidence basis exceeds its fixed bound")
+        for dimension, source in value.items():
+            if dimension not in known:
+                raise ValueError("unknown evidenced energy dimension")
+            if not isinstance(source, str) or not source.strip() or len(source) > 160:
+                raise ValueError(
+                    "energy evidence basis requires a non-blank bounded source"
+                )
+        return value
+
+    @field_validator("unknown_dimensions", mode="before")
+    @classmethod
+    def _json_unknown_dimensions(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("unknown_dimensions")
+    @classmethod
+    def _validate_unknown_dimensions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        known = frozenset(ENERGY_DIMENSIONS)
+        if len(value) > len(known):
+            raise ValueError("unknown energy dimensions exceed their fixed bound")
+        if len(value) != len(set(value)):
+            raise ValueError("unknown energy dimensions must be unique")
+        if any(item not in known for item in value):
+            raise ValueError("unknown energy dimension")
+        return value
+
+    @model_validator(mode="after")
+    def _evidence_partition_is_explicit(self) -> EnergyVector:
+        evidenced = frozenset(self.evidence_basis)
+        unknown = frozenset(self.unknown_dimensions)
+        if evidenced & unknown:
+            raise ValueError("energy dimensions cannot be both evidenced and unknown")
+        if evidenced | unknown != frozenset(ENERGY_DIMENSIONS):
+            raise ValueError("energy evidence must classify every dimension")
+        return self
 
     @property
     def activation(self) -> float:
@@ -323,6 +378,10 @@ def energy_from_event(event: EventEnvelope) -> EnergyVector:
     try:
         return EnergyVector(
             action_id=event.payload["action_id"],
+            evidence_basis=event.payload.get("evidence_basis", {}),
+            unknown_dimensions=event.payload.get(
+                "unknown_dimensions", ENERGY_DIMENSIONS
+            ),
             deficits=event.payload.get("deficits", {}),
             salience=event.payload["salience"],
             urgency=event.payload["urgency"],
@@ -345,6 +404,7 @@ def upsert_energy(
 
 
 __all__ = [
+    "ENERGY_DIMENSIONS",
     "EnergyVector",
     "LayerRateState",
     "PersonalityControl",
