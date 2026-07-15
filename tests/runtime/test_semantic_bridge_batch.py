@@ -176,6 +176,78 @@ def test_timeout_preserves_true_host_error_type_through_typed_receipt(
         assert action.receipt_history[-1].source_error_type == "TimeoutError"
 
 
+@pytest.mark.parametrize("status", ["error", "timeout", "blocked"])
+def test_overlong_host_error_type_commits_raw_plus_gap_and_retries_exactly(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    from alice_brain_hermes.runtime.engine import ConsciousEngine
+    from alice_brain_hermes.runtime.store import SQLiteLedger
+
+    ledger, engine, instance = make_engine(tmp_path)
+    database = ledger.path
+    brain_id = engine.brain_id
+    record = tool_observation(
+        instance,
+        2,
+        hook="post_tool_call",
+        status=status,
+        error_type="X" * 161,
+    )
+    with ledger:
+        engine.commit_bridge_record(
+            instance,
+            tool_observation(instance, 1, hook="pre_tool_call"),
+        )
+
+        accepted = engine.commit_bridge_record(instance, record)
+        duplicate = engine.commit_bridge_record(instance, record)
+
+        assert duplicate.canonical_json() == accepted.canonical_json()
+        assert accepted.semantic_status == "gap"
+        assert accepted.derived_event_count == 1
+        assert accepted.frame.semantic_evidence.semantic_gap_records == 1
+        assert [
+            event.event_type
+            for event in ledger.list_events(brain_id)
+            if event.sequence is not None
+            and event.sequence >= accepted.raw_event_sequence
+        ] == ["hermes.observer.post_tool_call", "semantic.gap"]
+        assert ledger.list_events(brain_id)[-1].payload["reason"] == (
+            "invalid_post_tool_error_type"
+        )
+        [action] = engine.state.action_records
+        assert action.phase is ActionPhase.PREPARED
+        assert action.execution_confirmed is None
+        assert action.outcome is None
+        assert action.receipt is None
+        before = (
+            len(ledger.list_events(brain_id)),
+            ledger.bridge_stream_state(instance),
+            ledger.observability_snapshot(brain_id),
+        )
+
+        changed_values = record.model_dump(mode="python")
+        changed_values["payload"]["error_type"] = "Y" * 161
+        changed = validate_observation(changed_values)
+        with pytest.raises(IdempotencyConflictError):
+            engine.commit_bridge_record(instance, changed)
+        assert (
+            len(ledger.list_events(brain_id)),
+            ledger.bridge_stream_state(instance),
+            ledger.observability_snapshot(brain_id),
+        ) == before
+
+    with SQLiteLedger.open(database) as reopened:
+        restarted = ConsciousEngine(reopened, brain_id, actor_id=brain_id)
+        duplicate_after_restart = restarted.commit_bridge_record(instance, record)
+
+        assert duplicate_after_restart.canonical_json() == accepted.canonical_json()
+        [action] = restarted.state.action_records
+        assert action.phase is ActionPhase.PREPARED
+        assert action.receipt is None
+
+
 def test_late_receipt_matches_latest_closed_occurrence_without_redispatch(
     tmp_path: Path,
 ) -> None:
@@ -211,6 +283,82 @@ def test_late_receipt_matches_latest_closed_occurrence_without_redispatch(
 
     with SQLiteLedger.open(database) as reopened:
         assert reopened.observability_snapshot(engine.brain_id).semantic_complete
+
+
+@pytest.mark.parametrize("late_status", ["ok", "error", "timeout", "cancelled"])
+def test_late_completion_after_blocked_is_gap_without_receipt_or_redispatch(
+    tmp_path: Path,
+    late_status: str,
+) -> None:
+    from alice_brain_hermes.runtime.engine import ConsciousEngine
+    from alice_brain_hermes.runtime.store import SQLiteLedger
+
+    ledger, engine, instance = make_engine(tmp_path)
+    database = ledger.path
+    brain_id = engine.brain_id
+    late_record = tool_observation(
+        instance,
+        3,
+        hook="post_tool_call",
+        status=late_status,
+    )
+    with ledger:
+        engine.commit_bridge_record(
+            instance,
+            tool_observation(instance, 1, hook="pre_tool_call"),
+        )
+        engine.commit_bridge_record(
+            instance,
+            tool_observation(instance, 2, hook="post_tool_call", status="blocked"),
+        )
+
+        late = engine.commit_bridge_record(instance, late_record)
+        duplicate = engine.commit_bridge_record(instance, late_record)
+
+        assert duplicate.canonical_json() == late.canonical_json()
+        assert late.semantic_status == "gap"
+        assert late.derived_event_count == 1
+        assert [
+            event.event_type
+            for event in ledger.list_events(brain_id)
+            if event.sequence is not None and event.sequence >= late.raw_event_sequence
+        ] == ["hermes.observer.post_tool_call", "semantic.gap"]
+        assert ledger.list_events(brain_id)[-1].payload["reason"] == (
+            "late_completion_after_blocked"
+        )
+        [action] = engine.state.action_records
+        assert action.phase is ActionPhase.BLOCKED
+        assert ActionPhase.DISPATCHED not in action.phase_history
+        assert ActionPhase.RECEIPT not in action.phase_history
+        assert action.execution_confirmed is False
+        assert action.outcome is None
+        assert action.effect_confirmed is None
+        before = (
+            len(ledger.list_events(brain_id)),
+            ledger.bridge_stream_state(instance),
+            ledger.observability_snapshot(brain_id),
+        )
+
+        changed_values = late_record.model_dump(mode="python")
+        changed_values["payload"]["result"] = {"changed": True}
+        changed = validate_observation(changed_values)
+        with pytest.raises(IdempotencyConflictError):
+            engine.commit_bridge_record(instance, changed)
+        assert (
+            len(ledger.list_events(brain_id)),
+            ledger.bridge_stream_state(instance),
+            ledger.observability_snapshot(brain_id),
+        ) == before
+
+    with SQLiteLedger.open(database) as reopened:
+        restarted = ConsciousEngine(reopened, brain_id, actor_id=brain_id)
+        duplicate_after_restart = restarted.commit_bridge_record(instance, late_record)
+
+        assert duplicate_after_restart.canonical_json() == late.canonical_json()
+        [action] = restarted.state.action_records
+        assert action.phase is ActionPhase.BLOCKED
+        assert ActionPhase.DISPATCHED not in action.phase_history
+        assert ActionPhase.RECEIPT not in action.phase_history
 
 
 def test_late_conflict_keeps_canonical_outcome_and_projects_typed_disposition(

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
 
+from alice_brain_hermes.core.action import MAX_ACTION_SOURCE_ERROR_TYPE_LENGTH
 from alice_brain_hermes.core.events import EventEnvelope, new_event, thaw_json
 from alice_brain_hermes.core.personality import ENERGY_DIMENSIONS
 from alice_brain_hermes.ids import validate_id
@@ -453,7 +454,9 @@ def _post_tool_plan(
     raw_status = record.payload.status
     raw_error_type = record.payload.error_type
     if raw_error_type is not None and (
-        not isinstance(raw_error_type, str) or not raw_error_type.strip()
+        type(raw_error_type) is not str
+        or not raw_error_type.strip()
+        or len(raw_error_type) > MAX_ACTION_SOURCE_ERROR_TYPE_LENGTH
     ):
         return _semantic_gap(
             stream, record, raw_event, reason="invalid_post_tool_error_type"

@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import threading
+from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
+from alice_brain_hermes.core.action import ActionPhase
 from alice_brain_hermes.core.events import EventEnvelope, new_event
 from alice_brain_hermes.core.reducer import reduce_state
 from alice_brain_hermes.core.state import (
@@ -584,15 +586,10 @@ class SQLiteLedger:
                 return
             if version == 2:
                 self._validate_schema_metadata(2)
-                self._validate_schema_contract(2, validate_data=False)
+                final_states = self._validate_schema_contract(2, validate_data=True)
                 for statement in _statements(_CREATE_BRIDGE_SCHEMA):
                     self._connection.execute(statement)
-                self._connection.execute(
-                    "INSERT INTO brain_observability("
-                    "brain_id, trace_complete, semantic_complete, dropped_events, "
-                    "semantic_records, legacy_raw_only_records, semantic_gap_records) "
-                    "SELECT brain_id, 1, 1, 0, 0, 0, 0 FROM brains"
-                )
+                self._rebuild_observability_in_transaction(final_states=final_states)
                 self._connection.execute(
                     "UPDATE schema_metadata SET value = ? WHERE key = ?",
                     (str(SQLITE_SCHEMA_VERSION), "schema_version"),
@@ -672,13 +669,41 @@ class SQLiteLedger:
             "record.bridge_instance_id ORDER BY stream.brain_id, "
             "record.ledger_sequence"
         ).fetchall()
+        covered_raw_event_ids = {str(row["event_id"]) for row in rows}
+        unbounded_gap_sequences: dict[str, list[int]] = {}
+        event_cursor = self._connection.execute(
+            "SELECT event_id, brain_id, sequence, body_fingerprint, "
+            "envelope_fingerprint, envelope_json FROM events "
+            "ORDER BY brain_id, sequence"
+        )
+        while event_rows := event_cursor.fetchmany(512):
+            for event_row in event_rows:
+                event = self._decode_event(event_row)
+                if (
+                    event.event_id not in covered_raw_event_ids
+                    and event.event_type in {"semantic.gap", "trace.gap"}
+                    and event.sequence is not None
+                ):
+                    unbounded_gap_sequences.setdefault(event.brain_id, []).append(
+                        event.sequence
+                    )
         migrated_rows: list[tuple[object, ...]] = []
         record_health: dict[str, dict[str, int]] = {}
         for row in rows:
             brain_id = row["brain_id"]
             health = record_health.setdefault(
                 brain_id,
-                {"records": 0, "legacy": 0, "gaps": 0, "dropped": 0},
+                {
+                    "records": 0,
+                    "legacy": 0,
+                    "gaps": 0,
+                    "dropped": 0,
+                    "unbounded": 0,
+                },
+            )
+            health["unbounded"] = bisect_right(
+                unbounded_gap_sequences.get(str(brain_id), []),
+                int(row["ledger_sequence"]),
             )
             health["records"] += 1
             health["legacy"] += 1
@@ -699,7 +724,7 @@ class SQLiteLedger:
                 "schema_version": SEMANTIC_SCHEMA_VERSION,
                 "semantic_records": health["records"],
                 "legacy_raw_only_records": health["legacy"],
-                "semantic_gap_records": health["gaps"],
+                "semantic_gap_records": health["gaps"] + health["unbounded"],
                 "dropped_events": health["dropped"],
             }
             frame = ConsciousnessFrameV3.model_validate(frame_values, strict=True)
@@ -758,26 +783,7 @@ class SQLiteLedger:
                 values,
             )
         self._connection.execute("DROP TABLE bridge_record_v4")
-        for brain_id, state in final_states.items():
-            health = record_health.get(
-                brain_id,
-                {"records": 0, "legacy": 0, "gaps": 0, "dropped": 0},
-            )
-            self._connection.execute(
-                "INSERT INTO brain_observability("
-                "brain_id, trace_complete, semantic_complete, dropped_events, "
-                "semantic_records, legacy_raw_only_records, semantic_gap_records) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    brain_id,
-                    int(state.trace_complete),
-                    int(health["legacy"] == 0 and health["gaps"] == 0),
-                    health["dropped"],
-                    health["records"],
-                    health["legacy"],
-                    health["gaps"],
-                ),
-            )
+        self._rebuild_observability_in_transaction(final_states=final_states)
 
     def _validate_schema_metadata(self, version: int) -> None:
         expected = [("schema_version", str(version))]
@@ -1772,6 +1778,16 @@ class SQLiteLedger:
                             matched_span, correlation_gap = match_hermes_span(
                                 record, tuple(expected_spans)
                             )
+                        predecessor = historical_states.get(ack.raw_event_sequence - 1)
+                        if predecessor is None:
+                            raise LedgerIntegrityError(
+                                "semantic batch has no predecessor state"
+                            )
+                        lifecycle_gap = self._semantic_lifecycle_gap(
+                            predecessor,
+                            record,
+                            matched_span,
+                        )
                         actual_derived = events[1:]
                         domain_capacity_gap = (
                             ack.semantic_status == "gap"
@@ -1780,15 +1796,10 @@ class SQLiteLedger:
                             and actual_derived[0].payload.get("reason")
                             == "semantic_domain_capacity"
                         )
-                        forced_gap_reason = capacity_gap or correlation_gap
+                        forced_gap_reason = (
+                            capacity_gap or correlation_gap or lifecycle_gap
+                        )
                         if domain_capacity_gap:
-                            predecessor = historical_states.get(
-                                ack.raw_event_sequence - 1
-                            )
-                            if predecessor is None:
-                                raise LedgerIntegrityError(
-                                    "semantic capacity gap has no predecessor state"
-                                )
                             candidate = build_semantic_plan(
                                 stream,
                                 record,
@@ -2006,12 +2017,12 @@ class SQLiteLedger:
                 "abandoned streams and unknown gaps are not one-to-one"
             )
 
-    def _validate_observability_in_transaction(
+    def _expected_observability_in_transaction(
         self,
         *,
         final_states: Mapping[str, BrainState],
         streams: Mapping[str, BridgeStreamState],
-    ) -> None:
+    ) -> dict[str, dict[str, int]]:
         expected = {
             brain_id: {
                 "trace_complete": int(state.trace_complete),
@@ -2071,6 +2082,56 @@ class SQLiteLedger:
                     health = expected[event.brain_id]
                     health["semantic_gap_records"] += 1
                     health["semantic_complete"] = 0
+        return expected
+
+    def _rebuild_observability_in_transaction(
+        self, *, final_states: Mapping[str, BrainState]
+    ) -> None:
+        stream_rows = self._connection.execute(
+            "SELECT bridge_instance_id, brain_id, server_actor_id, "
+            "server_adapter_id, recovery_token_digest, next_capture_seq, "
+            "status, connected_nonce, disconnected_reason, disconnected_at, "
+            "last_seen, closed_final_seq FROM bridge_stream "
+            "ORDER BY bridge_instance_id"
+        ).fetchall()
+        streams: dict[str, BridgeStreamState] = {}
+        for row in stream_rows:
+            self._validate_bridge_recovery_digest(row)
+            stream = self._stream_from_row(row)
+            streams[stream.bridge_instance_id] = stream
+        expected = self._expected_observability_in_transaction(
+            final_states=final_states,
+            streams=streams,
+        )
+        self._connection.execute("DELETE FROM brain_observability")
+        for brain_id in sorted(expected):
+            health = expected[brain_id]
+            self._connection.execute(
+                "INSERT INTO brain_observability("
+                "brain_id, trace_complete, semantic_complete, dropped_events, "
+                "semantic_records, legacy_raw_only_records, semantic_gap_records) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    brain_id,
+                    health["trace_complete"],
+                    health["semantic_complete"],
+                    health["dropped_events"],
+                    health["semantic_records"],
+                    health["legacy_raw_only_records"],
+                    health["semantic_gap_records"],
+                ),
+            )
+
+    def _validate_observability_in_transaction(
+        self,
+        *,
+        final_states: Mapping[str, BrainState],
+        streams: Mapping[str, BridgeStreamState],
+    ) -> None:
+        expected = self._expected_observability_in_transaction(
+            final_states=final_states,
+            streams=streams,
+        )
         persisted_rows = self._connection.execute(
             "SELECT brain_id, trace_complete, semantic_complete, dropped_events, "
             "semantic_records, legacy_raw_only_records, semantic_gap_records "
@@ -3745,6 +3806,32 @@ class SQLiteLedger:
             tuple(self._span_from_row(row) for row in rows),
         )
 
+    @staticmethod
+    def _semantic_lifecycle_gap(
+        state: BrainState,
+        record: BridgeRecordV1,
+        matched_span: HermesSpan | None,
+    ) -> str | None:
+        """Reject a known late tool/domain mismatch before deriving a receipt."""
+        if (
+            not isinstance(record, HermesObservationV1)
+            or record.hook != "post_tool_call"
+            or matched_span is None
+            or matched_span.closed_capture_seq is None
+            or record.payload.status == "blocked"
+        ):
+            return None
+        if matched_span.action_id is None:
+            return "late_action_unavailable"
+        action = state.actions.get(matched_span.action_id)
+        if action is None:
+            return "late_action_unavailable"
+        if action.phase is ActionPhase.BLOCKED:
+            return "late_completion_after_blocked"
+        if action.phase not in {ActionPhase.RECEIPT, ActionPhase.RECONSTRUCTED}:
+            return "late_action_state_mismatch"
+        return None
+
     def _prepare_semantic_span_capacity_in_transaction(
         self, record: BridgeRecordV1
     ) -> str | None:
@@ -4318,12 +4405,17 @@ class SQLiteLedger:
             raw_event = self._bridge_event(stream, record)
             capacity_gap = self._prepare_semantic_span_capacity_in_transaction(record)
             matched_span, correlation_gap = self._matched_span_in_transaction(record)
+            lifecycle_gap = self._semantic_lifecycle_gap(
+                expected_state,
+                record,
+                matched_span,
+            )
             plan = build_semantic_plan(
                 stream,
                 record,
                 raw_event=raw_event,
                 matched_span=matched_span,
-                forced_gap_reason=capacity_gap or correlation_gap,
+                forced_gap_reason=capacity_gap or correlation_gap or lifecycle_gap,
             )
 
             def sequence_and_reduce(

@@ -94,7 +94,12 @@ def test_v3_action_snapshot_is_replay_only_and_legacy_events_restore_outcome(
     assert action.outcome is ActionOutcome.FAILURE
 
 
-def legacy_action_ack_database(database: Path, *, sqlite_version: int | None):
+def legacy_action_ack_database(
+    database: Path,
+    *,
+    sqlite_version: int | None,
+    nonbridge_gap: str | None = None,
+):
     brain_id = new_id()
     bridge_instance_id = new_id()
     gap = BridgeGapV1(
@@ -150,7 +155,25 @@ def legacy_action_ack_database(database: Path, *, sqlite_version: int | None):
                 ),
             ):
                 engine.append(action_event)
+        if nonbridge_gap == "before":
+            engine.append(
+                new_event(
+                    "semantic.gap",
+                    brain_id,
+                    brain_id,
+                    {"reason": "legacy-unbounded", "trace_complete": False},
+                )
+            )
         current_ack = engine.commit_bridge_record(bridge_instance_id, gap)
+        if nonbridge_gap == "after":
+            engine.append(
+                new_event(
+                    "semantic.gap",
+                    brain_id,
+                    brain_id,
+                    {"reason": "legacy-unbounded", "trace_complete": False},
+                )
+            )
 
         legacy_frame = current_ack.frame.model_dump(mode="python")
         legacy_frame["schema_version"] = 2
@@ -201,6 +224,116 @@ def legacy_action_ack_database(database: Path, *, sqlite_version: int | None):
             )
             connection.execute(f"PRAGMA user_version = {sqlite_version}")
     return brain_id, bridge_instance_id, gap, current_ack
+
+
+def _downgrade_empty_database(database: Path, *, sqlite_version: int) -> None:
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TABLE hermes_span")
+        connection.execute("DROP TABLE brain_observability")
+        if sqlite_version == 2:
+            connection.execute("DROP TABLE bridge_record")
+            connection.execute("DROP TABLE bridge_stream")
+            connection.execute("DROP TABLE brain_profile")
+        else:
+            connection.execute("DROP INDEX bridge_record_event")
+            connection.execute("ALTER TABLE bridge_record RENAME TO bridge_record_v5")
+            connection.executescript(_CREATE_BRIDGE_RECORD_V4_SCHEMA)
+            connection.execute("DROP TABLE bridge_record_v5")
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
+            (str(sqlite_version),),
+        )
+        connection.execute(f"PRAGMA user_version = {sqlite_version}")
+
+
+@pytest.mark.parametrize("event_type", ["trace.gap", "semantic.gap"])
+def test_v2_gap_history_migrates_to_truthful_observability(
+    tmp_path: Path,
+    event_type: str,
+) -> None:
+    database = tmp_path / f"legacy-v2-{event_type}.db"
+    brain_id = new_id()
+    with SQLiteLedger.open(database) as ledger:
+        ledger.ensure_brain(brain_id)
+        ledger.append(
+            new_event(
+                event_type,
+                brain_id,
+                brain_id,
+                {"reason": "legacy-unbounded", "trace_complete": False},
+            )
+        )
+    _downgrade_empty_database(database, sqlite_version=2)
+
+    with SQLiteLedger.open(database) as migrated:
+        snapshot = migrated.observability_snapshot(brain_id)
+        assert migrated.replay(brain_id).trace_complete is False
+        assert snapshot.trace_complete is False
+        assert snapshot.semantic_complete is False
+        assert snapshot.semantic_records == 0
+        assert snapshot.legacy_raw_only_records == 0
+        assert snapshot.semantic_gap_records == 1
+        assert snapshot.dropped_events == 0
+
+
+def test_v4_unbounded_gap_without_bridge_rows_migrates_truthfully(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-v4-unbounded-gap.db"
+    brain_id = new_id()
+    with SQLiteLedger.open(database) as ledger:
+        ledger.ensure_brain(brain_id)
+        ledger.append(
+            new_event(
+                "semantic.gap",
+                brain_id,
+                brain_id,
+                {"reason": "legacy-unbounded", "trace_complete": False},
+            )
+        )
+    _downgrade_empty_database(database, sqlite_version=4)
+
+    with SQLiteLedger.open(database) as migrated:
+        snapshot = migrated.observability_snapshot(brain_id)
+        assert migrated.replay(brain_id).trace_complete is False
+        assert snapshot.trace_complete is False
+        assert snapshot.semantic_complete is False
+        assert snapshot.semantic_records == 0
+        assert snapshot.semantic_gap_records == 1
+        assert snapshot.total_bridges == 0
+
+
+@pytest.mark.parametrize("gap_position", ["before", "after"])
+def test_v4_mixed_bridge_and_unbounded_gaps_are_counted_once(
+    tmp_path: Path,
+    gap_position: str,
+) -> None:
+    database = tmp_path / f"legacy-v4-mixed-{gap_position}.db"
+    brain_id, bridge_instance_id, _gap, _current = legacy_action_ack_database(
+        database,
+        sqlite_version=4,
+        nonbridge_gap=gap_position,
+    )
+
+    with SQLiteLedger.open(database) as migrated:
+        snapshot = migrated.observability_snapshot(brain_id)
+        [row] = migrated._connection.execute(
+            "SELECT ack_json FROM bridge_record WHERE bridge_instance_id = ?",
+            (bridge_instance_id,),
+        ).fetchall()
+        ack = BridgeCommitAckV2.model_validate_json(row["ack_json"])
+
+        assert snapshot.trace_complete is False
+        assert snapshot.semantic_complete is False
+        assert snapshot.semantic_records == 1
+        assert snapshot.legacy_raw_only_records == 1
+        assert snapshot.semantic_gap_records == 2
+        assert snapshot.dropped_events == 1
+        assert ack.frame.semantic_evidence.semantic_gap_records == (
+            2 if gap_position == "before" else 1
+        )
+        assert ack.frame.semantic_evidence.dropped_events == 1
 
 
 def test_v3_bridge_ack_is_migrated_after_failure_execution_semantics_change(

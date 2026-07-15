@@ -49,6 +49,7 @@ class ActionReceiptDisposition(StrEnum):
 
 MAX_ACTION_RECEIPT_HISTORY = 16
 MAX_ACTION_RECONSTRUCTION_HISTORY = 16
+MAX_ACTION_SOURCE_ERROR_TYPE_LENGTH = 160
 _HERMES_SOURCE_STATUSES = frozenset({"ok", "error", "timeout", "cancelled", "blocked"})
 _THREAD_MISSING_RESULT = "thread_missing_result"
 
@@ -59,7 +60,7 @@ def _validate_source_error_type(source_error_type: object) -> None:
     if (
         type(source_error_type) is not str
         or not source_error_type.strip()
-        or len(source_error_type) > 160
+        or len(source_error_type) > MAX_ACTION_SOURCE_ERROR_TYPE_LENGTH
     ):
         raise ValueError(
             "receipt source semantics require a bounded non-blank error type"
@@ -142,7 +143,11 @@ class ActionReceiptRecord(BaseModel):
     status: ActionReceiptStatus
     disposition: ActionReceiptDisposition
     source_status: str | None = Field(default=None, min_length=1, max_length=160)
-    source_error_type: str | None = Field(default=None, min_length=1, max_length=160)
+    source_error_type: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_ACTION_SOURCE_ERROR_TYPE_LENGTH,
+    )
     late: bool = False
     execution_confirmed: bool | None = None
     outcome: ActionOutcome | None = None
@@ -707,6 +712,7 @@ def reduce_actions(
 __all__ = [
     "MAX_ACTION_RECEIPT_HISTORY",
     "MAX_ACTION_RECONSTRUCTION_HISTORY",
+    "MAX_ACTION_SOURCE_ERROR_TYPE_LENGTH",
     "ActionOutcome",
     "ActionPhase",
     "ActionReceiptDisposition",
