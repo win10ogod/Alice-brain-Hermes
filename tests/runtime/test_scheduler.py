@@ -70,6 +70,20 @@ class FakeClock:
         return next(self.values)
 
 
+@pytest.mark.parametrize("timeout", [True, -1.0, float("nan"), float("inf")])
+@pytest.mark.parametrize("operation", ["stop", "join"])
+def test_scheduler_shutdown_timeout_must_be_finite_nonnegative(
+    timeout: float, operation: str
+) -> None:
+    engine = ConsciousEngine(AppendProbeLedger(), BRAIN, actor_id=ACTOR)
+    scheduler = ContinuousScheduler(engine, monotonic=lambda: 0.0)
+
+    with pytest.raises(ValueError, match="timeout"):
+        getattr(scheduler, operation)(timeout=timeout)
+
+    assert scheduler._stop.is_set() is False
+
+
 def test_engine_appends_before_reducing_and_append_failure_leaves_state() -> None:
     ledger = AppendProbeLedger()
     engine = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
@@ -170,8 +184,7 @@ def test_engine_rejects_stale_conflicting_action_atomically_until_restart(
             {"action_id": "a1", "intent": {"writer": "concurrent"}},
             action_id="a1",
         )
-        with SQLiteLedger.open(database) as concurrent_ledger:
-            concurrent_ledger.append(concurrent)
+        engine_ledger.append(concurrent)
 
         with pytest.raises(EventConflictError, match="sequence divergence"):
             engine.append(
@@ -214,8 +227,7 @@ def test_engine_uses_one_authoritative_head_view_before_event_semantics(
             {"action_id": "future", "intent": {"writer": "concurrent"}},
             action_id="future",
         )
-        with SQLiteLedger.open(database) as concurrent:
-            concurrent.append(future)
+        engine_ledger.append(future)
 
         changed_body = future.model_copy(
             update={
@@ -234,16 +246,15 @@ def test_engine_uses_one_authoritative_head_view_before_event_semantics(
     followup_database = tmp_path / "followup.db"
     with SQLiteLedger.open(followup_database) as engine_ledger:
         engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
-        with SQLiteLedger.open(followup_database) as concurrent:
-            concurrent.append(
-                new_event(
-                    "action.proposed",
-                    BRAIN,
-                    ACTOR,
-                    {"action_id": "precursor", "intent": {}},
-                    action_id="precursor",
-                )
+        engine_ledger.append(
+            new_event(
+                "action.proposed",
+                BRAIN,
+                ACTOR,
+                {"action_id": "precursor", "intent": {}},
+                action_id="precursor",
             )
+        )
 
         with pytest.raises(EventConflictError, match="sequence divergence"):
             engine.append(
@@ -265,12 +276,9 @@ def test_engine_rejects_old_exact_retry_when_an_unseen_tail_exists(
     database = tmp_path / "brain.db"
     with SQLiteLedger.open(database) as engine_ledger:
         engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
-        original = new_event(
-            "clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0}
-        )
+        original = new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0})
         stored = engine.append(original)
-        with SQLiteLedger.open(database) as concurrent:
-            concurrent.append(new_event("opaque.tail", BRAIN, ACTOR, {}))
+        engine_ledger.append(new_event("opaque.tail", BRAIN, ACTOR, {}))
 
         with pytest.raises(EventConflictError, match="sequence divergence"):
             engine.append(original)
@@ -287,9 +295,7 @@ def test_engine_get_miss_race_adopts_exact_next_event_only_without_tail(
     database = tmp_path / f"race-{with_tail}.db"
     with SQLiteLedger.open(database) as engine_ledger:
         engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
-        target = new_event(
-            "clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0}
-        )
+        target = new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0})
         original_read = engine_ledger.get_event_and_head
         raced = False
 
@@ -300,17 +306,12 @@ def test_engine_get_miss_race_adopts_exact_next_event_only_without_tail(
             result = original_read(event_id, brain_id)
             if not raced:
                 raced = True
-                with SQLiteLedger.open(database) as concurrent:
-                    concurrent.append(target)
-                    if with_tail:
-                        concurrent.append(
-                            new_event("opaque.tail", BRAIN, ACTOR, {})
-                        )
+                engine_ledger.append(target)
+                if with_tail:
+                    engine_ledger.append(new_event("opaque.tail", BRAIN, ACTOR, {}))
             return result
 
-        monkeypatch.setattr(
-            engine_ledger, "get_event_and_head", read_then_race
-        )
+        monkeypatch.setattr(engine_ledger, "get_event_and_head", read_then_race)
 
         if with_tail:
             with pytest.raises(EventConflictError, match="sequence divergence"):
@@ -331,9 +332,7 @@ def test_engine_get_miss_race_marks_changed_body_in_target_brain_stale(
     database = tmp_path / "changed-body-target-race.db"
     with SQLiteLedger.open(database) as engine_ledger:
         engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
-        target = new_event(
-            "clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0}
-        )
+        target = new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0})
         conflicting = target.model_copy(
             update={"payload": {"elapsed_seconds": 2.0}}
         ).revalidated()
@@ -347,13 +346,10 @@ def test_engine_get_miss_race_marks_changed_body_in_target_brain_stale(
             result = original_read(event_id, brain_id)
             if not raced:
                 raced = True
-                with SQLiteLedger.open(database) as concurrent:
-                    concurrent.append(conflicting)
+                engine_ledger.append(conflicting)
             return result
 
-        monkeypatch.setattr(
-            engine_ledger, "get_event_and_head", read_then_race
-        )
+        monkeypatch.setattr(engine_ledger, "get_event_and_head", read_then_race)
 
         with pytest.raises(EventConflictError, match="sequence divergence"):
             engine.append(target)
@@ -372,9 +368,7 @@ def test_engine_get_miss_race_with_changed_body_in_other_brain_is_not_stale(
     other_brain = new_id()
     with SQLiteLedger.open(database) as engine_ledger:
         engine = ConsciousEngine(engine_ledger, BRAIN, actor_id=ACTOR)
-        target = new_event(
-            "clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0}
-        )
+        target = new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 1.0})
         conflicting = target.model_copy(
             update={
                 "brain_id": other_brain,
@@ -391,13 +385,10 @@ def test_engine_get_miss_race_with_changed_body_in_other_brain_is_not_stale(
             result = original_read(event_id, brain_id)
             if not raced:
                 raced = True
-                with SQLiteLedger.open(database) as concurrent:
-                    concurrent.append(conflicting)
+                engine_ledger.append(conflicting)
             return result
 
-        monkeypatch.setattr(
-            engine_ledger, "get_event_and_head", read_then_race
-        )
+        monkeypatch.setattr(engine_ledger, "get_event_and_head", read_then_race)
 
         with pytest.raises(EventConflictError, match="different body"):
             engine.append(target)
@@ -457,9 +448,7 @@ def test_pc_rate_budget_replays_identically_after_restart(tmp_path: Path) -> Non
                 {"layer": "traits", "values": {"care": 0.05}},
             )
         )
-        engine.append(
-            new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 0.5})
-        )
+        engine.append(new_event("clock.tick", BRAIN, ACTOR, {"elapsed_seconds": 0.5}))
         engine.append(
             new_event(
                 "personality.revised",
@@ -527,9 +516,7 @@ def test_energy_activation_and_c0_drive_are_stable_across_canonical_replay(
 
     with SQLiteLedger.open(database) as ledger:
         restarted = ConsciousEngine(ledger, BRAIN, actor_id=ACTOR)
-        replayed_activation = restarted.state.energies[
-            "stable-energy"
-        ].activation
+        replayed_activation = restarted.state.energies["stable-energy"].activation
         replayed_drive = next(
             item
             for item in derive_candidates(restarted.state)
@@ -682,9 +669,7 @@ def test_invalid_energy_types_and_ranges_leave_ledger_clean(tmp_path: Path) -> N
                 ACTOR,
                 base_payload,
                 action_id="energy-action",
-            ).model_copy(
-                update={"payload": {**base_payload, "urgency": invalid}}
-            )
+            ).model_copy(update={"payload": {**base_payload, "urgency": invalid}})
             with pytest.raises((DomainInvariantError, ValueError)):
                 engine.append(candidate)
             assert engine.state is baseline
@@ -719,9 +704,7 @@ def test_ambiguous_or_mismatched_receipt_evidence_is_not_persisted(
                     "kind": "linked_observation",
                     "observation_ids": ["o1", "o1"],
                 },
-                "observations": [
-                    {"proposition_id": "o1", "content": {"ok": True}}
-                ],
+                "observations": [{"proposition_id": "o1", "content": {"ok": True}}],
             },
             {
                 "effect_evidence": {
@@ -738,9 +721,7 @@ def test_ambiguous_or_mismatched_receipt_evidence_is_not_persisted(
                     "kind": "linked_observation",
                     "observation_ids": ["missing"],
                 },
-                "observations": [
-                    {"proposition_id": "o1", "content": {"ok": True}}
-                ],
+                "observations": [{"proposition_id": "o1", "content": {"ok": True}}],
             },
             {
                 "effect_evidence": {

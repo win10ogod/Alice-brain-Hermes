@@ -52,6 +52,35 @@ def test_event_envelope_is_strict_deeply_frozen_and_canonical() -> None:
     ).canonical_json(exclude_sequence=True)
 
 
+def test_frozen_json_backing_slot_cannot_rebind_event_or_state_data() -> None:
+    envelope = event("observation.received", {"nested": {"value": "original"}})
+    state = reduce_state(
+        BrainState.genesis(BRAIN),
+        event(
+            "capabilities.reported",
+            {"capabilities": {"nested": {"value": "original"}}},
+        ),
+    )
+    event_json = envelope.canonical_json()
+    body_fingerprint = envelope.body_fingerprint()
+    envelope_fingerprint = envelope.envelope_fingerprint()
+    state_json = state.canonical_json()
+
+    for frozen in (
+        envelope.payload,
+        envelope.payload["nested"],
+        state.capabilities,
+        state.capabilities["nested"],
+    ):
+        with pytest.raises(TypeError, match="immutable"):
+            frozen._data = {"rebound": True}
+
+    assert envelope.canonical_json() == event_json
+    assert envelope.body_fingerprint() == body_fingerprint
+    assert envelope.envelope_fingerprint() == envelope_fingerprint
+    assert state.canonical_json() == state_json
+
+
 def test_frozen_json_iteration_is_recursively_canonical() -> None:
     first = FrozenJsonDict(
         {
@@ -67,13 +96,21 @@ def test_frozen_json_iteration_is_recursively_canonical() -> None:
     )
 
     assert tuple(first) == tuple(second) == ("a", "z")
-    assert tuple(first["z"]) == tuple(second["z"]) == (
-        "a-inner",
-        "z-inner",
+    assert (
+        tuple(first["z"])
+        == tuple(second["z"])
+        == (
+            "a-inner",
+            "z-inner",
+        )
     )
-    assert tuple(first["a"][0]) == tuple(second["a"][0]) == (
-        "a-list",
-        "z-list",
+    assert (
+        tuple(first["a"][0])
+        == tuple(second["a"][0])
+        == (
+            "a-list",
+            "z-list",
+        )
     )
     state = reduce_state(
         BrainState.genesis(BRAIN),

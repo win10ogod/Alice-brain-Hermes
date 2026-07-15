@@ -85,7 +85,19 @@ class FrozenJsonDict(Mapping[str, Any]):
         for key in sorted(keys):
             value = source[key]
             data[key] = _freeze_json(value, location=f"payload.{key}")
-        self._data = MappingProxyType(data)
+        object.__setattr__(self, "_data", MappingProxyType(data))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_data":
+            try:
+                object.__getattribute__(self, "_data")
+            except AttributeError:
+                object.__setattr__(self, name, value)
+                return
+        raise TypeError("FrozenJsonDict is immutable")
+
+    def __delattr__(self, _name: str) -> None:
+        raise TypeError("FrozenJsonDict is immutable")
 
     def __getitem__(self, key: str) -> Any:
         return self._data[key]

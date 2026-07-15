@@ -9,7 +9,8 @@ from typing import Any, ClassVar
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict
-from alice_brain_hermes.errors import DomainInvariantError
+from alice_brain_hermes.core.limits import MAX_WORLD_PROPOSITIONS_PER_LAYER
+from alice_brain_hermes.errors import DomainCapacityError, DomainInvariantError
 
 
 class RDPhase(StrEnum):
@@ -144,9 +145,7 @@ def _transition(
         raise DomainInvariantError("invalid action transition") from error
 
 
-def _receipt_grounded_ids(
-    event: EventEnvelope, *, trusted: bool
-) -> frozenset[str]:
+def _receipt_grounded_ids(event: EventEnvelope, *, trusted: bool) -> frozenset[str]:
     evidence = event.payload.get("effect_evidence")
     if evidence is None:
         return frozenset()
@@ -156,9 +155,7 @@ def _receipt_grounded_ids(
         raise DomainInvariantError("receipt effect evidence kind is unsupported")
     evidence_ids = evidence.get("observation_ids")
     if not isinstance(evidence_ids, (list, tuple)) or not evidence_ids:
-        raise DomainInvariantError(
-            "receipt effect evidence requires observation IDs"
-        )
+        raise DomainInvariantError("receipt effect evidence requires observation IDs")
     if any(not isinstance(item, str) or not item.strip() for item in evidence_ids):
         raise DomainInvariantError(
             "receipt effect evidence observation IDs must be non-blank strings"
@@ -166,6 +163,10 @@ def _receipt_grounded_ids(
     if len(evidence_ids) != len(set(evidence_ids)):
         raise DomainInvariantError(
             "receipt effect evidence observation IDs must be unique"
+        )
+    if len(evidence_ids) > MAX_WORLD_PROPOSITIONS_PER_LAYER:
+        raise DomainCapacityError(
+            "receipt observation capacity is bounded; receipt was not applied"
         )
 
     observations = event.payload.get("observations")
@@ -268,9 +269,7 @@ def reduce_actions(
         execution = (
             True if status == "success" else False if status == "failure" else None
         )
-        grounded_ids = _receipt_grounded_ids(
-            event, trusted=trusted_provenance
-        )
+        grounded_ids = _receipt_grounded_ids(event, trusted=trusted_provenance)
         action = _transition(
             action,
             event,

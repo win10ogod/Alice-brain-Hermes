@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import math
+import os
 import re
+import sqlite3
 import threading
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Protocol
 
 from alice_brain_hermes.core.cognition import LocalCognitionPort, result_payload
@@ -15,6 +18,13 @@ from alice_brain_hermes.core.state import BrainState
 from alice_brain_hermes.core.workspace import WorkspaceCoordinator
 from alice_brain_hermes.errors import EventConflictError, ExpectedSequenceError
 from alice_brain_hermes.ids import validate_id
+from alice_brain_hermes.protocol.models import (
+    BridgeCommitAckV1,
+    BridgeRecordV1,
+    BridgeStreamState,
+    ConsciousnessFrameV2,
+)
+from alice_brain_hermes.runtime.store import BridgeAbandonResult, BridgeCommitResult
 
 
 class EventLedger(Protocol):
@@ -31,6 +41,35 @@ class EventLedger(Protocol):
     ) -> tuple[EventEnvelope | None, int]: ...
 
     def replay(self, brain_id: str) -> BrainState: ...
+
+    def commit_bridge_record(
+        self,
+        bridge_instance_id: str,
+        record: BridgeRecordV1,
+        *,
+        expected_state: BrainState,
+        connected_nonce: str | None = None,
+        max_frame_bytes: int = 65_536,
+        max_ack_bytes: int = 4_194_304,
+    ) -> BridgeCommitResult: ...
+
+    def abandon_bridge_stream(
+        self,
+        bridge_instance_id: str,
+        *,
+        expected_state: BrainState,
+        last_seen_not_after: datetime | None = None,
+    ) -> BridgeAbandonResult: ...
+
+    def project_bridge_frame(
+        self,
+        bridge_instance_id: str,
+        *,
+        expected_state: BrainState,
+        connected_nonce: str | None = None,
+        scheduler_sample: str,
+        max_frame_bytes: int = 65_536,
+    ) -> ConsciousnessFrameV2: ...
 
 
 class Coordinator(Protocol):
@@ -70,23 +109,36 @@ class ConsciousEngine:
         self.cognition = cognition or LocalCognitionPort()
         self.coordinator = coordinator
         self._default_coordinator = WorkspaceCoordinator()
+        self._creator_pid = os.getpid()
         self._lock = threading.RLock()
-        self._state = ledger.replay(brain_id)
+        bootstrap_state = getattr(ledger, "bootstrap_state", None)
+        self._state = (
+            bootstrap_state(brain_id)
+            if callable(bootstrap_state)
+            else ledger.replay(brain_id)
+        )
         self._diverged = False
+
+    def _assert_creator_process(self) -> None:
+        if os.getpid() != self._creator_pid:
+            raise PermissionError("conscious engine belongs to another process")
 
     @property
     def state(self) -> BrainState:
+        self._assert_creator_process()
         with self._lock:
             return self._state
 
     @property
     def is_stale(self) -> bool:
         """Whether this engine must be reconstructed from authoritative replay."""
+        self._assert_creator_process()
         with self._lock:
             return self._diverged
 
     def append(self, event: EventEnvelope) -> EventEnvelope:
         """Validate next state, persist, then publish the authoritative state."""
+        self._assert_creator_process()
         if event.brain_id != self.brain_id:
             raise ValueError("event brain does not match engine brain")
         if event.sequence is not None:
@@ -152,11 +204,110 @@ class ConsciousEngine:
             self._state = successor
             return stored
 
+    def commit_bridge_record(
+        self,
+        bridge_instance_id: str,
+        record: BridgeRecordV1,
+        *,
+        connected_nonce: str | None = None,
+        max_frame_bytes: int = 65_536,
+        max_ack_bytes: int = 4_194_304,
+    ) -> BridgeCommitAckV1:
+        """Commit one typed bridge record and publish only its committed successor."""
+        self._assert_creator_process()
+        with self._lock:
+            if self._diverged:
+                raise EventConflictError(
+                    "engine sequence divergence requires a replayed restart"
+                )
+            try:
+                result = self.ledger.commit_bridge_record(
+                    bridge_instance_id,
+                    record,
+                    expected_state=self._state,
+                    connected_nonce=connected_nonce,
+                    max_frame_bytes=max_frame_bytes,
+                    max_ack_bytes=max_ack_bytes,
+                )
+            except ExpectedSequenceError as error:
+                self._diverged = True
+                raise EventConflictError(
+                    "engine sequence divergence during bridge commit; "
+                    "restart from ledger replay is required"
+                ) from error
+            except sqlite3.DatabaseError:
+                self._diverged = True
+                raise
+            if result.successor is not None:
+                if result.successor.last_sequence != result.ack.event_sequence:
+                    self._diverged = True
+                    raise EventConflictError(
+                        "bridge publication does not match committed sequence"
+                    )
+                self._state = result.successor
+            return result.ack
+
+    def abandon_bridge_stream(
+        self,
+        bridge_instance_id: str,
+        *,
+        last_seen_not_after: datetime | None = None,
+    ) -> BridgeStreamState:
+        """Publish one committed unknown-gap successor after grace expiry."""
+        self._assert_creator_process()
+        with self._lock:
+            if self._diverged:
+                raise EventConflictError(
+                    "engine sequence divergence requires a replayed restart"
+                )
+            try:
+                result = self.ledger.abandon_bridge_stream(
+                    bridge_instance_id,
+                    expected_state=self._state,
+                    last_seen_not_after=last_seen_not_after,
+                )
+            except ExpectedSequenceError as error:
+                self._diverged = True
+                raise EventConflictError(
+                    "engine sequence divergence during bridge abandonment; "
+                    "restart from ledger replay is required"
+                ) from error
+            except sqlite3.DatabaseError:
+                self._diverged = True
+                raise
+            if result.successor is not None:
+                self._state = result.successor
+            return result.stream
+
+    def project_bridge_frame(
+        self,
+        bridge_instance_id: str,
+        *,
+        connected_nonce: str | None = None,
+        scheduler_sample: str,
+        max_frame_bytes: int = 65_536,
+    ) -> ConsciousnessFrameV2:
+        """Return one integrity-checked live frame under engine serialization."""
+        self._assert_creator_process()
+        with self._lock:
+            if self._diverged:
+                raise EventConflictError(
+                    "engine sequence divergence requires a replayed restart"
+                )
+            return self.ledger.project_bridge_frame(
+                bridge_instance_id,
+                expected_state=self._state,
+                connected_nonce=connected_nonce,
+                scheduler_sample=scheduler_sample,
+                max_frame_bytes=max_frame_bytes,
+            )
+
     def _event(self, event_type: str, payload: Mapping[str, object]) -> EventEnvelope:
         return new_event(event_type, self.brain_id, self.actor_id, payload)
 
     def pulse(self, elapsed_seconds: float) -> BrainState:
         """Advance one genuine C0 cycle without an agent turn or provider."""
+        self._assert_creator_process()
         if (
             isinstance(elapsed_seconds, bool)
             or not isinstance(elapsed_seconds, (int, float))
@@ -176,9 +327,7 @@ class ConsciousEngine:
                 "workspace.broadcast",
                 {
                     "cycle": cycle,
-                    "candidates": [
-                        item.model_dump(mode="json") for item in candidates
-                    ],
+                    "candidates": [item.model_dump(mode="json") for item in candidates],
                 },
             )
         )
@@ -196,11 +345,13 @@ class ConsciousEngine:
         return self.state
 
     def record_failure(self, error: Exception, *, phase: str) -> EventEnvelope:
+        self._assert_creator_process()
         return self.append(
             self._event("runtime.failure", sanitized_failure(error, phase=phase))
         )
 
     def record_recovered(self) -> EventEnvelope:
+        self._assert_creator_process()
         return self.append(self._event("runtime.recovered", {"status": "healthy"}))
 
 

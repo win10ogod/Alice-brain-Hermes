@@ -11,7 +11,8 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict
-from alice_brain_hermes.errors import DomainInvariantError
+from alice_brain_hermes.core.limits import MAX_PERSONALITY_VALUES_PER_LAYER
+from alice_brain_hermes.errors import DomainCapacityError, DomainInvariantError
 
 PersonalityLayer = Literal["traits", "adaptations", "narrative_ideal"]
 _RATE_POLICIES: dict[str, tuple[float, float]] = {
@@ -32,9 +33,7 @@ def _deterministic_decimal_context(*, term_count: int = 1) -> Iterator[None]:
     that complete span; the term-count digits cover an exact finite sum.
     """
     with localcontext() as context:
-        context.prec = _FINITE_FLOAT_DECIMAL_PRECISION + len(
-            str(max(1, term_count))
-        )
+        context.prec = _FINITE_FLOAT_DECIMAL_PRECISION + len(str(max(1, term_count)))
         context.Emax = MAX_EMAX
         context.Emin = MIN_EMIN
         context.rounding = ROUND_HALF_EVEN
@@ -98,8 +97,7 @@ class LayerRateState(BaseModel):
             elapsed = Decimal(str(target)) - Decimal(str(self.logical_clock))
             available = min(
                 Decimal(str(self.capacity)),
-                Decimal(str(self.available))
-                + elapsed * Decimal(str(self.refill_rate)),
+                Decimal(str(self.available)) + elapsed * Decimal(str(self.refill_rate)),
             )
         return self.model_copy(
             update={
@@ -155,10 +153,7 @@ class PersonalityRateState(BaseModel):
     def _policies_are_fixed(self) -> PersonalityRateState:
         for layer, (capacity, refill_rate) in _RATE_POLICIES.items():
             bucket = getattr(self, layer)
-            if (
-                bucket.capacity != capacity
-                or bucket.refill_rate != refill_rate
-            ):
+            if bucket.capacity != capacity or bucket.refill_rate != refill_rate:
                 raise ValueError(
                     f"{layer} personality rate policy does not match runtime policy"
                 )
@@ -280,6 +275,10 @@ def reduce_personality(
     updates = _numeric_values(event.payload.get("values"))
     current = getattr(personality, layer)
     merged = dict(current.items())
+    if len(set(current) | set(updates)) > MAX_PERSONALITY_VALUES_PER_LAYER:
+        raise DomainCapacityError(
+            f"personality {layer} capacity is full; revision was not applied"
+        )
     try:
         bucket = getattr(personality.rate_state, layer).advanced_to(logical_clock)
     except DomainInvariantError:
@@ -298,9 +297,7 @@ def reduce_personality(
             raise DomainInvariantError("personality values must be finite")
         if not -1.0 <= value <= 1.0:
             raise DomainInvariantError("personality values must be in [-1.0, 1.0]")
-        changes.append(
-            (Decimal(str(raw_value)), Decimal(str(current.get(key, 0.0))))
-        )
+        changes.append((Decimal(str(raw_value)), Decimal(str(current.get(key, 0.0)))))
         merged[key] = value
     with _deterministic_decimal_context(term_count=len(changes)):
         cumulative_change = sum(

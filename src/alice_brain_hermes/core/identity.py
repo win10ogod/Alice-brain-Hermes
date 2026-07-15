@@ -8,7 +8,11 @@ from typing import ClassVar
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict
-from alice_brain_hermes.errors import DomainInvariantError
+from alice_brain_hermes.core.limits import (
+    MAX_IDENTITY_ACTORS,
+    MAX_PROVENANCE_AUTHORIZATIONS,
+)
+from alice_brain_hermes.errors import DomainCapacityError, DomainInvariantError
 from alice_brain_hermes.ids import validate_id
 
 
@@ -152,6 +156,13 @@ def reduce_identity(identity: IdentityState, event: EventEnvelope) -> IdentitySt
             raise DomainInvariantError("the self actor kind cannot be replaced")
         if actor.parent_actor_id == actor.actor_id:
             raise DomainInvariantError("an actor cannot be its own parent")
+        if (
+            all(item.actor_id != actor.actor_id for item in identity.actors)
+            and len(identity.actors) >= MAX_IDENTITY_ACTORS
+        ):
+            raise DomainCapacityError(
+                "identity actor capacity is full; registration was not applied"
+            )
         return identity.model_copy(
             update={"actors": _replace_actor(identity.actors, actor)}
         ).revalidated()
@@ -170,6 +181,11 @@ def reduce_identity(identity: IdentityState, event: EventEnvelope) -> IdentitySt
             raise DomainInvariantError("invalid provenance authorization") from error
         if authorization in identity.authorizations:
             return identity
+        if len(identity.authorizations) >= MAX_PROVENANCE_AUTHORIZATIONS:
+            raise DomainCapacityError(
+                "provenance authorization capacity is full; authorization "
+                "was not applied"
+            )
         return identity.model_copy(
             update={"authorizations": (*identity.authorizations, authorization)}
         ).revalidated()

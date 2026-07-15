@@ -7,6 +7,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from alice_brain_hermes.core.action import (
+    ActionPhase,
     RDPhase,
     ThoughtBranch,
     action_id_from_event,
@@ -15,6 +16,15 @@ from alice_brain_hermes.core.action import (
 from alice_brain_hermes.core.cognition import cognition_result_from_payload
 from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict, thaw_json
 from alice_brain_hermes.core.identity import reduce_identity
+from alice_brain_hermes.core.limits import (
+    MAX_ACTION_RECORDS,
+    MAX_CAPABILITIES,
+    MAX_COGNITION_REFLECTIONS,
+    MAX_ENERGY_RECORDS,
+    MAX_MEMORY_RECORDS,
+    MAX_RAW_LIFECYCLE_KEYS,
+    MAX_THOUGHT_BRANCHES,
+)
 from alice_brain_hermes.core.personality import (
     advance_personality_clock,
     energy_from_event,
@@ -25,6 +35,8 @@ from alice_brain_hermes.core.state import (
     BrainState,
     RuntimeFailure,
     RuntimeState,
+    WorkingSetCounter,
+    WorkingSetState,
     state_from_data,
 )
 from alice_brain_hermes.core.workspace import (
@@ -34,11 +46,33 @@ from alice_brain_hermes.core.workspace import (
     choose_broadcast,
 )
 from alice_brain_hermes.core.world import reduce_world
-from alice_brain_hermes.errors import DomainInvariantError, SchemaVersionError
+from alice_brain_hermes.errors import (
+    DomainCapacityError,
+    DomainInvariantError,
+    SchemaVersionError,
+)
 
 
 def _state_values(state: BrainState) -> dict[str, Any]:
     return state.model_dump(mode="python")
+
+
+def _advance_working_set(
+    working_set: WorkingSetState,
+    name: str,
+    *,
+    admitted: int = 0,
+    evicted: int = 0,
+) -> WorkingSetState:
+    counter = getattr(working_set, name)
+    return working_set.model_copy(
+        update={
+            name: WorkingSetCounter(
+                total=counter.total + admitted,
+                evicted=counter.evicted + evicted,
+            )
+        }
+    )
 
 
 def _payload_mapping(value: Any, *, field: str) -> Mapping[str, Any]:
@@ -103,7 +137,7 @@ def _reduce_memory(state: BrainState, event: EventEnvelope) -> tuple[MemoryRecor
     retained = tuple(
         item for item in state.memories if item.memory_id != memory.memory_id
     )
-    return (*retained, memory)[-256:]
+    return (*retained, memory)[-MAX_MEMORY_RECORDS:]
 
 
 def _runtime_failure(event: EventEnvelope) -> RuntimeFailure:
@@ -132,9 +166,7 @@ def _simulation_branch(event: EventEnvelope) -> ThoughtBranch:
             branch_id=event.payload.get("branch_id", proposition_id),
             stance=event.payload.get("stance", "simulate"),
             content=event.payload["content"],
-            expected_consequences=tuple(
-                FrozenJsonDict(item) for item in consequences
-            ),
+            expected_consequences=tuple(FrozenJsonDict(item) for item in consequences),
             uncertainty=float(event.payload.get("uncertainty", 0.5)),
             source_ids=tuple(event.payload.get("source_ids", ())),
             rd_phase=RDPhase.SIMULATE,
@@ -163,37 +195,131 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
         )
 
     values = _state_values(state)
+    working_set = state.working_set.model_copy(
+        update={"reduced_event_count": state.working_set.reduced_event_count + 1}
+    )
     counts = dict(state.raw_lifecycle_counts.items())
+    if event.event_type not in counts:
+        raw_evicted_events = working_set.raw_lifecycle_events_evicted
+        raw_key_evicted = 0
+        if len(counts) >= MAX_RAW_LIFECYCLE_KEYS:
+            evicted_key = sorted(counts)[0]
+            raw_evicted_events += counts.pop(evicted_key)
+            raw_key_evicted = 1
+        working_set = _advance_working_set(
+            working_set,
+            "raw_lifecycle_counts",
+            admitted=1,
+            evicted=raw_key_evicted,
+        ).model_copy(update={"raw_lifecycle_events_evicted": raw_evicted_events})
     counts[event.event_type] = counts.get(event.event_type, 0) + 1
     values["raw_lifecycle_counts"] = dict(sorted(counts.items()))
     if event.sequence is not None:
         values["last_sequence"] = event.sequence
 
-    trusted_provenance = state.identity.is_authorized(
-        event.actor_id, event.adapter_id
-    )
+    trusted_provenance = state.identity.is_authorized(event.actor_id, event.adapter_id)
     identity = reduce_identity(state.identity, event)
     values["identity"] = identity
-    values["personality"] = reduce_personality(
+    if len(identity.actors) > len(state.identity.actors):
+        working_set = _advance_working_set(working_set, "identity_actors", admitted=1)
+    if len(identity.authorizations) > len(state.identity.authorizations):
+        working_set = _advance_working_set(
+            working_set, "provenance_authorizations", admitted=1
+        )
+    personality = reduce_personality(
         state.personality,
         event,
         logical_clock=state.logical_clock,
     )
+    values["personality"] = personality
+    for layer in ("traits", "adaptations", "narrative_ideal"):
+        admitted = len(getattr(personality, layer)) - len(
+            getattr(state.personality, layer)
+        )
+        if admitted:
+            working_set = _advance_working_set(
+                working_set, f"personality_{layer}", admitted=admitted
+            )
 
+    previous_action_ids = {item.action_id for item in state.action_records}
     actions, grounded_receipt = reduce_actions(
         state.action_records,
         event,
         trusted_provenance=trusted_provenance,
     )
+    admitted_actions = sum(
+        item.action_id not in previous_action_ids for item in actions
+    )
+    evicted_action_id: str | None = None
+    if len(actions) > MAX_ACTION_RECORDS:
+        terminal_index = next(
+            (
+                index
+                for index, item in enumerate(actions)
+                if item.phase is ActionPhase.RECONSTRUCTED
+            ),
+            None,
+        )
+        if terminal_index is None:
+            raise DomainCapacityError(
+                "active action capacity is full; proposal was not applied"
+            )
+        evicted_action_id = actions[terminal_index].action_id
+        actions = actions[:terminal_index] + actions[terminal_index + 1 :]
+    if admitted_actions:
+        working_set = _advance_working_set(
+            working_set,
+            "action_records",
+            admitted=admitted_actions,
+            evicted=int(evicted_action_id is not None),
+        )
     values["action_records"] = actions
-    values["world"] = reduce_world(
+    if evicted_action_id is not None:
+        retained_energy = tuple(
+            item for item in state.energy_records if item.action_id != evicted_action_id
+        )
+        if len(retained_energy) != len(state.energy_records):
+            values["energy_records"] = retained_energy
+            working_set = _advance_working_set(working_set, "energy_records", evicted=1)
+
+    world = reduce_world(
         state.world,
         event,
         trusted_provenance=trusted_provenance,
         grounded_receipt=grounded_receipt,
     )
+    values["world"] = world
+    for layer in ("observed", "believed", "simulated", "ideal"):
+        previous = getattr(state.world, layer)
+        current = getattr(world, layer)
+        previous_ids = {item.proposition_id for item in previous}
+        current_ids = {item.proposition_id for item in current}
+        retained_existing = len(previous_ids & current_ids)
+        admitted = len(current) - retained_existing
+        evicted = len(previous) + admitted - len(current)
+        if admitted or evicted:
+            working_set = _advance_working_set(
+                working_set,
+                f"world_{layer}",
+                admitted=admitted,
+                evicted=evicted,
+            )
     values["workspace"] = _reduce_workspace(state, event)
-    values["memories"] = _reduce_memory(state, event)
+    memories = _reduce_memory(state, event)
+    values["memories"] = memories
+    if event.event_type == "memory.recorded":
+        memory_id = event.payload.get("memory_id")
+        admitted_memory = int(
+            isinstance(memory_id, str)
+            and all(item.memory_id != memory_id for item in state.memories)
+        )
+        memory_evicted = max(0, len(state.memories) + admitted_memory - len(memories))
+        working_set = _advance_working_set(
+            working_set,
+            "memories",
+            admitted=admitted_memory,
+            evicted=memory_evicted,
+        )
 
     if event.event_type in {"brain.created", "identity.named"}:
         name = event.payload.get("name")
@@ -231,7 +357,14 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
         capabilities = _payload_mapping(
             event.payload.get("capabilities"), field="capabilities"
         )
+        if len(capabilities) > MAX_CAPABILITIES:
+            raise DomainCapacityError(
+                "capabilities exceed the bounded working-set capacity"
+            )
         values["capabilities"] = thaw_json(FrozenJsonDict(capabilities))
+        working_set = working_set.model_copy(
+            update={"capabilities": WorkingSetCounter(total=len(capabilities))}
+        )
     elif event.event_type == "trace.gap":
         values["trace_complete"] = False
     elif event.event_type == "action.energy_assessed":
@@ -239,13 +372,38 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
         if action_id not in state.actions:
             raise DomainInvariantError("energy assessment requires an existing action")
         energy = energy_from_event(event)
-        values["energy_records"] = upsert_energy(state.energy_records, energy)
+        energy_source = state.energy_records
+        energies = upsert_energy(energy_source, energy)
+        admitted_energy = int(
+            all(item.action_id != action_id for item in energy_source)
+        )
+        energy_evicted = 0
+        if len(energies) > MAX_ENERGY_RECORDS:
+            energies = energies[-MAX_ENERGY_RECORDS:]
+            energy_evicted = 1
+        values["energy_records"] = energies
+        working_set = _advance_working_set(
+            working_set,
+            "energy_records",
+            admitted=admitted_energy,
+            evicted=energy_evicted,
+        )
     elif event.event_type == "simulation.created":
         branch = _simulation_branch(event)
+        admitted_branch = int(
+            all(item.branch_id != branch.branch_id for item in state.thought_space)
+        )
         retained = tuple(
             item for item in state.thought_space if item.branch_id != branch.branch_id
         )
-        values["thought_space"] = (*retained, branch)[-256:]
+        branches = (*retained, branch)[-MAX_THOUGHT_BRANCHES:]
+        values["thought_space"] = branches
+        working_set = _advance_working_set(
+            working_set,
+            "thought_space",
+            admitted=admitted_branch,
+            evicted=max(0, len(state.thought_space) + admitted_branch - len(branches)),
+        )
     elif event.event_type == "cognition.reflected":
         try:
             result = cognition_result_from_payload(event.payload)
@@ -254,7 +412,18 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
         if result.cognition_mode != "local" or result.provider_used is not False:
             raise DomainInvariantError("local cognition cannot claim provider use")
         values["cognition"] = state.cognition.model_copy(
-            update={"reflections": (*state.cognition.reflections, result)[-128:]}
+            update={
+                "reflections": (
+                    *state.cognition.reflections,
+                    result,
+                )[-MAX_COGNITION_REFLECTIONS:]
+            }
+        )
+        working_set = _advance_working_set(
+            working_set,
+            "cognition_reflections",
+            admitted=1,
+            evicted=int(len(state.cognition.reflections) >= MAX_COGNITION_REFLECTIONS),
         )
         branches = tuple(
             ThoughtBranch(
@@ -271,10 +440,22 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
             )
             for item in result.alternatives
         )
-        existing = {
-            item.branch_id: item for item in (*state.thought_space, *branches)
-        }
-        values["thought_space"] = tuple(existing.values())[-256:]
+        old_branch_ids = {item.branch_id for item in state.thought_space}
+        existing = {item.branch_id: item for item in (*state.thought_space, *branches)}
+        new_branch_count = sum(
+            item.branch_id not in old_branch_ids for item in branches
+        )
+        bounded_branches = tuple(existing.values())[-MAX_THOUGHT_BRANCHES:]
+        values["thought_space"] = bounded_branches
+        working_set = _advance_working_set(
+            working_set,
+            "thought_space",
+            admitted=new_branch_count,
+            evicted=max(
+                0,
+                len(state.thought_space) + new_branch_count - len(bounded_branches),
+            ),
+        )
     elif event.event_type == "runtime.failure":
         failure = _runtime_failure(event)
         values["runtime"] = RuntimeState(
@@ -295,6 +476,7 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
             last_failure=state.runtime.last_failure,
         )
 
+    values["working_set"] = working_set
     return state_from_data(values)
 
 

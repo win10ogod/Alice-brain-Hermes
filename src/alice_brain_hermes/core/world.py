@@ -9,6 +9,7 @@ from typing import Any, ClassVar
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict
+from alice_brain_hermes.core.limits import MAX_WORLD_PROPOSITIONS_PER_LAYER
 from alice_brain_hermes.errors import DomainInvariantError
 
 
@@ -59,6 +60,15 @@ class WorldModel(BaseModel):
     def _json_arrays_to_tuples(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
 
+    @field_validator("observed", "believed", "simulated", "ideal")
+    @classmethod
+    def _bounded_layers(
+        cls, value: tuple[WorldProposition, ...]
+    ) -> tuple[WorldProposition, ...]:
+        if len(value) > MAX_WORLD_PROPOSITIONS_PER_LAYER:
+            raise ValueError("world layer exceeds bounded working-set capacity")
+        return value
+
     def revalidated(self) -> WorldModel:
         return WorldModel.model_validate(self.model_dump(mode="python"))
 
@@ -100,7 +110,7 @@ def _upsert(
     retained = tuple(
         item for item in items if item.proposition_id != proposition.proposition_id
     )
-    return (*retained, proposition)
+    return (*retained, proposition)[-MAX_WORLD_PROPOSITIONS_PER_LAYER:]
 
 
 def reduce_world(

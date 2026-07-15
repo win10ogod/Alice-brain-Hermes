@@ -273,8 +273,9 @@ def test_pc_accepted_revision_is_order_and_ambient_precision_independent() -> No
     assert first.personality.rate_state.traits.available == pytest.approx(0.001)
 
 
-def test_pc_budget_refills_by_elapsed_logical_clock_and_rejects_bad_rate_state(
-) -> None:
+def test_pc_budget_refills_by_elapsed_logical_clock_and_rejects_bad_rate_state() -> (
+    None
+):
     state = reduce_state(
         BrainState.genesis(BRAIN),
         event(
@@ -386,9 +387,7 @@ def test_simulation_and_forged_trust_cannot_change_observed() -> None:
                 "kind": "linked_observation",
                 "observation_ids": ["o1"],
             },
-            "observations": [
-                {"proposition_id": "o1", "content": {"door": "open"}}
-            ],
+            "observations": [{"proposition_id": "o1", "content": {"door": "open"}}],
         },
         actor_id=OTHER_ACTOR,
         adapter_id="hermes-tool",

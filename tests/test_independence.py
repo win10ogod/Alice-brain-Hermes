@@ -26,8 +26,7 @@ def _write_wheel(
 ) -> None:
     requires_dist = "".join(f"Requires-Dist: {item}\n" for item in dependencies)
     metadata_text = (
-        f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n"
-        f"{requires_dist}\n"
+        f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n{requires_dist}\n"
     )
     dist_info = f"{name.replace('-', '_')}-{version}.dist-info"
     with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
@@ -72,7 +71,7 @@ def test_project_audit_rejects_exact_alice_brain_import_root(
         'import importlib as loader\nloader.import_module("alice_brain.runtime")\n',
         'from importlib import import_module\nimport_module("alice_brain")\n',
         (
-            'from importlib import import_module as load_module\n'
+            "from importlib import import_module as load_module\n"
             'load_module("alice_brain.runtime")\n'
         ),
         'import builtins\nbuiltins.__import__("alice_brain")\n',
@@ -80,12 +79,12 @@ def test_project_audit_rejects_exact_alice_brain_import_root(
         'from builtins import __import__ as load\nload("alice_brain")\n',
         '__import__("alice_" + "brain")\n',
         (
-            'import importlib as loader\n'
+            "import importlib as loader\n"
             'TARGET = "alice_" + "brain"\n'
-            'loader.import_module(TARGET)\n'
+            "loader.import_module(TARGET)\n"
         ),
-        'from . import alice_brain as runtime\n',
-        'from .. import alice_brain\n',
+        "from . import alice_brain as runtime\n",
+        "from .. import alice_brain\n",
     ],
 )
 def test_project_audit_rejects_statically_resolvable_import_bypasses(
@@ -100,7 +99,7 @@ def test_project_audit_rejects_statically_resolvable_import_bypasses(
 def test_project_audit_allows_dynamic_hermes_namespace(tmp_path: Path) -> None:
     _write_source(
         tmp_path,
-        'import importlib as loader\n'
+        "import importlib as loader\n"
         'loader.import_module("alice_brain_hermes.runtime")\n',
     )
 
@@ -116,21 +115,14 @@ def test_project_audit_allows_dynamic_hermes_namespace(tmp_path: Path) -> None:
             '    target = "alice_" + "brain"\n'
             "    return importlib.import_module(target)\n"
         ),
-        (
-            "import importlib.util\n"
-            'importlib.import_module("alice_brain.runtime")\n'
-        ),
+        ('import importlib.util\nimportlib.import_module("alice_brain.runtime")\n'),
         (
             "from importlib import import_module as load\n"
             "def load_runtime():\n"
             '    target = "alice_brain"\n'
             "    return load(target)\n"
         ),
-        (
-            "import importlib\n"
-            "load = importlib.import_module\n"
-            'load("alice_brain")\n'
-        ),
+        ('import importlib\nload = importlib.import_module\nload("alice_brain")\n'),
         (
             "from importlib import import_module\n"
             "def load_runtime():\n"
@@ -349,8 +341,7 @@ def test_project_audit_rejects_explicit_external_runtime_references(
             "daemon service",
         ),
         (
-            'BINARY = "alice-" + "brain"\n'
-            'COMMAND = ["uv", "run", BINARY, "daemon"]\n',
+            'BINARY = "alice-" + "brain"\nCOMMAND = ["uv", "run", BINARY, "daemon"]\n',
             "daemon service",
         ),
     ],
@@ -377,18 +368,12 @@ def test_project_audit_allows_hermes_state_and_wrapped_command(tmp_path: Path) -
 @pytest.mark.parametrize(
     "source",
     [
-        (
-            "from pathlib import Path\n"
-            'CHECKOUT = Path("..") / "alice_brain"\n'
-        ),
+        ('from pathlib import Path\nCHECKOUT = Path("..") / "alice_brain"\n'),
         (
             "from pathlib import Path as FilePath\n"
             'CHECKOUT = FilePath("..") / "alice_brain"\n'
         ),
-        (
-            "import os\n"
-            'CHECKOUT = os.path.join("..", "alice_brain")\n'
-        ),
+        ('import os\nCHECKOUT = os.path.join("..", "alice_brain")\n'),
         (
             "import os as platform_os\n"
             'CHECKOUT = platform_os.path.join("..", "alice_brain")\n'
@@ -464,11 +449,7 @@ def test_project_audit_never_ignores_nested_shipping_source_directories(
     tmp_path: Path, nested_name: str
 ) -> None:
     source = (
-        tmp_path
-        / "src"
-        / "alice_brain_hermes"
-        / nested_name
-        / "forbidden_bridge.py"
+        tmp_path / "src" / "alice_brain_hermes" / nested_name / "forbidden_bridge.py"
     )
     source.parent.mkdir(parents=True)
     source.write_text("import alice_brain\n", encoding="utf-8")
@@ -620,8 +601,7 @@ def test_wheel_audit_allows_hermes_entry_points(tmp_path: Path) -> None:
     _write_wheel(
         wheel,
         entry_points=(
-            "[console_scripts]\n"
-            "alice-brain-hermes = alice_brain_hermes.cli:main\n"
+            "[console_scripts]\nalice-brain-hermes = alice_brain_hermes.cli:main\n"
         ),
     )
 

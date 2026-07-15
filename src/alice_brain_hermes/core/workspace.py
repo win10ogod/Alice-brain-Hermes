@@ -6,9 +6,10 @@ import hashlib
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from alice_brain_hermes.core.events import FrozenJsonDict
+from alice_brain_hermes.core.limits import MAX_WORKSPACE_BROADCAST
 
 if TYPE_CHECKING:
     from alice_brain_hermes.core.state import BrainState
@@ -75,7 +76,11 @@ class WorkspaceState(BaseModel):
         extra="forbid", frozen=True, strict=True, validate_default=True
     )
 
-    capacity: int = Field(default=DEFAULT_WORKSPACE_CAPACITY, ge=1, le=64)
+    capacity: int = Field(
+        default=DEFAULT_WORKSPACE_CAPACITY,
+        ge=1,
+        le=MAX_WORKSPACE_BROADCAST,
+    )
     cycle: int = Field(default=0, ge=0)
     broadcast: tuple[WorkspaceCandidate, ...] = ()
 
@@ -84,6 +89,12 @@ class WorkspaceState(BaseModel):
     def _json_broadcast(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
 
+    @model_validator(mode="after")
+    def _broadcast_fits_capacity(self) -> WorkspaceState:
+        if len(self.broadcast) > self.capacity:
+            raise ValueError("workspace broadcast exceeds its declared capacity")
+        return self
+
 
 def choose_broadcast(
     candidates: Iterable[WorkspaceCandidate], *, capacity: int
@@ -91,8 +102,10 @@ def choose_broadcast(
     """Deduplicate by structured content, then score and tie-break stably."""
     if isinstance(capacity, bool) or not isinstance(capacity, int):
         raise TypeError("workspace capacity must be an integer")
-    if not 1 <= capacity <= 64:
-        raise ValueError("workspace capacity must be between 1 and 64")
+    if not 1 <= capacity <= MAX_WORKSPACE_BROADCAST:
+        raise ValueError(
+            f"workspace capacity must be between 1 and {MAX_WORKSPACE_BROADCAST}"
+        )
     best_by_content: dict[str, WorkspaceCandidate] = {}
     for candidate in candidates:
         if not isinstance(candidate, WorkspaceCandidate):
@@ -206,9 +219,7 @@ def _memory(state: BrainState, cycle: int) -> WorkspaceCandidate:
 
 def _self_world_conflict(state: BrainState, cycle: int) -> WorkspaceCandidate:
     ideal_keys = set(state.personality.narrative_ideal.keys())
-    observed_keys = {
-        key for item in state.world.observed for key in item.content
-    }
+    observed_keys = {key for item in state.world.observed for key in item.content}
     unmatched = sorted(ideal_keys - observed_keys)
     return _candidate(
         cycle,
