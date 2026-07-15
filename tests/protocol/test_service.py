@@ -9,6 +9,7 @@ import pytest
 
 from alice_brain_hermes.core.events import new_event
 from alice_brain_hermes.ids import new_id
+from alice_brain_hermes.protocol.identity import IdentityChoiceV1
 from alice_brain_hermes.protocol.models import (
     MAX_BRIDGE_COMMIT_ENVELOPE_BYTES,
     PROTOCOL_VERSION,
@@ -519,7 +520,7 @@ def test_daemon_status_is_typed_complete_zero_evidence_for_fresh_runtime(
             "gap": 1,
             "frame": 3,
             "semantic": 1,
-            "sqlite": 5,
+            "sqlite": 6,
         },
     }
 
@@ -914,6 +915,136 @@ def test_brain_resolve_reuses_one_server_persisted_stable_profile(service) -> No
     assert one["result"]["brain_id"] == two["result"]["brain_id"]
     assert one["result"]["created"] is True
     assert two["result"]["created"] is False
+
+
+def test_identity_naming_rpc_is_lease_bound_causal_and_idempotent(service) -> None:
+    first = service.new_connection()
+    second = service.new_connection()
+    initialize(first)
+    initialize(second)
+    profile = BrainProfileV1(profile_key="hermes.default", name=None).model_dump(
+        mode="json"
+    )
+    brain = decode(
+        first.handle_frame(request(2, "brain.resolve", {"profile": profile}))
+    )["result"]
+
+    claimed = decode(
+        first.handle_frame(
+            request(
+                3,
+                "identity.naming.claim",
+                {"brain_id": brain["brain_id"]},
+            )
+        )
+    )["result"]["lease"]
+    assert claimed["brain_id"] == brain["brain_id"]
+    assert claimed["state_sequence"] == 2
+    assert (
+        decode(
+            second.handle_frame(
+                request(
+                    2,
+                    "identity.naming.claim",
+                    {"brain_id": brain["brain_id"]},
+                )
+            )
+        )["result"]["lease"]
+        is None
+    )
+
+    choice = IdentityChoiceV1(
+        name="Mira",
+        reason="Chosen for stable continuity",
+    ).model_dump(mode="json")
+    completed = decode(
+        first.handle_frame(
+            request(
+                4,
+                "identity.naming.complete",
+                {"lease_id": claimed["lease_id"], "choice": choice},
+            )
+        )
+    )
+    exact_retry = decode(
+        second.handle_frame(
+            request(
+                3,
+                "identity.naming.complete",
+                {"lease_id": claimed["lease_id"], "choice": choice},
+            )
+        )
+    )
+    conflict_choice = {**choice, "name": "Aster"}
+    conflict = decode(
+        second.handle_frame(
+            request(
+                4,
+                "identity.naming.complete",
+                {
+                    "lease_id": claimed["lease_id"],
+                    "choice": conflict_choice,
+                },
+            )
+        )
+    )
+
+    assert completed["result"] == {"status": "completed"}
+    assert exact_retry["result"] == {"status": "completed"}
+    assert conflict["error"]["code"] == "idempotency_conflict"
+    state = service.runtime.ledger.replay(brain["brain_id"])
+    assert state.identity.name == "Mira"
+    assert [
+        event.event_type
+        for event in service.runtime.ledger.list_events(brain["brain_id"])
+    ][-4:] == [
+        "cognition.requested",
+        "cognition.completed",
+        "c1.deliberated",
+        "identity.named",
+    ]
+
+
+def test_identity_naming_failure_rpc_rejects_unsanitized_codes(service) -> None:
+    connection = service.new_connection()
+    initialize(connection)
+    brain = decode(connection.handle_frame(request(2, "brain.create", {"name": None})))[
+        "result"
+    ]
+    lease = decode(
+        connection.handle_frame(
+            request(
+                3,
+                "identity.naming.claim",
+                {"brain_id": brain["brain_id"]},
+            )
+        )
+    )["result"]["lease"]
+
+    rejected = decode(
+        connection.handle_frame(
+            request(
+                4,
+                "identity.naming.fail",
+                {"lease_id": lease["lease_id"], "failure_code": "bad code\nraw"},
+            )
+        )
+    )
+    failed = decode(
+        connection.handle_frame(
+            request(
+                5,
+                "identity.naming.fail",
+                {
+                    "lease_id": lease["lease_id"],
+                    "failure_code": "llm_error.TimeoutError",
+                },
+            )
+        )
+    )
+
+    assert rejected["error"]["code"] == "invalid_params"
+    assert failed["result"] == {"status": "failed"}
 
 
 def test_brain_resolve_rejects_whitespace_name_and_accepts_null(service) -> None:

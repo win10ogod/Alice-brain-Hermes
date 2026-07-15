@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import unicodedata
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from alice_brain_hermes.ids import validate_id
 
@@ -15,6 +15,7 @@ IDENTITY_NAME_MAX_CODEPOINTS = 160
 IDENTITY_NAME_MAX_UTF8_BYTES = 512
 IDENTITY_REASON_MAX_CODEPOINTS = 512
 IDENTITY_REASON_MAX_UTF8_BYTES = 2_048
+IDENTITY_NAMING_LEASE_SECONDS = 120
 
 
 def _is_noncharacter(value: str) -> bool:
@@ -114,11 +115,102 @@ class IdentityNamingLeaseV1(_StrictIdentityModel):
         return value.astimezone(UTC)
 
 
+class IdentityNamingLeaseStatusV1(_StrictIdentityModel):
+    """Durable audit state for one daemon-owned naming lease."""
+
+    schema_version: Literal[1] = 1
+    lease_id: str
+    brain_id: str
+    state_sequence: int = Field(ge=1)
+    status: Literal["pending", "completed", "failed", "superseded"]
+    requested_at: datetime
+    expires_at: datetime
+    choice: IdentityChoiceV1 | None = None
+    failure_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9_.-]+$",
+    )
+    terminal_event_id: str | None = None
+    terminal_at: datetime | None = None
+
+    @field_validator("lease_id", "brain_id")
+    @classmethod
+    def _ids(cls, value: str) -> str:
+        return validate_id(value)
+
+    @field_validator("terminal_event_id")
+    @classmethod
+    def _optional_event_id(cls, value: str | None) -> str | None:
+        return None if value is None else validate_id(value)
+
+    @field_validator("requested_at", "expires_at", "terminal_at")
+    @classmethod
+    def _aware_times(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("identity naming status times must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def _terminal_shape(self) -> IdentityNamingLeaseStatusV1:
+        if self.expires_at != self.requested_at + timedelta(
+            seconds=IDENTITY_NAMING_LEASE_SECONDS
+        ):
+            raise ValueError("identity naming lease duration is invalid")
+        if self.status == "pending":
+            if any(
+                value is not None
+                for value in (
+                    self.choice,
+                    self.failure_code,
+                    self.terminal_event_id,
+                    self.terminal_at,
+                )
+            ):
+                raise ValueError("pending identity naming lease is already terminal")
+        elif self.status == "completed":
+            if (
+                self.choice is None
+                or self.failure_code is not None
+                or self.terminal_event_id is None
+                or self.terminal_at is None
+            ):
+                raise ValueError("completed identity naming lease is incomplete")
+        elif self.status == "failed":
+            if (
+                self.failure_code is None
+                or self.terminal_event_id is None
+                or self.terminal_at is None
+            ):
+                raise ValueError("failed identity naming lease lacks failure evidence")
+        elif (
+            self.choice is not None
+            or self.failure_code is None
+            or self.terminal_event_id is not None
+            or self.terminal_at is None
+        ):
+            raise ValueError("superseded identity naming lease is inconsistent")
+        if self.terminal_at is not None and self.terminal_at < self.requested_at:
+            raise ValueError("identity naming terminal time predates its request")
+        if (
+            self.status in {"completed", "failed"}
+            and self.terminal_at is not None
+            and self.terminal_at >= self.expires_at
+        ):
+            raise ValueError("identity naming terminal time exceeds its live lease")
+        return self
+
+
 __all__ = [
     "IDENTITY_NAME_MAX_CODEPOINTS",
     "IDENTITY_NAME_MAX_UTF8_BYTES",
+    "IDENTITY_NAMING_LEASE_SECONDS",
     "IDENTITY_REASON_MAX_CODEPOINTS",
     "IDENTITY_REASON_MAX_UTF8_BYTES",
     "IdentityChoiceV1",
+    "IdentityNamingLeaseStatusV1",
     "IdentityNamingLeaseV1",
 ]

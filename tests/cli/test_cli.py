@@ -241,7 +241,7 @@ def test_status_payload_rejects_unknown_or_identity_collision_fields() -> None:
             "gap": 1,
             "frame": 3,
             "semantic": 1,
-            "sqlite": 5,
+            "sqlite": 6,
         },
     }
 
@@ -895,7 +895,7 @@ def test_doctor_fails_visible_persisted_integration_gaps(
             "gap": 1,
             "frame": 3,
             "semantic": 1,
-            "sqlite": 5,
+            "sqlite": 6,
         },
     }
     daemon.update(changes)

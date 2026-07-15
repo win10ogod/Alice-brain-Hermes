@@ -24,8 +24,8 @@ from tests.runtime.test_bridge_store import make_engine
 from tests.runtime.test_semantic_ingest import generic_observation, tool_observation
 
 
-def test_fresh_store_exposes_v5_semantic_schema() -> None:
-    assert SQLITE_SCHEMA_VERSION == 5
+def test_fresh_store_exposes_v6_identity_and_semantic_schema() -> None:
+    assert SQLITE_SCHEMA_VERSION == 6
 
 
 def test_empty_store_observability_is_complete_zero_evidence_not_a_gap(
@@ -1376,7 +1376,7 @@ def test_observability_snapshot_is_persisted_and_truthful_after_restart(
         before = ledger.observability_snapshot(engine.brain_id)
         aggregate = ledger.observability_snapshot()
         assert before.semantic_schema_version == 1
-        assert before.sqlite_schema_version == 5
+        assert before.sqlite_schema_version == 6
         assert before.trace_complete is False
         assert before.semantic_complete is False
         assert before.dropped_events == 0

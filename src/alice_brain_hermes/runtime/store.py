@@ -9,14 +9,15 @@ import os
 import re
 import sqlite3
 import threading
+import unicodedata
 from bisect import bisect_right
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from alice_brain_hermes.core.action import ActionPhase
 from alice_brain_hermes.core.events import EventEnvelope, new_event
@@ -45,6 +46,12 @@ from alice_brain_hermes.errors import (
     SnapshotConflictError,
 )
 from alice_brain_hermes.ids import new_id, validate_id
+from alice_brain_hermes.protocol.identity import (
+    IDENTITY_NAMING_LEASE_SECONDS,
+    IdentityChoiceV1,
+    IdentityNamingLeaseStatusV1,
+    IdentityNamingLeaseV1,
+)
 from alice_brain_hermes.protocol.models import (
     HOOK_EVENT_TYPES,
     MAX_BRIDGE_INTEGER,
@@ -73,7 +80,7 @@ from alice_brain_hermes.runtime.semantic_ingest import (
     span_context_fingerprint,
 )
 
-SQLITE_SCHEMA_VERSION = 5
+SQLITE_SCHEMA_VERSION = 6
 SEMANTIC_SCHEMA_VERSION = 1
 MAX_HERMES_SPANS_PER_STREAM = 256
 MAX_PERSISTED_OBSERVABILITY_COUNT = MAX_BRIDGE_INTEGER
@@ -81,7 +88,7 @@ MAX_PAGE_SIZE = 10_000
 DEFAULT_MAX_FRAME_BYTES = 65_536
 DEFAULT_MAX_ACK_BYTES = 4_194_304
 _LEGACY_STATE_SCHEMA_VERSIONS = frozenset({1, 2, 3})
-_SQLITE_BRIDGE_SCHEMA_VERSIONS = frozenset({3, 4, SQLITE_SCHEMA_VERSION})
+_SQLITE_BRIDGE_SCHEMA_VERSIONS = frozenset({3, 4, 5, SQLITE_SCHEMA_VERSION})
 
 _SQLITE_MUTATION_ACTIONS = frozenset(
     {
@@ -117,6 +124,9 @@ _SQLITE_MUTATION_ACTIONS = frozenset(
 )
 _SQLITE_MUTATING_NO_ARGUMENT_PRAGMAS = frozenset(
     {"incremental_vacuum", "optimize", "shrink_memory", "wal_checkpoint"}
+)
+_IDENTITY_WORKER_FAILURE_CODE = re.compile(
+    r"^(?:invalid_structured_choice|llm_error\.[A-Za-z0-9_]{1,80})$"
 )
 
 
@@ -283,6 +293,66 @@ CREATE TABLE brain_observability (
 ) WITHOUT ROWID;
 """
 
+_CREATE_IDENTITY_SCHEMA = """
+CREATE TABLE identity_name_registry (
+    brain_id TEXT PRIMARY KEY,
+    normalized_name TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    source_event_id TEXT NOT NULL UNIQUE,
+    FOREIGN KEY (brain_id) REFERENCES brains(brain_id),
+    FOREIGN KEY (source_event_id) REFERENCES events(event_id)
+) WITHOUT ROWID;
+
+CREATE TABLE identity_naming_lease (
+    lease_id TEXT PRIMARY KEY,
+    brain_id TEXT NOT NULL,
+    request_sequence INTEGER NOT NULL CHECK (request_sequence >= 1),
+    status TEXT NOT NULL CHECK (status IN (
+        'pending', 'completed', 'failed', 'superseded'
+    )),
+    requested_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    request_event_id TEXT NOT NULL UNIQUE,
+    choice_fingerprint TEXT CHECK (
+        choice_fingerprint IS NULL OR length(choice_fingerprint) = 64
+    ),
+    choice_json TEXT,
+    failure_code TEXT,
+    terminal_event_id TEXT UNIQUE,
+    terminal_at TEXT,
+    CHECK ((choice_fingerprint IS NULL) = (choice_json IS NULL)),
+    CHECK (
+        (status = 'pending'
+         AND choice_json IS NULL
+         AND failure_code IS NULL
+         AND terminal_event_id IS NULL
+         AND terminal_at IS NULL)
+        OR
+        (status = 'completed'
+         AND choice_json IS NOT NULL
+         AND failure_code IS NULL
+         AND terminal_event_id IS NOT NULL
+         AND terminal_at IS NOT NULL)
+        OR
+        (status = 'failed'
+         AND failure_code IS NOT NULL
+         AND terminal_event_id IS NOT NULL
+         AND terminal_at IS NOT NULL)
+        OR
+        (status = 'superseded'
+         AND failure_code IS NOT NULL
+         AND terminal_event_id IS NULL
+         AND terminal_at IS NOT NULL)
+    ),
+    FOREIGN KEY (brain_id) REFERENCES brains(brain_id),
+    FOREIGN KEY (request_event_id) REFERENCES events(event_id),
+    FOREIGN KEY (terminal_event_id) REFERENCES events(event_id)
+) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX identity_naming_pending ON identity_naming_lease(brain_id)
+WHERE status = 'pending';
+"""
+
 _CREATE_V2_SCHEMA = _CREATE_BASE_SCHEMA
 _CREATE_V4_SCHEMA = (
     _CREATE_BASE_SCHEMA
@@ -295,7 +365,8 @@ _CREATE_BRIDGE_SCHEMA = (
     + _CREATE_BRIDGE_RECORD_V5_SCHEMA
     + _CREATE_PROFILE_SCHEMA
 )
-_CREATE_SCHEMA = _CREATE_BASE_SCHEMA + _CREATE_BRIDGE_SCHEMA
+_CREATE_V5_SCHEMA = _CREATE_BASE_SCHEMA + _CREATE_BRIDGE_SCHEMA
+_CREATE_SCHEMA = _CREATE_V5_SCHEMA + _CREATE_IDENTITY_SCHEMA
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +386,21 @@ class BrainResolveResult:
     brain_id: str
     created: bool
     foundation: EventEnvelope | None = None
+
+
+IdentityNamingTerminalStatus = Literal["completed", "failed", "superseded"]
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityNamingClaimResult:
+    lease: IdentityNamingLeaseV1 | None
+    successor: BrainState | None
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityNamingTerminalResult:
+    status: IdentityNamingTerminalStatus
+    successor: BrainState | None
 
 
 def _schema_statements() -> Iterator[str]:
@@ -344,7 +430,8 @@ def _bridge_recovery_token_digest(value: object) -> bytes:
 def _schema_objects(script: str) -> dict[str, tuple[str, str]]:
     objects: dict[str, tuple[str, str]] = {}
     pattern = re.compile(
-        r"^CREATE\s+(TABLE|INDEX)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b",
+        r"^CREATE\s+(?:UNIQUE\s+)?(TABLE|INDEX)\s+"
+        r"([a-zA-Z_][a-zA-Z0-9_]*)\b",
         re.IGNORECASE,
     )
     for statement in _statements(script):
@@ -595,9 +682,10 @@ class SQLiteLedger:
                     self._rebuild_observability_in_transaction(
                         final_states=final_states
                     )
+                    self._install_identity_schema(final_states=final_states)
                 except Exception as error:
                     raise SchemaVersionError(
-                        "SQLite v2 to v5 migration failed"
+                        "SQLite v2 to v6 migration failed"
                     ) from error
                 self._connection.execute(
                     "UPDATE schema_metadata SET value = ? WHERE key = ?",
@@ -620,9 +708,37 @@ class SQLiteLedger:
                     self._migrate_bridge_schema_to_v5(
                         final_states=self._startup_audited_final_states
                     )
+                    self._install_identity_schema(
+                        final_states=self._startup_audited_final_states
+                    )
                 except Exception as error:
                     raise SchemaVersionError(
-                        f"SQLite v{version} to v5 migration failed"
+                        f"SQLite v{version} to v6 migration failed"
+                    ) from error
+                self._connection.execute(
+                    "UPDATE schema_metadata SET value = ? WHERE key = ?",
+                    (str(SQLITE_SCHEMA_VERSION), "schema_version"),
+                )
+                self._connection.execute(
+                    f"PRAGMA user_version = {SQLITE_SCHEMA_VERSION}"
+                )
+                self._startup_audited_final_states = self._validate_schema_contract(
+                    SQLITE_SCHEMA_VERSION, validate_data=True
+                )
+                self._validate_schema_metadata(SQLITE_SCHEMA_VERSION)
+                return
+            if version == 5:
+                self._validate_schema_metadata(5)
+                self._startup_audited_final_states = self._validate_schema_contract(
+                    5, validate_data=True
+                )
+                try:
+                    self._install_identity_schema(
+                        final_states=self._startup_audited_final_states
+                    )
+                except Exception as error:
+                    raise SchemaVersionError(
+                        "SQLite v5 to v6 migration failed"
                     ) from error
                 self._connection.execute(
                     "UPDATE schema_metadata SET value = ? WHERE key = ?",
@@ -645,6 +761,337 @@ class SQLiteLedger:
                 SQLITE_SCHEMA_VERSION, validate_data=True
             )
             self._validate_schema_metadata(SQLITE_SCHEMA_VERSION)
+
+    @staticmethod
+    def _normalized_identity_name(name: str) -> str:
+        return unicodedata.normalize("NFKC", name).casefold()
+
+    def _last_identity_name_event_in_transaction(
+        self,
+        brain_id: str,
+        name: str,
+    ) -> EventEnvelope:
+        rows = self._connection.execute(
+            "SELECT event_id, brain_id, sequence, body_fingerprint, "
+            "envelope_fingerprint, envelope_json FROM events "
+            "WHERE brain_id = ? ORDER BY sequence DESC",
+            (brain_id,),
+        ).fetchall()
+        for row in rows:
+            event = self._decode_event(row)
+            if (
+                event.event_type in {"brain.created", "identity.named"}
+                and event.payload.get("name") == name
+            ):
+                return event
+        raise LedgerIntegrityError("named identity lacks its source event")
+
+    def _install_identity_schema(
+        self,
+        *,
+        final_states: Mapping[str, BrainState],
+    ) -> None:
+        for statement in _statements(_CREATE_IDENTITY_SCHEMA):
+            self._connection.execute(statement)
+        for brain_id, state in final_states.items():
+            if state.identity.name is None:
+                continue
+            source = self._last_identity_name_event_in_transaction(
+                brain_id,
+                state.identity.name,
+            )
+            self._connection.execute(
+                "INSERT INTO identity_name_registry("
+                "brain_id, normalized_name, display_name, source_event_id) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    brain_id,
+                    self._normalized_identity_name(state.identity.name),
+                    state.identity.name,
+                    source.event_id,
+                ),
+            )
+
+    @staticmethod
+    def _identity_timestamp(value: object, *, field: str) -> datetime:
+        if not isinstance(value, str):
+            raise LedgerIntegrityError(f"identity {field} timestamp is invalid")
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as error:
+            raise LedgerIntegrityError(
+                f"identity {field} timestamp is invalid"
+            ) from error
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise LedgerIntegrityError(f"identity {field} timestamp is naive")
+        exact = parsed.astimezone(UTC)
+        if exact.isoformat() != value:
+            raise LedgerIntegrityError(
+                f"identity {field} timestamp is not canonical UTC"
+            )
+        return exact
+
+    @staticmethod
+    def _identity_choice_fingerprint(choice: IdentityChoiceV1) -> str:
+        return hashlib.sha256(choice.canonical_json().encode("utf-8")).hexdigest()
+
+    def _identity_status_from_row(
+        self,
+        row: sqlite3.Row,
+    ) -> IdentityNamingLeaseStatusV1:
+        choice: IdentityChoiceV1 | None = None
+        if row["choice_json"] is not None:
+            try:
+                choice = IdentityChoiceV1.model_validate_json(row["choice_json"])
+            except Exception as error:
+                raise LedgerIntegrityError(
+                    "identity naming choice is invalid"
+                ) from error
+            if (
+                choice.canonical_json() != row["choice_json"]
+                or self._identity_choice_fingerprint(choice)
+                != row["choice_fingerprint"]
+            ):
+                raise LedgerIntegrityError(
+                    "identity naming choice integrity check failed"
+                )
+        elif row["choice_fingerprint"] is not None:
+            raise LedgerIntegrityError("identity naming choice fingerprint is orphaned")
+        try:
+            return IdentityNamingLeaseStatusV1(
+                lease_id=row["lease_id"],
+                brain_id=row["brain_id"],
+                state_sequence=int(row["request_sequence"]),
+                status=row["status"],
+                requested_at=self._identity_timestamp(
+                    row["requested_at"], field="requested_at"
+                ),
+                expires_at=self._identity_timestamp(
+                    row["expires_at"], field="expires_at"
+                ),
+                choice=choice,
+                failure_code=row["failure_code"],
+                terminal_event_id=row["terminal_event_id"],
+                terminal_at=(
+                    None
+                    if row["terminal_at"] is None
+                    else self._identity_timestamp(row["terminal_at"], field="terminal")
+                ),
+            )
+        except Exception as error:
+            raise LedgerIntegrityError(
+                "identity naming lease row is invalid"
+            ) from error
+
+    def _validate_identity_rows_in_transaction(
+        self,
+        final_states: Mapping[str, BrainState],
+    ) -> None:
+        registry_rows = self._connection.execute(
+            "SELECT brain_id, normalized_name, display_name, source_event_id "
+            "FROM identity_name_registry ORDER BY brain_id"
+        ).fetchall()
+        registry = {row["brain_id"]: row for row in registry_rows}
+        expected_named = {
+            brain_id: state.identity.name
+            for brain_id, state in final_states.items()
+            if state.identity.name is not None
+        }
+        if set(registry) != set(expected_named):
+            raise LedgerIntegrityError("identity name registry coverage is invalid")
+        for brain_id, name in expected_named.items():
+            if name is None:
+                raise AssertionError("named identity unexpectedly became null")
+            row = registry[brain_id]
+            source = self._last_identity_name_event_in_transaction(brain_id, name)
+            if (
+                row["display_name"] != name
+                or row["normalized_name"] != self._normalized_identity_name(name)
+                or row["source_event_id"] != source.event_id
+            ):
+                raise LedgerIntegrityError(
+                    "identity name registry is not replay-derived"
+                )
+
+        lease_rows = self._connection.execute(
+            "SELECT lease_id, brain_id, request_sequence, status, requested_at, "
+            "expires_at, request_event_id, choice_fingerprint, choice_json, "
+            "failure_code, terminal_event_id, terminal_at "
+            "FROM identity_naming_lease ORDER BY lease_id"
+        ).fetchall()
+        for row in lease_rows:
+            status = self._identity_status_from_row(row)
+            if status.brain_id not in final_states:
+                raise LedgerIntegrityError("identity naming lease brain is missing")
+            request_row = self._connection.execute(
+                "SELECT event_id, brain_id, sequence, body_fingerprint, "
+                "envelope_fingerprint, envelope_json FROM events "
+                "WHERE event_id = ?",
+                (row["request_event_id"],),
+            ).fetchone()
+            if request_row is None:
+                raise LedgerIntegrityError("identity naming request event is missing")
+            request = self._decode_event(request_row)
+            if (
+                request.brain_id != status.brain_id
+                or request.actor_id != status.brain_id
+                or request.sequence != status.state_sequence
+                or request.event_type != "cognition.requested"
+                or request.adapter_id != "alice-brain-hermes-identity-v1"
+                or request.payload
+                != {
+                    "schema_version": 1,
+                    "purpose": "identity_self_naming",
+                    "lease_id": status.lease_id,
+                    "requested_at": status.requested_at.isoformat(),
+                    "expires_at": status.expires_at.isoformat(),
+                }
+            ):
+                raise LedgerIntegrityError(
+                    "identity naming request event does not match its lease"
+                )
+            if status.status == "superseded" and status.failure_code not in {
+                "expired",
+                "identity_already_named",
+            }:
+                raise LedgerIntegrityError(
+                    "identity naming supersession reason is invalid"
+                )
+            if status.status == "failed":
+                failure_code = status.failure_code
+                if failure_code is None:
+                    raise LedgerIntegrityError(
+                        "identity naming failure lost its reason"
+                    )
+                valid_failure = (
+                    _IDENTITY_WORKER_FAILURE_CODE.fullmatch(failure_code) is not None
+                    if status.choice is None
+                    else failure_code == "name_conflict"
+                )
+                if not valid_failure:
+                    raise LedgerIntegrityError(
+                        "identity naming failure origin is invalid"
+                    )
+            terminal_id = status.terminal_event_id
+            if terminal_id is None:
+                continue
+            terminal_row = self._connection.execute(
+                "SELECT event_id, brain_id, sequence, body_fingerprint, "
+                "envelope_fingerprint, envelope_json FROM events "
+                "WHERE event_id = ?",
+                (terminal_id,),
+            ).fetchone()
+            if terminal_row is None:
+                raise LedgerIntegrityError("identity naming terminal event is missing")
+            terminal = self._decode_event(terminal_row)
+            if (
+                terminal.brain_id != status.brain_id
+                or terminal.actor_id != status.brain_id
+                or terminal.adapter_id != "alice-brain-hermes-identity-v1"
+                or terminal.sequence is None
+                or terminal.sequence <= status.state_sequence
+            ):
+                raise LedgerIntegrityError(
+                    "identity naming terminal event changed lease provenance"
+                )
+            if status.status == "completed":
+                if terminal.sequence < 3:
+                    raise LedgerIntegrityError(
+                        "completed identity naming chain is truncated"
+                    )
+                causal_rows = self._connection.execute(
+                    "SELECT event_id, brain_id, sequence, body_fingerprint, "
+                    "envelope_fingerprint, envelope_json FROM events "
+                    "WHERE brain_id = ? AND sequence IN (?, ?) "
+                    "ORDER BY sequence",
+                    (
+                        status.brain_id,
+                        terminal.sequence - 2,
+                        terminal.sequence - 1,
+                    ),
+                ).fetchall()
+                if len(causal_rows) != 2:
+                    raise LedgerIntegrityError(
+                        "completed identity naming chain is missing"
+                    )
+                completed, deliberated = (
+                    self._decode_event(causal_rows[0]),
+                    self._decode_event(causal_rows[1]),
+                )
+                if status.choice is None or status.terminal_at is None:
+                    raise LedgerIntegrityError(
+                        "completed identity naming status lost its evidence"
+                    )
+                terminal_at = status.terminal_at.isoformat()
+                choice_fingerprint = self._identity_choice_fingerprint(status.choice)
+                if (
+                    terminal.event_type != "identity.named"
+                    or completed.event_type != "cognition.completed"
+                    or deliberated.event_type != "c1.deliberated"
+                    or completed.actor_id != status.brain_id
+                    or deliberated.actor_id != status.brain_id
+                    or completed.adapter_id != "alice-brain-hermes-identity-v1"
+                    or deliberated.adapter_id != "alice-brain-hermes-identity-v1"
+                    or completed.payload
+                    != {
+                        "schema_version": 1,
+                        "purpose": "identity_self_naming",
+                        "lease_id": status.lease_id,
+                        "choice_fingerprint": choice_fingerprint,
+                        "structured": True,
+                        "terminal_at": terminal_at,
+                    }
+                    or deliberated.payload
+                    != {
+                        "schema_version": 1,
+                        "purpose": "identity_self_naming",
+                        "lease_id": status.lease_id,
+                        "name": status.choice.name,
+                        "reason": status.choice.reason,
+                        "source_event_id": completed.event_id,
+                        "terminal_at": terminal_at,
+                    }
+                    or terminal.payload
+                    != {
+                        "schema_version": 1,
+                        "purpose": "identity_self_naming",
+                        "lease_id": status.lease_id,
+                        "name": status.choice.name,
+                        "reason": status.choice.reason,
+                        "source_event_id": deliberated.event_id,
+                        "terminal_at": terminal_at,
+                    }
+                ):
+                    raise LedgerIntegrityError(
+                        "completed identity naming event does not match its choice"
+                    )
+            else:
+                if (
+                    status.status != "failed"
+                    or status.failure_code is None
+                    or status.terminal_at is None
+                ):
+                    raise LedgerIntegrityError(
+                        "identity naming terminal status is invalid"
+                    )
+                failure_payload: dict[str, object] = {
+                    "schema_version": 1,
+                    "purpose": "identity_self_naming",
+                    "lease_id": status.lease_id,
+                    "failure_code": status.failure_code,
+                    "terminal_at": status.terminal_at.isoformat(),
+                }
+                if status.choice is not None:
+                    failure_payload["choice_fingerprint"] = (
+                        self._identity_choice_fingerprint(status.choice)
+                    )
+                if (
+                    terminal.event_type != "cognition.failed"
+                    or terminal.payload != failure_payload
+                ):
+                    raise LedgerIntegrityError(
+                        "failed identity naming event does not match its lease"
+                    )
 
     @staticmethod
     def _legacy_semantic_fingerprint(
@@ -823,6 +1270,8 @@ class SQLiteLedger:
             if version == 2
             else _CREATE_V4_SCHEMA
             if version in {3, 4}
+            else _CREATE_V5_SCHEMA
+            if version == 5
             else _CREATE_SCHEMA
         )
         rows = self._connection.execute(
@@ -877,6 +1326,13 @@ class SQLiteLedger:
             except Exception as error:
                 raise SchemaVersionError(
                     f"SQLite v{version} bridge or profile data integrity check failed"
+                ) from error
+        if version == SQLITE_SCHEMA_VERSION:
+            try:
+                self._validate_identity_rows_in_transaction(final_states)
+            except Exception as error:
+                raise SchemaVersionError(
+                    f"SQLite v{version} identity data integrity check failed"
                 ) from error
         return final_states
 
@@ -1356,6 +1812,31 @@ class SQLiteLedger:
             (brain_id,),
         )
 
+    def _record_identity_name_in_transaction(
+        self,
+        *,
+        brain_id: str,
+        name: str | None,
+        source_event_id: str,
+    ) -> None:
+        if name is None:
+            return
+        self._connection.execute(
+            "INSERT INTO identity_name_registry("
+            "brain_id, normalized_name, display_name, source_event_id) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(brain_id) DO UPDATE SET "
+            "normalized_name = excluded.normalized_name, "
+            "display_name = excluded.display_name, "
+            "source_event_id = excluded.source_event_id",
+            (
+                brain_id,
+                self._normalized_identity_name(name),
+                name,
+                source_event_id,
+            ),
+        )
+
     def create_brain_foundation(
         self, brain_id: str, *, name: str | None
     ) -> EventEnvelope:
@@ -1386,6 +1867,11 @@ class SQLiteLedger:
                     provisional.envelope_fingerprint(),
                     provisional.canonical_json(),
                 ),
+            )
+            self._record_identity_name_in_transaction(
+                brain_id=brain_id,
+                name=name,
+                source_event_id=provisional.event_id,
             )
         return provisional
 
@@ -1487,6 +1973,11 @@ class SQLiteLedger:
                     foundation.canonical_json(),
                 ),
             )
+            self._record_identity_name_in_transaction(
+                brain_id=brain_id,
+                name=profile.name,
+                source_event_id=foundation.event_id,
+            )
             self._connection.execute(
                 "INSERT INTO brain_profile("
                 "profile_key, profile_fingerprint, profile_json, brain_id) "
@@ -1561,6 +2052,15 @@ class SQLiteLedger:
                 "WHERE stream.brain_id = ? LIMIT 1",
                 (brain_id,),
             ).fetchone()
+            name_rows = self._connection.execute(
+                "SELECT brain_id, normalized_name, display_name, source_event_id "
+                "FROM identity_name_registry WHERE brain_id = ?",
+                (brain_id,),
+            ).fetchall()
+            has_naming_lease = self._connection.execute(
+                "SELECT 1 FROM identity_naming_lease WHERE brain_id = ? LIMIT 1",
+                (brain_id,),
+            ).fetchone()
 
             persisted_foundation = (
                 self._decode_event(event_rows[0]) if len(event_rows) == 1 else None
@@ -1579,6 +2079,17 @@ class SQLiteLedger:
                     and profile_rows[0]["profile_json"] == profile.canonical_json()
                     and profile_rows[0]["brain_id"] == brain_id
                 )
+            foundation_name = foundation.payload.get("name")
+            exact_name_registry = (
+                not name_rows
+                if foundation_name is None
+                else len(name_rows) == 1
+                and name_rows[0]["brain_id"] == brain_id
+                and name_rows[0]["display_name"] == foundation_name
+                and name_rows[0]["normalized_name"]
+                == self._normalized_identity_name(foundation_name)
+                and name_rows[0]["source_event_id"] == foundation.event_id
+            )
             if (
                 brain is None
                 or int(brain["next_sequence"]) != 2
@@ -1587,6 +2098,8 @@ class SQLiteLedger:
                 or has_snapshot is not None
                 or has_stream is not None
                 or has_bridge_record is not None
+                or has_naming_lease is not None
+                or not exact_name_registry
             ):
                 return False
 
@@ -1605,6 +2118,22 @@ class SQLiteLedger:
                 if deleted_profile.rowcount != 1:
                     raise LedgerIntegrityError(
                         "exact dynamic profile compensation was lost"
+                    )
+            if foundation_name is not None:
+                deleted_name = self._connection.execute(
+                    "DELETE FROM identity_name_registry WHERE brain_id = ? "
+                    "AND normalized_name = ? AND display_name = ? "
+                    "AND source_event_id = ?",
+                    (
+                        brain_id,
+                        self._normalized_identity_name(foundation_name),
+                        foundation_name,
+                        foundation.event_id,
+                    ),
+                )
+                if deleted_name.rowcount != 1:
+                    raise LedgerIntegrityError(
+                        "exact dynamic identity-name compensation was lost"
                     )
             deleted_event = self._connection.execute(
                 "DELETE FROM events WHERE brain_id = ? AND sequence = 1 "
@@ -1643,6 +2172,450 @@ class SQLiteLedger:
                 "SELECT brain_id FROM brains ORDER BY brain_id ASC"
             ).fetchall()
             return [validate_id(row["brain_id"]) for row in rows]
+
+    @staticmethod
+    def _identity_now(value: datetime) -> datetime:
+        if not isinstance(value, datetime):
+            raise TypeError("identity naming time must be a datetime")
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("identity naming time must be timezone-aware")
+        return value.astimezone(UTC)
+
+    def _identity_lease_row(self, lease_id: str) -> sqlite3.Row:
+        row = self._connection.execute(
+            "SELECT lease_id, brain_id, request_sequence, status, requested_at, "
+            "expires_at, request_event_id, choice_fingerprint, choice_json, "
+            "failure_code, terminal_event_id, terminal_at "
+            "FROM identity_naming_lease WHERE lease_id = ?",
+            (lease_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(lease_id)
+        return row
+
+    def identity_naming_status(
+        self,
+        lease_id: str,
+    ) -> IdentityNamingLeaseStatusV1:
+        lease_id = validate_id(lease_id)
+        self._assert_creator_process()
+        with self._lock:
+            self._ensure_open()
+            return self._identity_status_from_row(self._identity_lease_row(lease_id))
+
+    def identity_naming_brain_id(self, lease_id: str) -> str:
+        return self.identity_naming_status(lease_id).brain_id
+
+    @staticmethod
+    def _identity_lease(status: IdentityNamingLeaseStatusV1) -> IdentityNamingLeaseV1:
+        return IdentityNamingLeaseV1(
+            lease_id=status.lease_id,
+            brain_id=status.brain_id,
+            state_sequence=status.state_sequence,
+            expires_at=status.expires_at,
+        )
+
+    def _require_identity_head_in_transaction(self, state: BrainState) -> None:
+        head = self._authoritative_brain_head_in_transaction(state.brain_id)
+        if head != state.last_sequence:
+            raise ExpectedSequenceError(
+                "identity naming state does not match authoritative head"
+            )
+
+    def _insert_identity_event_batch_in_transaction(
+        self,
+        state: BrainState,
+        events: tuple[EventEnvelope, ...],
+    ) -> tuple[tuple[EventEnvelope, ...], BrainState]:
+        if not events:
+            raise ValueError("identity event batch cannot be empty")
+        successor = state
+        sequenced: list[EventEnvelope] = []
+        for offset, event in enumerate(events, start=1):
+            if event.brain_id != state.brain_id or event.sequence is not None:
+                raise ValueError("identity event batch changed its brain or sequence")
+            provisional = event.model_copy(
+                update={"sequence": state.last_sequence + offset}
+            ).revalidated()
+            successor = reduce_state(successor, provisional)
+            sequenced.append(provisional)
+        next_sequence = successor.last_sequence + 1
+        updated = self._connection.execute(
+            "UPDATE brains SET next_sequence = ? "
+            "WHERE brain_id = ? AND next_sequence = ?",
+            (next_sequence, state.brain_id, state.last_sequence + 1),
+        )
+        if updated.rowcount != 1:
+            raise ExpectedSequenceError(
+                "identity naming sequence was lost before event insert"
+            )
+        for event in sequenced:
+            self._connection.execute(
+                "INSERT INTO events("
+                "brain_id, sequence, event_id, body_fingerprint, "
+                "envelope_fingerprint, envelope_json) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    event.brain_id,
+                    event.sequence,
+                    event.event_id,
+                    event.body_fingerprint(),
+                    event.envelope_fingerprint(),
+                    event.canonical_json(),
+                ),
+            )
+        return tuple(sequenced), successor
+
+    def claim_identity_naming(
+        self,
+        *,
+        expected_state: BrainState,
+        actor_id: str,
+        now: datetime,
+    ) -> IdentityNamingClaimResult:
+        expected_state = expected_state.revalidated()
+        actor_id = validate_id(actor_id)
+        if actor_id != expected_state.brain_id:
+            raise ValueError("identity naming actor must be the brain self actor")
+        now = self._identity_now(now)
+        expires_at = now + timedelta(seconds=IDENTITY_NAMING_LEASE_SECONDS)
+        lease_id = new_id()
+        request = new_event(
+            "cognition.requested",
+            expected_state.brain_id,
+            actor_id,
+            {
+                "schema_version": 1,
+                "purpose": "identity_self_naming",
+                "lease_id": lease_id,
+                "requested_at": now.isoformat(),
+                "expires_at": expires_at.isoformat(),
+            },
+            adapter_id="alice-brain-hermes-identity-v1",
+        )
+        with self._transaction(immediate=True):
+            self._require_identity_head_in_transaction(expected_state)
+            pending_row = self._connection.execute(
+                "SELECT lease_id, brain_id, request_sequence, status, requested_at, "
+                "expires_at, request_event_id, choice_fingerprint, choice_json, "
+                "failure_code, terminal_event_id, terminal_at "
+                "FROM identity_naming_lease "
+                "WHERE brain_id = ? AND status = 'pending'",
+                (expected_state.brain_id,),
+            ).fetchone()
+            if pending_row is not None:
+                pending = self._identity_status_from_row(pending_row)
+                if pending.expires_at > now:
+                    return IdentityNamingClaimResult(lease=None, successor=None)
+                superseded = self._connection.execute(
+                    "UPDATE identity_naming_lease SET status = 'superseded', "
+                    "failure_code = 'expired', terminal_at = ? "
+                    "WHERE lease_id = ? AND status = 'pending'",
+                    (now.isoformat(), pending.lease_id),
+                )
+                if superseded.rowcount != 1:
+                    raise LedgerIntegrityError(
+                        "expired identity naming lease was not superseded"
+                    )
+            if expected_state.identity.name is not None:
+                return IdentityNamingClaimResult(lease=None, successor=None)
+            events, successor = self._insert_identity_event_batch_in_transaction(
+                expected_state,
+                (request,),
+            )
+            request_event = events[0]
+            self._connection.execute(
+                "INSERT INTO identity_naming_lease("
+                "lease_id, brain_id, request_sequence, status, requested_at, "
+                "expires_at, request_event_id, choice_fingerprint, choice_json, "
+                "failure_code, terminal_event_id, terminal_at) "
+                "VALUES (?, ?, ?, 'pending', ?, ?, ?, NULL, NULL, NULL, NULL, NULL)",
+                (
+                    lease_id,
+                    expected_state.brain_id,
+                    request_event.sequence,
+                    now.isoformat(),
+                    expires_at.isoformat(),
+                    request_event.event_id,
+                ),
+            )
+            lease = IdentityNamingLeaseV1(
+                lease_id=lease_id,
+                brain_id=expected_state.brain_id,
+                state_sequence=request_event.sequence,
+                expires_at=expires_at,
+            )
+            return IdentityNamingClaimResult(lease=lease, successor=successor)
+
+    def _supersede_pending_identity_lease(
+        self,
+        lease_id: str,
+        *,
+        now: datetime,
+        reason: str,
+    ) -> None:
+        updated = self._connection.execute(
+            "UPDATE identity_naming_lease SET status = 'superseded', "
+            "failure_code = ?, terminal_at = ? "
+            "WHERE lease_id = ? AND status = 'pending'",
+            (reason, now.isoformat(), lease_id),
+        )
+        if updated.rowcount != 1:
+            raise LedgerIntegrityError("identity naming lease supersession was lost")
+
+    def complete_identity_naming(
+        self,
+        lease_id: str,
+        choice: IdentityChoiceV1,
+        *,
+        expected_state: BrainState,
+        actor_id: str,
+        now: datetime,
+    ) -> IdentityNamingTerminalResult:
+        lease_id = validate_id(lease_id)
+        if not isinstance(choice, IdentityChoiceV1):
+            raise TypeError("choice must be IdentityChoiceV1")
+        choice = IdentityChoiceV1.model_validate(
+            choice.model_dump(mode="python"), strict=True
+        )
+        expected_state = expected_state.revalidated()
+        actor_id = validate_id(actor_id)
+        if actor_id != expected_state.brain_id:
+            raise ValueError("identity naming actor must be the brain self actor")
+        now = self._identity_now(now)
+        choice_json = choice.canonical_json()
+        choice_fingerprint = self._identity_choice_fingerprint(choice)
+        with self._transaction(immediate=True):
+            row = self._identity_lease_row(lease_id)
+            status = self._identity_status_from_row(row)
+            if status.brain_id != expected_state.brain_id:
+                raise ValueError("identity naming lease changed brain identity")
+            if status.status == "completed":
+                if status.choice != choice:
+                    raise IdempotencyConflictError(
+                        "identity naming lease has a different completed choice"
+                    )
+                return IdentityNamingTerminalResult("completed", None)
+            if status.status == "failed":
+                if status.choice is not None and status.choice != choice:
+                    raise IdempotencyConflictError(
+                        "identity naming lease has a different failed choice"
+                    )
+                return IdentityNamingTerminalResult(
+                    "failed" if status.choice == choice else "superseded",
+                    None,
+                )
+            if status.status == "superseded":
+                return IdentityNamingTerminalResult("superseded", None)
+            self._require_identity_head_in_transaction(expected_state)
+            if now >= status.expires_at:
+                self._supersede_pending_identity_lease(
+                    lease_id,
+                    now=now,
+                    reason="expired",
+                )
+                return IdentityNamingTerminalResult("superseded", None)
+            if expected_state.identity.name is not None:
+                self._supersede_pending_identity_lease(
+                    lease_id,
+                    now=now,
+                    reason="identity_already_named",
+                )
+                return IdentityNamingTerminalResult("superseded", None)
+
+            conflict = self._connection.execute(
+                "SELECT brain_id FROM identity_name_registry "
+                "WHERE normalized_name = ? AND brain_id != ? LIMIT 1",
+                (
+                    self._normalized_identity_name(choice.name),
+                    expected_state.brain_id,
+                ),
+            ).fetchone()
+            if conflict is not None:
+                failed = new_event(
+                    "cognition.failed",
+                    expected_state.brain_id,
+                    actor_id,
+                    {
+                        "schema_version": 1,
+                        "purpose": "identity_self_naming",
+                        "lease_id": lease_id,
+                        "failure_code": "name_conflict",
+                        "choice_fingerprint": choice_fingerprint,
+                        "terminal_at": now.isoformat(),
+                    },
+                    adapter_id="alice-brain-hermes-identity-v1",
+                )
+                events, successor = self._insert_identity_event_batch_in_transaction(
+                    expected_state,
+                    (failed,),
+                )
+                updated = self._connection.execute(
+                    "UPDATE identity_naming_lease SET status = 'failed', "
+                    "choice_fingerprint = ?, choice_json = ?, "
+                    "failure_code = 'name_conflict', terminal_event_id = ?, "
+                    "terminal_at = ? WHERE lease_id = ? AND status = 'pending'",
+                    (
+                        choice_fingerprint,
+                        choice_json,
+                        events[0].event_id,
+                        now.isoformat(),
+                        lease_id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise LedgerIntegrityError(
+                        "identity naming conflict result was not persisted"
+                    )
+                return IdentityNamingTerminalResult("failed", successor)
+
+            completed = new_event(
+                "cognition.completed",
+                expected_state.brain_id,
+                actor_id,
+                {
+                    "schema_version": 1,
+                    "purpose": "identity_self_naming",
+                    "lease_id": lease_id,
+                    "choice_fingerprint": choice_fingerprint,
+                    "structured": True,
+                    "terminal_at": now.isoformat(),
+                },
+                adapter_id="alice-brain-hermes-identity-v1",
+            )
+            deliberated = new_event(
+                "c1.deliberated",
+                expected_state.brain_id,
+                actor_id,
+                {
+                    "schema_version": 1,
+                    "purpose": "identity_self_naming",
+                    "lease_id": lease_id,
+                    "name": choice.name,
+                    "reason": choice.reason,
+                    "source_event_id": completed.event_id,
+                    "terminal_at": now.isoformat(),
+                },
+                adapter_id="alice-brain-hermes-identity-v1",
+            )
+            named = new_event(
+                "identity.named",
+                expected_state.brain_id,
+                actor_id,
+                {
+                    "schema_version": 1,
+                    "purpose": "identity_self_naming",
+                    "lease_id": lease_id,
+                    "name": choice.name,
+                    "reason": choice.reason,
+                    "source_event_id": deliberated.event_id,
+                    "terminal_at": now.isoformat(),
+                },
+                adapter_id="alice-brain-hermes-identity-v1",
+            )
+            events, successor = self._insert_identity_event_batch_in_transaction(
+                expected_state,
+                (completed, deliberated, named),
+            )
+            self._record_identity_name_in_transaction(
+                brain_id=expected_state.brain_id,
+                name=choice.name,
+                source_event_id=events[-1].event_id,
+            )
+            updated = self._connection.execute(
+                "UPDATE identity_naming_lease SET status = 'completed', "
+                "choice_fingerprint = ?, choice_json = ?, terminal_event_id = ?, "
+                "terminal_at = ? WHERE lease_id = ? AND status = 'pending'",
+                (
+                    choice_fingerprint,
+                    choice_json,
+                    events[-1].event_id,
+                    now.isoformat(),
+                    lease_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise LedgerIntegrityError(
+                    "completed identity naming result was not persisted"
+                )
+            return IdentityNamingTerminalResult("completed", successor)
+
+    def fail_identity_naming(
+        self,
+        lease_id: str,
+        failure_code: str,
+        *,
+        expected_state: BrainState,
+        actor_id: str,
+        now: datetime,
+    ) -> IdentityNamingTerminalResult:
+        lease_id = validate_id(lease_id)
+        if not isinstance(
+            failure_code, str
+        ) or not _IDENTITY_WORKER_FAILURE_CODE.fullmatch(failure_code):
+            raise ValueError("identity naming failure code is invalid")
+        expected_state = expected_state.revalidated()
+        actor_id = validate_id(actor_id)
+        if actor_id != expected_state.brain_id:
+            raise ValueError("identity naming actor must be the brain self actor")
+        now = self._identity_now(now)
+        with self._transaction(immediate=True):
+            status = self._identity_status_from_row(self._identity_lease_row(lease_id))
+            if status.brain_id != expected_state.brain_id:
+                raise ValueError("identity naming lease changed brain identity")
+            if status.status == "failed":
+                if status.failure_code != failure_code or status.choice is not None:
+                    raise IdempotencyConflictError(
+                        "identity naming lease has a different failure"
+                    )
+                return IdentityNamingTerminalResult("failed", None)
+            if status.status in {"completed", "superseded"}:
+                return IdentityNamingTerminalResult("superseded", None)
+            self._require_identity_head_in_transaction(expected_state)
+            if now >= status.expires_at:
+                self._supersede_pending_identity_lease(
+                    lease_id,
+                    now=now,
+                    reason="expired",
+                )
+                return IdentityNamingTerminalResult("superseded", None)
+            if expected_state.identity.name is not None:
+                self._supersede_pending_identity_lease(
+                    lease_id,
+                    now=now,
+                    reason="identity_already_named",
+                )
+                return IdentityNamingTerminalResult("superseded", None)
+            failed = new_event(
+                "cognition.failed",
+                expected_state.brain_id,
+                actor_id,
+                {
+                    "schema_version": 1,
+                    "purpose": "identity_self_naming",
+                    "lease_id": lease_id,
+                    "failure_code": failure_code,
+                    "terminal_at": now.isoformat(),
+                },
+                adapter_id="alice-brain-hermes-identity-v1",
+            )
+            events, successor = self._insert_identity_event_batch_in_transaction(
+                expected_state,
+                (failed,),
+            )
+            updated = self._connection.execute(
+                "UPDATE identity_naming_lease SET status = 'failed', "
+                "failure_code = ?, terminal_event_id = ?, terminal_at = ? "
+                "WHERE lease_id = ? AND status = 'pending'",
+                (
+                    failure_code,
+                    events[0].event_id,
+                    now.isoformat(),
+                    lease_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise LedgerIntegrityError("identity naming failure was not persisted")
+            return IdentityNamingTerminalResult("failed", successor)
 
     def _authoritative_brain_head_in_transaction(self, brain_id: str) -> int | None:
         row = self._connection.execute(
@@ -4894,6 +5867,12 @@ class SQLiteLedger:
                     stored.canonical_json(),
                 ),
             )
+            if stored.event_type in {"brain.created", "identity.named"}:
+                self._record_identity_name_in_transaction(
+                    brain_id=stored.brain_id,
+                    name=stored.payload.get("name"),
+                    source_event_id=stored.event_id,
+                )
             if stored.event_type in {"semantic.gap", "trace.gap"}:
                 self._record_unbounded_gap_observability(stored.brain_id)
             return stored, True

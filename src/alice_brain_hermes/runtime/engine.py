@@ -8,7 +8,7 @@ import re
 import sqlite3
 import threading
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 from alice_brain_hermes.core.cognition import LocalCognitionPort, result_payload
@@ -18,13 +18,19 @@ from alice_brain_hermes.core.state import BrainState
 from alice_brain_hermes.core.workspace import WorkspaceCoordinator
 from alice_brain_hermes.errors import EventConflictError, ExpectedSequenceError
 from alice_brain_hermes.ids import validate_id
+from alice_brain_hermes.protocol.identity import IdentityChoiceV1, IdentityNamingLeaseV1
 from alice_brain_hermes.protocol.models import (
     BridgeCommitAckV2,
     BridgeRecordV1,
     BridgeStreamState,
     ConsciousnessFrameV3,
 )
-from alice_brain_hermes.runtime.store import BridgeAbandonResult, BridgeCommitResult
+from alice_brain_hermes.runtime.store import (
+    BridgeAbandonResult,
+    BridgeCommitResult,
+    IdentityNamingClaimResult,
+    IdentityNamingTerminalResult,
+)
 
 
 class EventLedger(Protocol):
@@ -70,6 +76,34 @@ class EventLedger(Protocol):
         scheduler_sample: str,
         max_frame_bytes: int = 65_536,
     ) -> ConsciousnessFrameV3: ...
+
+    def claim_identity_naming(
+        self,
+        *,
+        expected_state: BrainState,
+        actor_id: str,
+        now: datetime,
+    ) -> IdentityNamingClaimResult: ...
+
+    def complete_identity_naming(
+        self,
+        lease_id: str,
+        choice: IdentityChoiceV1,
+        *,
+        expected_state: BrainState,
+        actor_id: str,
+        now: datetime,
+    ) -> IdentityNamingTerminalResult: ...
+
+    def fail_identity_naming(
+        self,
+        lease_id: str,
+        failure_code: str,
+        *,
+        expected_state: BrainState,
+        actor_id: str,
+        now: datetime,
+    ) -> IdentityNamingTerminalResult: ...
 
 
 class Coordinator(Protocol):
@@ -301,6 +335,114 @@ class ConsciousEngine:
                 scheduler_sample=scheduler_sample,
                 max_frame_bytes=max_frame_bytes,
             )
+
+    @staticmethod
+    def _identity_time(now: datetime | None) -> datetime:
+        selected = datetime.now(UTC) if now is None else now
+        if selected.tzinfo is None or selected.utcoffset() is None:
+            raise ValueError("identity naming time must be timezone-aware")
+        return selected.astimezone(UTC)
+
+    def claim_identity_naming(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> IdentityNamingLeaseV1 | None:
+        """Atomically claim one durable self-naming lease while still unnamed."""
+
+        self._assert_creator_process()
+        with self._lock:
+            if self._diverged:
+                raise EventConflictError(
+                    "engine sequence divergence requires a replayed restart"
+                )
+            try:
+                result = self.ledger.claim_identity_naming(
+                    expected_state=self._state,
+                    actor_id=self.actor_id,
+                    now=self._identity_time(now),
+                )
+            except ExpectedSequenceError as error:
+                self._diverged = True
+                raise EventConflictError(
+                    "engine sequence divergence during identity lease claim"
+                ) from error
+            except sqlite3.DatabaseError:
+                self._diverged = True
+                raise
+            if result.successor is not None:
+                self._state = result.successor
+            return result.lease
+
+    def complete_identity_naming(
+        self,
+        lease_id: str,
+        choice: IdentityChoiceV1,
+        *,
+        now: datetime | None = None,
+    ) -> str:
+        """Commit one exact structured choice and its causal C1 event chain."""
+
+        self._assert_creator_process()
+        with self._lock:
+            if self._diverged:
+                raise EventConflictError(
+                    "engine sequence divergence requires a replayed restart"
+                )
+            try:
+                result = self.ledger.complete_identity_naming(
+                    lease_id,
+                    choice,
+                    expected_state=self._state,
+                    actor_id=self.actor_id,
+                    now=self._identity_time(now),
+                )
+            except ExpectedSequenceError as error:
+                self._diverged = True
+                raise EventConflictError(
+                    "engine sequence divergence during identity completion"
+                ) from error
+            except sqlite3.DatabaseError:
+                self._diverged = True
+                raise
+            if result.successor is not None:
+                self._state = result.successor
+            return result.status
+
+    def fail_identity_naming(
+        self,
+        lease_id: str,
+        failure_code: str,
+        *,
+        now: datetime | None = None,
+    ) -> str:
+        """Commit one sanitized provider/validation failure for a live lease."""
+
+        self._assert_creator_process()
+        with self._lock:
+            if self._diverged:
+                raise EventConflictError(
+                    "engine sequence divergence requires a replayed restart"
+                )
+            try:
+                result = self.ledger.fail_identity_naming(
+                    lease_id,
+                    failure_code,
+                    expected_state=self._state,
+                    actor_id=self.actor_id,
+                    now=self._identity_time(now),
+                )
+            except ExpectedSequenceError as error:
+                self._diverged = True
+                raise EventConflictError(
+                    "engine sequence divergence during identity failure"
+                ) from error
+            except sqlite3.DatabaseError:
+                self._diverged = True
+                raise
+            if result.successor is not None:
+                self._state = result.successor
+            return result.status
 
     def _event(self, event_type: str, payload: Mapping[str, object]) -> EventEnvelope:
         return new_event(event_type, self.brain_id, self.actor_id, payload)

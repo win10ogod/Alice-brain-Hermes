@@ -34,6 +34,7 @@ from alice_brain_hermes.protocol.diagnostics import (
     IdentitySnapshotV1,
     build_trace_page,
 )
+from alice_brain_hermes.protocol.identity import IdentityChoiceV1
 from alice_brain_hermes.protocol.models import (
     PROTOCOL_VERSION,
     SERVER_ADAPTER_ID,
@@ -587,6 +588,33 @@ class ProtocolConnection:
                 "state_sequence": engine.state.last_sequence,
                 "created": created,
             }
+        if method == "identity.naming.claim":
+            self._only(params, {"brain_id"})
+            brain_id = validate_id(params.get("brain_id"))  # type: ignore[arg-type]
+            lease = self.service.runtime.claim_identity_naming(brain_id)
+            return {"lease": (None if lease is None else lease.model_dump(mode="json"))}
+        if method == "identity.naming.complete":
+            self._only(params, {"lease_id", "choice"})
+            lease_id = validate_id(params.get("lease_id"))  # type: ignore[arg-type]
+            choice_data = params.get("choice")
+            if not isinstance(choice_data, dict):
+                raise ProtocolFault("invalid_params", "identity choice is invalid")
+            choice = IdentityChoiceV1.model_validate(choice_data, strict=True)
+            status = self.service.runtime.complete_identity_naming(lease_id, choice)
+            return {"status": status}
+        if method == "identity.naming.fail":
+            self._only(params, {"lease_id", "failure_code"})
+            lease_id = validate_id(params.get("lease_id"))  # type: ignore[arg-type]
+            failure_code = params.get("failure_code")
+            if not isinstance(failure_code, str):
+                raise ProtocolFault(
+                    "invalid_params", "identity failure code is invalid"
+                )
+            status = self.service.runtime.fail_identity_naming(
+                lease_id,
+                failure_code,
+            )
+            return {"status": status}
         if method == "brain.attach":
             self._only(
                 params,

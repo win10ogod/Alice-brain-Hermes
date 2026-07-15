@@ -210,6 +210,9 @@ def legacy_action_ack_database(
         )
         if sqlite_version is not None:
             connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("DROP INDEX identity_naming_pending")
+            connection.execute("DROP TABLE identity_naming_lease")
+            connection.execute("DROP TABLE identity_name_registry")
             connection.execute("DROP TABLE hermes_span")
             connection.execute("DROP TABLE brain_observability")
             connection.execute("DROP INDEX bridge_record_event")
@@ -235,6 +238,8 @@ def legacy_action_ack_database(
 def _downgrade_empty_database(database: Path, *, sqlite_version: int) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TABLE identity_naming_lease")
+        connection.execute("DROP TABLE identity_name_registry")
         connection.execute("DROP TABLE hermes_span")
         connection.execute("DROP TABLE brain_observability")
         if sqlite_version == 2:
@@ -484,8 +489,8 @@ def test_v3_bridge_ack_is_migrated_after_failure_execution_semantics_change(
     )
 
     with SQLiteLedger.open(database) as restarted:
-        assert restarted.schema_version == 5
-        assert restarted._connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert restarted.schema_version == 6
+        assert restarted._connection.execute("PRAGMA user_version").fetchone()[0] == 6
         [row] = restarted._connection.execute(
             "SELECT ack_json FROM bridge_record WHERE bridge_instance_id = ?",
             (bridge_instance_id,),

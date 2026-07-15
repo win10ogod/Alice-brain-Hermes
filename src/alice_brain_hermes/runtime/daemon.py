@@ -30,6 +30,7 @@ from alice_brain_hermes.errors import (
     SchedulerShutdownError,
 )
 from alice_brain_hermes.ids import new_id, validate_id
+from alice_brain_hermes.protocol.identity import IdentityChoiceV1, IdentityNamingLeaseV1
 from alice_brain_hermes.protocol.models import (
     BrainProfileV1,
     DaemonDiscoveryV1,
@@ -849,6 +850,48 @@ class HermesDaemonRuntime:
             if receipt is None:
                 return self._engine_once(resolved.brain_id), False
             return self._start_dynamic_foundation(receipt, candidate_cell), True
+        finally:
+            self._end_operation()
+
+    def claim_identity_naming(self, brain_id: str) -> IdentityNamingLeaseV1 | None:
+        """Claim through the brain's single authoritative engine writer."""
+
+        brain_id = validate_id(brain_id)
+        self._begin_operation()
+        try:
+            return self._engine_once(brain_id).claim_identity_naming()
+        finally:
+            self._end_operation()
+
+    def complete_identity_naming(
+        self,
+        lease_id: str,
+        choice: IdentityChoiceV1,
+    ) -> str:
+        """Route a lease completion without trusting client-owned brain identity."""
+
+        lease_id = validate_id(lease_id)
+        self._begin_operation()
+        try:
+            brain_id = self.ledger.identity_naming_brain_id(lease_id)
+            return self._engine_once(brain_id).complete_identity_naming(
+                lease_id,
+                choice,
+            )
+        finally:
+            self._end_operation()
+
+    def fail_identity_naming(self, lease_id: str, failure_code: str) -> str:
+        """Route one sanitized naming failure through its durable lease."""
+
+        lease_id = validate_id(lease_id)
+        self._begin_operation()
+        try:
+            brain_id = self.ledger.identity_naming_brain_id(lease_id)
+            return self._engine_once(brain_id).fail_identity_naming(
+                lease_id,
+                failure_code,
+            )
         finally:
             self._end_operation()
 

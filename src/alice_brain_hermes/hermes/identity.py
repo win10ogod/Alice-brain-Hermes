@@ -84,7 +84,7 @@ class IdentityNamingLeasePort(Protocol):
         self,
         lease_id: str,
         choice: IdentityChoiceV1,
-    ) -> Literal["completed", "superseded"]: ...
+    ) -> Literal["completed", "failed", "superseded"]: ...
 
     def fail(
         self,
@@ -216,6 +216,8 @@ class IdentityNamingWorker:
         status = self._lease_port.complete(lease.lease_id, choice)
         if status == "completed":
             return NamingRunResult.COMPLETED
+        if status == "failed":
+            return NamingRunResult.FAILED
         if status == "superseded":
             return NamingRunResult.SUPERSEDED
         raise RuntimeError("identity lease port returned an invalid completion status")

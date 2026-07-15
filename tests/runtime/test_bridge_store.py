@@ -1151,6 +1151,9 @@ def test_schema_v2_migrates_transactionally_without_losing_brains(
         connection.execute("DROP TABLE bridge_record")
         connection.execute("DROP TABLE bridge_stream")
         connection.execute("DROP TABLE brain_profile")
+        connection.execute("DROP INDEX identity_naming_pending")
+        connection.execute("DROP TABLE identity_naming_lease")
+        connection.execute("DROP TABLE identity_name_registry")
         connection.execute(
             "UPDATE schema_metadata SET value = '2' WHERE key = 'schema_version'"
         )
@@ -1188,6 +1191,9 @@ def test_malformed_v2_schema_rolls_back_the_whole_migration(tmp_path: Path) -> N
         connection.execute("DROP TABLE bridge_record")
         connection.execute("DROP TABLE bridge_stream")
         connection.execute("DROP TABLE brain_profile")
+        connection.execute("DROP INDEX identity_naming_pending")
+        connection.execute("DROP TABLE identity_naming_lease")
+        connection.execute("DROP TABLE identity_name_registry")
         connection.execute("DROP INDEX events_event_id")
         connection.execute(
             "UPDATE schema_metadata SET value = '2' WHERE key = 'schema_version'"
@@ -1219,8 +1225,8 @@ def test_malformed_v2_schema_rolls_back_the_whole_migration(tmp_path: Path) -> N
         connection.close()
 
 
-def test_existing_v5_rejects_extra_schema_metadata_rows(tmp_path: Path) -> None:
-    database = tmp_path / "extra-v4-metadata.db"
+def test_existing_v6_rejects_extra_schema_metadata_rows(tmp_path: Path) -> None:
+    database = tmp_path / "extra-v6-metadata.db"
     with SQLiteLedger.open(database):
         pass
     with sqlite3.connect(database) as connection:
@@ -1234,7 +1240,7 @@ def test_existing_v5_rejects_extra_schema_metadata_rows(tmp_path: Path) -> None:
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT key, value FROM schema_metadata ORDER BY key"
-        ).fetchall() == [("schema_version", "5"), ("unexpected", "4")]
+        ).fetchall() == [("schema_version", "6"), ("unexpected", "4")]
 
 
 def test_v2_extra_schema_metadata_row_fails_without_partial_migration(
@@ -1249,6 +1255,9 @@ def test_v2_extra_schema_metadata_row_fails_without_partial_migration(
         connection.execute("DROP TABLE bridge_record")
         connection.execute("DROP TABLE bridge_stream")
         connection.execute("DROP TABLE brain_profile")
+        connection.execute("DROP INDEX identity_naming_pending")
+        connection.execute("DROP TABLE identity_naming_lease")
+        connection.execute("DROP TABLE identity_name_registry")
         connection.execute(
             "UPDATE schema_metadata SET value = '2' WHERE key = 'schema_version'"
         )
@@ -1373,6 +1382,9 @@ def test_v2_migration_with_extra_object_rolls_back_without_partial_v4(
         connection.execute("DROP TABLE bridge_record")
         connection.execute("DROP TABLE bridge_stream")
         connection.execute("DROP TABLE brain_profile")
+        connection.execute("DROP INDEX identity_naming_pending")
+        connection.execute("DROP TABLE identity_naming_lease")
+        connection.execute("DROP TABLE identity_name_registry")
         connection.execute("CREATE TABLE unexpected_object(value INTEGER)")
         connection.execute(
             "UPDATE schema_metadata SET value = '2' WHERE key = 'schema_version'"
