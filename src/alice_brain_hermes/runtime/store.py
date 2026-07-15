@@ -2838,15 +2838,11 @@ class SQLiteLedger:
         actual_actions: list[dict[str, object]] = []
         for action in action_items:
             evidence_ids = action_evidence_ids(action)
-            canonical_receipt_status = (
-                action.outcome.value
-                if action.outcome is not None
-                else (
-                    "unknown"
-                    if action.receipt_history
-                    and action.receipt_history[0].status.value == "unknown"
-                    else None
-                )
+            canonical_outcome = (
+                action.outcome.value if action.outcome is not None else None
+            )
+            canonical_receipt_status = canonical_outcome or (
+                action.receipt.get("status") if action.receipt is not None else None
             )
             latest_receipt = (
                 action.receipt_history[-1] if action.receipt_history else None
@@ -2865,27 +2861,41 @@ class SQLiteLedger:
                 }
             )
             history = {item.value for item in action.phase_history}
-            actual_actions.append(
-                {
-                    "action_id": action.action_id,
-                    "dispatch_observed": "dispatched" in history,
-                    "blocked": "blocked" in history,
-                    "blocked_fact_available": True,
-                    "receipt_observed": "receipt" in history,
-                    "receipt_status": canonical_receipt_status,
-                    "latest_receipt_status": (
-                        None if latest_receipt is None else latest_receipt.status.value
-                    ),
-                    "latest_receipt_disposition": (
-                        None
-                        if latest_receipt is None
-                        else latest_receipt.disposition.value
-                    ),
-                    "execution_confirmed": action.execution_confirmed,
-                    "effect_confirmed": action.effect_confirmed,
-                    "last_event_id": action.last_event_id,
-                }
-            )
+            blocked_observed = "blocked" in history
+            dispatch_observed = "dispatched" in history
+            projected_action: dict[str, object] = {
+                "action_id": action.action_id,
+                "dispatch_observed": dispatch_observed,
+                "blocked": True if blocked_observed else None,
+                "blocked_fact_available": blocked_observed,
+                "receipt_observed": "receipt" in history,
+                "receipt_status": canonical_receipt_status,
+                "latest_receipt_status": (
+                    None if latest_receipt is None else latest_receipt.status.value
+                ),
+                "latest_receipt_disposition": (
+                    None
+                    if latest_receipt is None
+                    else latest_receipt.disposition.value
+                ),
+                "execution_confirmed": action.execution_confirmed,
+                "effect_confirmed": action.effect_confirmed,
+                "last_event_id": action.last_event_id,
+            }
+            if (
+                action.receipt_corroboration_count > 0
+                or action.receipt_conflict_count > 0
+            ):
+                projected_action.update(
+                    {
+                        "outcome": canonical_outcome,
+                        "receipt_corroboration_count": (
+                            action.receipt_corroboration_count
+                        ),
+                        "receipt_conflict_count": action.receipt_conflict_count,
+                    }
+                )
+            actual_actions.append(projected_action)
 
         world_sections: dict[str, list[dict[str, object]]] = {}
         world_omissions: dict[str, dict[str, object]] = {}

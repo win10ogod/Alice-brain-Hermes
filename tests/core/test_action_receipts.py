@@ -17,6 +17,7 @@ from alice_brain_hermes.core.action import (
 from alice_brain_hermes.core.events import new_event
 from alice_brain_hermes.core.reducer import reduce_many
 from alice_brain_hermes.core.state import BrainState
+from alice_brain_hermes.errors import DomainInvariantError
 from alice_brain_hermes.ids import new_id
 
 BRAIN = new_id()
@@ -116,9 +117,10 @@ def test_blocked_action_record_rejects_executed_or_dispatched_claims() -> None:
     [
         ("success", "ok", None, True, ActionOutcome.SUCCESS),
         ("failure", "error", None, True, ActionOutcome.FAILURE),
+        ("failure", "error", "tool_error", True, ActionOutcome.FAILURE),
         ("unknown", "error", "thread_missing_result", None, None),
-        ("unknown", "timeout", None, None, None),
-        ("unknown", "cancelled", None, None, None),
+        ("unknown", "timeout", "tool_timeout", None, None),
+        ("unknown", "cancelled", "keyboard_interrupt", None, None),
     ],
 )
 def test_typed_receipt_history_preserves_exact_post_tool_semantics(
@@ -149,6 +151,167 @@ def test_typed_receipt_history_preserves_exact_post_tool_semantics(
     assert receipt.outcome is outcome
     assert action.execution_confirmed is execution
     assert action.outcome is outcome
+
+
+@pytest.mark.parametrize(
+    ("status", "source_status", "source_error_type"),
+    [
+        ("failure", "ok", None),
+        ("success", "timeout", None),
+        ("success", "cancelled", None),
+        ("unknown", "ok", None),
+        ("failure", "error", "thread_missing_result"),
+        ("unknown", "error", "ToolError"),
+        ("success", "OK", None),
+        ("success", " ok", None),
+        ("success", "completed", None),
+        ("unknown", "blocked", None),
+    ],
+)
+def test_receipt_rejects_contradictory_or_non_exact_hermes_source_semantics(
+    status: str,
+    source_status: str,
+    source_error_type: str | None,
+) -> None:
+    payload: dict[str, object] = {
+        "action_id": "action-1",
+        "status": status,
+        "source_status": source_status,
+    }
+    if source_error_type is not None:
+        payload["source_error_type"] = source_error_type
+
+    with pytest.raises(DomainInvariantError, match="source semantics"):
+        reduce_many(
+            dispatched_state(),
+            [action_event("action.receipt", payload)],
+        )
+
+
+@pytest.mark.parametrize(
+    "source_status",
+    ["ok", "error", "timeout", "cancelled", ["blocked"]],
+)
+def test_blocked_transition_rejects_non_blocked_hermes_source_status(
+    source_status: object,
+) -> None:
+    with pytest.raises(DomainInvariantError, match="blocked source status"):
+        reduce_many(
+            prepared_state(),
+            [
+                action_event(
+                    "action.blocked",
+                    {
+                        "action_id": "action-1",
+                        "source_status": source_status,
+                    },
+                )
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    [
+        (
+            "action.receipt",
+            {
+                "action_id": "action-1",
+                "status": "success",
+                "source_status": "ok",
+                "source_error_type": "ToolError",
+            },
+        ),
+        (
+            "action.receipt",
+            {
+                "action_id": "action-1",
+                "status": "unknown",
+                "source_status": "timeout",
+                "source_error_type": "thread_missing_result",
+            },
+        ),
+        (
+            "action.receipt",
+            {
+                "action_id": "action-1",
+                "status": "unknown",
+                "source_status": "cancelled",
+                "source_error_type": "thread_missing_result",
+            },
+        ),
+    ],
+)
+def test_source_status_rejects_forbidden_error_type(
+    event_type: str,
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(DomainInvariantError, match="source semantics"):
+        reduce_many(dispatched_state(), [action_event(event_type, payload)])
+
+
+def test_typed_receipt_model_rejects_source_mapping_tampering_on_replay() -> None:
+    receipt = (
+        reduce_many(
+            dispatched_state(),
+            [
+                action_event(
+                    "action.receipt",
+                    {
+                        "action_id": "action-1",
+                        "status": "success",
+                        "source_status": "ok",
+                    },
+                )
+            ],
+        )
+        .actions["action-1"]
+        .receipt_history[0]
+    )
+    raw = receipt.model_dump(mode="python")
+    raw["source_status"] = "timeout"
+    raw["payload"] = {
+        **dict(receipt.payload),
+        "source_status": "timeout",
+    }
+
+    with pytest.raises(ValidationError, match="source semantics"):
+        type(receipt).model_validate(raw)
+
+
+def test_action_record_rejects_receipt_claim_without_observed_dispatch() -> None:
+    action = state_with_receipt("success").actions["action-1"]
+    raw = action.model_dump(mode="python")
+    raw["phase_history"] = tuple(
+        phase for phase in action.phase_history if phase is not ActionPhase.DISPATCHED
+    )
+
+    with pytest.raises(ValidationError, match="receipt requires observed dispatch"):
+        type(action).model_validate(raw)
+
+
+def test_action_record_rejects_unattributed_execution_confirmation() -> None:
+    action = dispatched_state().actions["action-1"]
+    raw = action.model_dump(mode="python")
+    raw["execution_confirmed"] = True
+
+    with pytest.raises(
+        ValidationError, match="execution confirmation requires outcome"
+    ):
+        type(action).model_validate(raw)
+
+
+def test_action_record_rejects_canonical_source_mapping_tampering() -> None:
+    action = state_with_receipt("success").actions["action-1"]
+    raw = action.model_dump(mode="python")
+    raw["receipt"] = {
+        **dict(action.receipt or {}),
+        "source_status": "timeout",
+        "source_error_type": "tool_timeout",
+    }
+
+    with pytest.raises(ValidationError, match="canonical receipt source semantics"):
+        type(action).model_validate(raw)
 
 
 def test_typed_receipt_rejects_inconsistent_execution_claims() -> None:
@@ -195,8 +358,18 @@ def test_late_receipt_resolves_unknown_without_a_second_dispatch() -> None:
 
 def test_corroborating_and_conflicting_receipts_are_audited_without_overwrite() -> None:
     first = reduce_many(
-        state_with_receipt("success"),
-        [action_event("action.reconstructed", {"action_id": "action-1"})],
+        dispatched_state(),
+        [
+            action_event(
+                "action.receipt",
+                {
+                    "action_id": "action-1",
+                    "status": "success",
+                    "source_status": "ok",
+                },
+            ),
+            action_event("action.reconstructed", {"action_id": "action-1"}),
+        ],
     )
     corroborated = reduce_many(
         first,
@@ -238,6 +411,9 @@ def test_corroborating_and_conflicting_receipts_are_audited_without_overwrite() 
     assert action.receipt_history[-1].outcome is ActionOutcome.FAILURE
     assert action.receipt_corroboration_count == 1
     assert action.receipt_conflict_count == 1
+    assert action.receipt is not None
+    assert action.receipt["status"] == "success"
+    assert action.receipt["source_status"] == "ok"
 
 
 def test_blocked_action_can_be_reconstructed_with_typed_history() -> None:
@@ -250,6 +426,7 @@ def test_blocked_action_can_be_reconstructed_with_typed_history() -> None:
                     "action_id": "action-1",
                     "reason": "guardrail",
                     "source_status": "blocked",
+                    "source_error_type": "tool_scope_block",
                 },
             )
         ],
@@ -294,7 +471,8 @@ def test_receipt_and_reconstruction_histories_have_visible_fixed_bounds() -> Non
                         "action_id": "action-1",
                         "status": "unknown",
                         "source_status": "timeout",
-                        "source_error_type": f"attempt-{index}",
+                        "source_error_type": "tool_timeout",
+                        "attempt": index,
                         "late": index > 0,
                     },
                 ),
@@ -312,7 +490,9 @@ def test_receipt_and_reconstruction_histories_have_visible_fixed_bounds() -> Non
     assert action.reconstruction_history_evicted == (
         total - MAX_ACTION_RECONSTRUCTION_HISTORY
     )
-    assert action.receipt_history[0].source_error_type == "attempt-3"
+    assert action.receipt_history[0].source_status == "timeout"
+    assert action.receipt_history[0].source_error_type == "tool_timeout"
+    assert action.receipt_history[0].payload["attempt"] == 3
     assert action.reconstruction_history[0].payload["cycle"] == 3
     assert action.phase_history == (
         ActionPhase.PROPOSED,

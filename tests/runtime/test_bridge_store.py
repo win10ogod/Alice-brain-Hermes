@@ -561,6 +561,10 @@ def test_public_frame_projection_reports_every_omitted_state_collection(
         assert frame.rd["actions"][0]["phase"] == "receipt"
         assert frame.a["actions"][0]["dispatch_observed"] is True
         assert frame.a["actions"][0]["receipt_status"] == "success"
+        assert frame.a["actions"][0]["blocked"] is None
+        assert frame.a["actions"][0]["blocked_fact_available"] is False
+        assert "outcome" not in frame.a["actions"][0]
+        assert "receipt_conflict_count" not in frame.a["actions"][0]
         assert any(
             item["proposition_id"] == "observed-1" for item in frame.world["observed"]
         )
@@ -681,6 +685,105 @@ def test_rd_projection_labels_each_action_event_as_a_transition_not_outcome(
             assert projected["phase"] == expected_phase
             assert projected["last_transition_event_id"] == stored.event_id
             assert "outcome_event_id" not in projected
+
+
+def test_action_projection_preserves_canonical_outcome_and_reports_conflicts(
+    tmp_path: Path,
+) -> None:
+    ledger, engine, instance = make_engine(tmp_path)
+    action_id = "conflicting-receipt-action"
+    events = (
+        (
+            "action.proposed",
+            {"action_id": action_id, "intent": {"kind": "test"}},
+        ),
+        ("action.prepared", {"action_id": action_id}),
+        ("action.dispatched", {"action_id": action_id}),
+        (
+            "action.receipt",
+            {
+                "action_id": action_id,
+                "status": "success",
+                "source_status": "ok",
+            },
+        ),
+        ("action.reconstructed", {"action_id": action_id}),
+        (
+            "action.receipt",
+            {
+                "action_id": action_id,
+                "status": "failure",
+                "source_status": "error",
+                "late": True,
+            },
+        ),
+    )
+
+    with ledger:
+        for event_type, payload in events:
+            engine.append(
+                new_event(
+                    event_type,
+                    engine.brain_id,
+                    engine.actor_id,
+                    payload,
+                    action_id=action_id,
+                )
+            )
+
+        frame = ledger.project_bridge_frame(
+            instance,
+            expected_state=engine.state,
+            scheduler_sample="running",
+        )
+
+    [projected] = frame.a["actions"]
+    assert projected["receipt_status"] == "success"
+    assert projected["outcome"] == "success"
+    assert projected["receipt_conflict_count"] == 1
+    assert projected["receipt_corroboration_count"] == 0
+
+
+def test_blocked_action_projection_reports_observed_non_dispatch(
+    tmp_path: Path,
+) -> None:
+    ledger, engine, instance = make_engine(tmp_path)
+    action_id = "blocked-action"
+
+    with ledger:
+        for event_type, payload in (
+            (
+                "action.proposed",
+                {"action_id": action_id, "intent": {"kind": "test"}},
+            ),
+            ("action.prepared", {"action_id": action_id}),
+            (
+                "action.blocked",
+                {"action_id": action_id, "source_status": "blocked"},
+            ),
+        ):
+            engine.append(
+                new_event(
+                    event_type,
+                    engine.brain_id,
+                    engine.actor_id,
+                    payload,
+                    action_id=action_id,
+                )
+            )
+
+        frame = ledger.project_bridge_frame(
+            instance,
+            expected_state=engine.state,
+            scheduler_sample="running",
+        )
+
+    [projected] = frame.a["actions"]
+    assert projected["dispatch_observed"] is False
+    assert projected["blocked"] is True
+    assert projected["blocked_fact_available"] is True
+    assert projected["execution_confirmed"] is False
+    assert "outcome" not in projected
 
 
 def test_public_frame_projection_rejects_tampered_latest_capture_record(

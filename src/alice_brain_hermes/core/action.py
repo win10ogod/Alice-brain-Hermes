@@ -49,6 +49,86 @@ class ActionReceiptDisposition(StrEnum):
 
 MAX_ACTION_RECEIPT_HISTORY = 16
 MAX_ACTION_RECONSTRUCTION_HISTORY = 16
+_HERMES_SOURCE_STATUSES = frozenset({"ok", "error", "timeout", "cancelled", "blocked"})
+_THREAD_MISSING_RESULT = "thread_missing_result"
+
+
+def _validate_source_error_type(source_error_type: object) -> None:
+    if source_error_type is None:
+        return
+    if (
+        type(source_error_type) is not str
+        or not source_error_type.strip()
+        or len(source_error_type) > 160
+    ):
+        raise ValueError(
+            "receipt source semantics require a bounded non-blank error type"
+        )
+
+
+def _validate_receipt_source_semantics(
+    status: ActionReceiptStatus,
+    source_status: object,
+    source_error_type: object,
+) -> None:
+    """Validate the exact Hermes post-tool status to domain receipt mapping."""
+    if source_status is None:
+        if source_error_type is not None:
+            raise ValueError(
+                "receipt source semantics require a source status for error type"
+            )
+        # Historical and non-Hermes events predate attributed source fields.
+        return
+    if type(source_status) is not str or source_status not in _HERMES_SOURCE_STATUSES:
+        raise ValueError("receipt source semantics use an unsupported source status")
+    _validate_source_error_type(source_error_type)
+    if source_status == "ok" and source_error_type is not None:
+        raise ValueError(
+            "receipt source semantics do not allow an error type for ok status"
+        )
+    if source_status != "error" and source_error_type == _THREAD_MISSING_RESULT:
+        raise ValueError(
+            "receipt source semantics reserve thread_missing_result for error status"
+        )
+    if source_status == "blocked":
+        raise ValueError("receipt source semantics require an action.blocked event")
+
+    expected = {
+        "ok": ActionReceiptStatus.SUCCESS,
+        "timeout": ActionReceiptStatus.UNKNOWN,
+        "cancelled": ActionReceiptStatus.UNKNOWN,
+    }.get(source_status)
+    if source_status == "error":
+        expected = (
+            ActionReceiptStatus.UNKNOWN
+            if source_error_type == _THREAD_MISSING_RESULT
+            else ActionReceiptStatus.FAILURE
+        )
+    if status is not expected:
+        raise ValueError("receipt source semantics contradict normalized status")
+
+
+def _validate_blocked_source_semantics(payload: Mapping[str, Any]) -> None:
+    source_status = payload.get("source_status")
+    source_error_type = payload.get("source_error_type")
+    if source_status is not None and (
+        type(source_status) is not str or source_status != "blocked"
+    ):
+        raise DomainInvariantError(
+            "blocked source status must be exact 'blocked' when attributed"
+        )
+    if source_status is None and source_error_type is not None:
+        raise DomainInvariantError(
+            "blocked error type requires attributed source status"
+        )
+    try:
+        _validate_source_error_type(source_error_type)
+    except ValueError as error:
+        raise DomainInvariantError("blocked source error type is invalid") from error
+    if source_error_type == _THREAD_MISSING_RESULT:
+        raise DomainInvariantError(
+            "blocked source status cannot use thread_missing_result"
+        )
 
 
 class ActionReceiptRecord(BaseModel):
@@ -89,6 +169,21 @@ class ActionReceiptRecord(BaseModel):
 
     @model_validator(mode="after")
     def _status_matches_execution_claims(self) -> ActionReceiptRecord:
+        _validate_receipt_source_semantics(
+            self.status,
+            self.source_status,
+            self.source_error_type,
+        )
+        if self.payload.get("status") != self.status.value:
+            raise ValueError("receipt payload status does not match typed status")
+        if self.payload.get("source_status") != self.source_status:
+            raise ValueError(
+                "receipt payload source status does not match typed source"
+            )
+        if self.payload.get("source_error_type") != self.source_error_type:
+            raise ValueError("receipt payload error type does not match typed source")
+        if self.payload.get("late", False) is not self.late:
+            raise ValueError("receipt payload late flag does not match typed receipt")
         if self.status is ActionReceiptStatus.UNKNOWN:
             if self.execution_confirmed is not None or self.outcome is not None:
                 raise ValueError("unknown receipt cannot confirm execution or outcome")
@@ -210,6 +305,7 @@ class ActionRecord(BaseModel):
     def _execution_claims_match_lifecycle(self) -> ActionRecord:
         was_blocked = ActionPhase.BLOCKED in self.phase_history
         was_dispatched = ActionPhase.DISPATCHED in self.phase_history
+        was_receipted = ActionPhase.RECEIPT in self.phase_history
         if was_blocked and was_dispatched:
             raise ValueError("blocked action cannot claim dispatch")
         if was_blocked and (
@@ -222,6 +318,46 @@ class ActionRecord(BaseModel):
             raise ValueError("blocked action cannot claim execution or effect")
         if self.outcome is not None and self.execution_confirmed is not True:
             raise ValueError("action outcome requires confirmed execution")
+        if self.execution_confirmed is True and self.outcome is None:
+            raise ValueError("action execution confirmation requires outcome")
+        receipt_claimed = (
+            was_receipted
+            or self.execution_confirmed is True
+            or self.outcome is not None
+            or self.effect_confirmed is not None
+            or self.receipt is not None
+            or bool(self.receipt_history)
+        )
+        if receipt_claimed and not was_dispatched:
+            raise ValueError("action receipt requires observed dispatch")
+        if (self.receipt is not None or self.receipt_history) and not was_receipted:
+            raise ValueError("action receipt evidence requires receipt phase")
+        if self.execution_confirmed is False and not was_blocked:
+            raise ValueError("non-execution claim requires a blocked action")
+        if self.receipt is not None:
+            canonical_status = self.receipt.get("status")
+            if canonical_status not in {"success", "failure", "unknown"}:
+                raise ValueError("canonical action receipt status is invalid")
+            try:
+                _validate_receipt_source_semantics(
+                    ActionReceiptStatus(canonical_status),
+                    self.receipt.get("source_status"),
+                    self.receipt.get("source_error_type"),
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "canonical receipt source semantics are inconsistent"
+                ) from error
+            if canonical_status == "unknown":
+                if self.execution_confirmed is not None or self.outcome is not None:
+                    raise ValueError("unknown canonical receipt cannot confirm outcome")
+            elif (
+                self.execution_confirmed is not True
+                or self.outcome is not ActionOutcome(canonical_status)
+            ):
+                raise ValueError(
+                    "canonical receipt must match confirmed action outcome"
+                )
         return self
 
 
@@ -410,6 +546,7 @@ def reduce_actions(
             updates={"prepared_branch_id": branch_id},
         )
     elif event.event_type == "action.blocked":
+        _validate_blocked_source_semantics(event.payload)
         action = _transition(
             action,
             event,
@@ -433,6 +570,16 @@ def reduce_actions(
                 "receipt status must be success, failure or unknown"
             )
         receipt_status = ActionReceiptStatus(status)
+        try:
+            _validate_receipt_source_semantics(
+                receipt_status,
+                event.payload.get("source_status"),
+                event.payload.get("source_error_type"),
+            )
+        except ValueError as error:
+            raise DomainInvariantError(
+                "receipt source semantics are inconsistent"
+            ) from error
         execution = True if status in {"success", "failure"} else None
         incoming_outcome = ActionOutcome(status) if execution is True else None
         late = event.payload.get("late", False)
@@ -473,7 +620,12 @@ def reduce_actions(
                 if grounded_ids or action.effect_confirmed is True
                 else action.effect_confirmed
             ),
-            "receipt": FrozenJsonDict(event.payload),
+            "receipt": (
+                FrozenJsonDict(event.payload)
+                if action.receipt is None
+                or disposition is ActionReceiptDisposition.RESOLUTION
+                else action.receipt
+            ),
             "receipt_history": (
                 *action.receipt_history,
                 receipt_record,
