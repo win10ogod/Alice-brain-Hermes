@@ -113,4 +113,3 @@ jailbreak 成功當作 benchmark。
 - Fleming & Lau (2014), metacognition measurement.
 - Mashour et al. (2020), global neuronal workspace.
 - LAAP 參考文章與上述本地 checkout；文章宣告與 checkout 程式事實分開記錄。
-
