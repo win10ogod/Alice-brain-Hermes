@@ -28,6 +28,62 @@ def test_semantic_batch_uses_versioned_protocol_and_frame_contract() -> None:
     assert models_module.FRAME_SCHEMA_VERSION == 3
 
 
+def test_capture_sequence_wire_bound_reserves_one_sqlite_cursor_value() -> None:
+    instance = new_id()
+    maximum_sqlite_integer = 2**63 - 1
+    gap_values = {
+        "bridge_instance_id": instance,
+        "first_capture_seq": 1,
+        "last_capture_seq": maximum_sqlite_integer,
+        "dropped_count": maximum_sqlite_integer,
+        "cause_counts": {"queue_full": maximum_sqlite_integer},
+    }
+
+    with pytest.raises(ValidationError, match="less than or equal"):
+        BridgeGapV1(**gap_values)
+
+    accepted = BridgeGapV1(
+        **{
+            **gap_values,
+            "last_capture_seq": maximum_sqlite_integer - 1,
+            "dropped_count": maximum_sqlite_integer - 1,
+            "cause_counts": {"queue_full": maximum_sqlite_integer - 1},
+        }
+    )
+    assert accepted.last_capture_seq + 1 == maximum_sqlite_integer
+
+    observation_values = validate_observation(
+        {
+            "bridge_instance_id": instance,
+            "capture_seq": 1,
+            "captured_at": datetime.now(UTC),
+            "captured_monotonic_ns": 1,
+            "hook": "pre_tool_call",
+            "context": {
+                "session_id": "session",
+                "task_id": "task",
+                "turn_id": "turn",
+                "api_request_id": "request",
+                "tool_call_id": "tool",
+            },
+            "payload": {
+                "tool_name": "shell",
+                "args": {},
+                "middleware_trace": {},
+            },
+            "coverage": _coverage(),
+        }
+    ).model_dump(mode="python")
+    observation_values["capture_seq"] = maximum_sqlite_integer
+    with pytest.raises(ValidationError, match="less than or equal"):
+        validate_observation(observation_values)
+
+    observation_values["capture_seq"] = maximum_sqlite_integer - 1
+    assert validate_observation(observation_values).capture_seq + 1 == (
+        maximum_sqlite_integer
+    )
+
+
 def _empty_frame_v3(*, brain_id: str, state_sequence: int) -> object:
     return models_module.ConsciousnessFrameV3(
         brain_id=brain_id,

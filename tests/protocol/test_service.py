@@ -150,6 +150,139 @@ def test_closed_connection_rejects_late_worker_dispatch_without_mutation(
     assert service.runtime.ledger.list_brain_ids() == []
 
 
+def test_daemon_status_exposes_exact_large_global_observability(
+    service: ProtocolService,
+) -> None:
+    connection = service.new_connection()
+    initialize(connection)
+    per_brain = 2**62
+    for index in range(2):
+        brain = decode(
+            connection.handle_frame(request(10 + index * 3, "brain.create"))
+        )["result"]
+        instance = new_id()
+        binding = decode(
+            connection.handle_frame(
+                request(
+                    11 + index * 3,
+                    "brain.attach",
+                    bridge_attach_params(brain["brain_id"], instance),
+                )
+            )
+        )["result"]["binding"]
+        committed = decode(
+            connection.handle_frame(
+                request(
+                    12 + index * 3,
+                    "bridge.commit",
+                    {
+                        "binding": binding,
+                        "record": {
+                            "schema_version": 1,
+                            "record_kind": "gap",
+                            "bridge_instance_id": instance,
+                            "first_capture_seq": 1,
+                            "last_capture_seq": per_brain,
+                            "dropped_count": per_brain,
+                            "cause_counts": {"queue_full": per_brain},
+                        },
+                    },
+                )
+            )
+        )
+        assert committed["result"]["semantic_status"] == "gap"
+
+    status = decode(connection.handle_frame(request(20, "daemon.status")))["result"]
+
+    assert len(status["brain_ids"]) == 2
+    assert status["scheduler_health"]["brain_count"] == 2
+    assert status["dropped_events"] == per_brain * 2
+    assert status["dropped_events"] > 2**63 - 1
+    assert status["semantic_evidence"]["semantic_records"] == 2
+    assert status["semantic_evidence"]["semantic_gap_records"] == 2
+    assert status["bridge_connection"]["total_bridges"] == 2
+
+
+def test_observability_capacity_is_typed_and_visible_after_rpc_rollback(
+    service: ProtocolService,
+) -> None:
+    connection = service.new_connection()
+    initialize(connection)
+    brain = decode(connection.handle_frame(request(2, "brain.create")))["result"]
+    maximum_capture_sequence = 2**63 - 2
+    bindings: list[tuple[str, str]] = []
+    for index in range(2):
+        instance = new_id()
+        attached = decode(
+            connection.handle_frame(
+                request(
+                    3 + index,
+                    "brain.attach",
+                    bridge_attach_params(brain["brain_id"], instance),
+                )
+            )
+        )["result"]
+        bindings.append((instance, attached["binding"]))
+
+    first_instance, first_binding = bindings[0]
+    accepted = decode(
+        connection.handle_frame(
+            request(
+                5,
+                "bridge.commit",
+                {
+                    "binding": first_binding,
+                    "record": {
+                        "schema_version": 1,
+                        "record_kind": "gap",
+                        "bridge_instance_id": first_instance,
+                        "first_capture_seq": 1,
+                        "last_capture_seq": maximum_capture_sequence,
+                        "dropped_count": maximum_capture_sequence,
+                        "cause_counts": {"queue_full": maximum_capture_sequence},
+                    },
+                },
+            )
+        )
+    )
+    assert accepted["result"]["through_capture_seq"] == maximum_capture_sequence
+
+    second_instance, second_binding = bindings[1]
+    rejected = decode(
+        connection.handle_frame(
+            request(
+                6,
+                "bridge.commit",
+                {
+                    "binding": second_binding,
+                    "record": {
+                        "schema_version": 1,
+                        "record_kind": "gap",
+                        "bridge_instance_id": second_instance,
+                        "first_capture_seq": 1,
+                        "last_capture_seq": 2,
+                        "dropped_count": 2,
+                        "cause_counts": {"queue_full": 2},
+                    },
+                },
+            )
+        )
+    )
+    assert rejected["error"] == {
+        "code": "capacity_exhausted",
+        "message": "bounded runtime capacity is exhausted",
+        "data": {},
+    }
+
+    status = decode(connection.handle_frame(request(7, "daemon.status")))["result"]
+    assert status["dropped_events"] == maximum_capture_sequence
+    assert status["semantic_evidence"]["semantic_gap_records"] == 1
+    assert (
+        service.runtime.ledger.bridge_stream_state(second_instance).next_capture_seq
+        == 1
+    )
+
+
 def test_close_waits_for_inflight_dispatch_before_disconnect_fence(
     service: ProtocolService,
     monkeypatch: pytest.MonkeyPatch,

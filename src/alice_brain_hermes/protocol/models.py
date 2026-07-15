@@ -42,6 +42,10 @@ MAX_BRIDGE_STRING_BYTES = 16_384
 MAX_COVERAGE_CHANNELS = 64
 MIN_BRIDGE_INTEGER = -(2**63)
 MAX_BRIDGE_INTEGER = 2**63 - 1
+# ``bridge_stream.next_capture_seq`` stores the successor cursor in SQLite.
+# Reserve the final signed-int64 value so every accepted capture has one exact,
+# persistable successor instead of failing after wire validation.
+MAX_CAPTURE_SEQUENCE = MAX_BRIDGE_INTEGER - 1
 
 GapCause: TypeAlias = Literal[
     "queue_full",
@@ -502,7 +506,7 @@ class HermesObservationV1(_StrictModel):
     schema_version: Literal[RECORD_SCHEMA_VERSION] = RECORD_SCHEMA_VERSION
     record_kind: Literal["observation"] = "observation"
     bridge_instance_id: str
-    capture_seq: int = Field(ge=1)
+    capture_seq: int = Field(ge=1, le=MAX_CAPTURE_SEQUENCE)
     captured_at: datetime
     captured_monotonic_ns: int = Field(ge=0)
     source_schema_version: Literal["hermes.observer.v1"] = "hermes.observer.v1"
@@ -669,9 +673,9 @@ class BridgeGapV1(_StrictModel):
     schema_version: Literal[GAP_SCHEMA_VERSION] = GAP_SCHEMA_VERSION
     record_kind: Literal["gap"] = "gap"
     bridge_instance_id: str
-    first_capture_seq: int = Field(ge=1)
-    last_capture_seq: int = Field(ge=1)
-    dropped_count: int = Field(ge=1)
+    first_capture_seq: int = Field(ge=1, le=MAX_CAPTURE_SEQUENCE)
+    last_capture_seq: int = Field(ge=1, le=MAX_CAPTURE_SEQUENCE)
+    dropped_count: int = Field(ge=1, le=MAX_CAPTURE_SEQUENCE)
     cause_counts: FrozenJsonDict
 
     @field_validator("bridge_instance_id")
@@ -689,6 +693,8 @@ class BridgeGapV1(_StrictModel):
                 raise ValueError("gap causes must use the fixed cause enum")
             if isinstance(count, bool) or not isinstance(count, int) or count < 1:
                 raise ValueError("gap cause counts must be positive integers")
+            if count > MAX_CAPTURE_SEQUENCE:
+                raise ValueError("gap cause counts exceed the capture sequence bound")
         return FrozenJsonDict(dict(value))
 
     @model_validator(mode="after")
@@ -750,7 +756,7 @@ class _ConsciousnessFrameBase(_StrictModel):
 
     brain_id: str
     state_sequence: int = Field(ge=0)
-    through_capture_seq: int = Field(ge=0)
+    through_capture_seq: int = Field(ge=0, le=MAX_CAPTURE_SEQUENCE)
     logical_clock: float = Field(ge=0.0)
     trace_complete: bool
     runtime_health: Literal["healthy", "degraded"]
@@ -834,7 +840,7 @@ class BridgeCommitAckV1(_StrictModel):
     event_id: str
     event_sequence: int = Field(ge=1)
     frame: ConsciousnessFrameV2
-    through_capture_seq: int = Field(ge=1)
+    through_capture_seq: int = Field(ge=1, le=MAX_CAPTURE_SEQUENCE)
 
     @field_validator("event_id")
     @classmethod
@@ -868,7 +874,7 @@ class BridgeCommitAckV2(_StrictModel):
     semantic_complete: bool
     semantic_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     frame: ConsciousnessFrameV3
-    through_capture_seq: int = Field(ge=1)
+    through_capture_seq: int = Field(ge=1, le=MAX_CAPTURE_SEQUENCE)
 
     @field_validator("raw_event_id")
     @classmethod
@@ -934,7 +940,7 @@ class BridgeStreamState(_StrictModel):
     brain_id: str
     server_actor_id: str
     server_adapter_id: str = Field(min_length=1, max_length=512)
-    next_capture_seq: int = Field(ge=1)
+    next_capture_seq: int = Field(ge=1, le=MAX_BRIDGE_INTEGER)
     status: Literal["open", "clean_closed", "abandoned"]
     connected_nonce: str | None = Field(default=None, min_length=1, max_length=512)
     disconnected_reason: (
@@ -943,7 +949,11 @@ class BridgeStreamState(_StrictModel):
     ) = None
     disconnected_at: datetime | None = None
     last_seen: datetime
-    closed_final_seq: int | None = Field(default=None, ge=0)
+    closed_final_seq: int | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_CAPTURE_SEQUENCE,
+    )
 
     @field_validator("bridge_instance_id", "brain_id", "server_actor_id")
     @classmethod
@@ -1199,6 +1209,7 @@ __all__ = [
     "HOOK_EVENT_TYPES",
     "MAX_BRIDGE_COMMIT_ENVELOPE_BYTES",
     "MAX_BRIDGE_RECORD_BYTES",
+    "MAX_CAPTURE_SEQUENCE",
     "OBSERVER_SCHEMA_VERSION",
     "PROTOCOL_VERSION",
     "RECORD_SCHEMA_VERSION",

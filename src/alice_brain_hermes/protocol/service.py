@@ -21,6 +21,7 @@ from alice_brain_hermes.errors import (
     BridgeClosedError,
     CaptureGapRequiredError,
     CaptureSequenceError,
+    DomainCapacityError,
     EventConflictError,
     FrameSizeError,
     IdempotencyConflictError,
@@ -390,6 +391,12 @@ class ProtocolConnection:
                 request_id,
                 "response_too_large",
                 "response exceeds the negotiated byte limit",
+            )
+        except DomainCapacityError:
+            return self._error(
+                request_id,
+                "capacity_exhausted",
+                "bounded runtime capacity is exhausted",
             )
         except KeyError:
             return self._error(

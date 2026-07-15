@@ -3,23 +3,29 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from alice_brain_hermes.core.action import ActionOutcome
 from alice_brain_hermes.core.events import new_event
+from alice_brain_hermes.core.reducer import reduce_state
+from alice_brain_hermes.core.state import BrainState
 from alice_brain_hermes.errors import SchemaVersionError
 from alice_brain_hermes.ids import new_id
 from alice_brain_hermes.protocol.models import (
     BridgeCommitAckV1,
     BridgeCommitAckV2,
     BridgeGapV1,
+    BridgeStreamState,
     ConsciousnessFrameV2,
 )
 from alice_brain_hermes.runtime.engine import ConsciousEngine
+from alice_brain_hermes.runtime.semantic_ingest import build_raw_event
 from alice_brain_hermes.runtime.store import (
     _CREATE_BRIDGE_RECORD_V4_SCHEMA,
+    _CREATE_V4_SCHEMA,
     SQLiteLedger,
 )
 
@@ -245,6 +251,138 @@ def _downgrade_empty_database(database: Path, *, sqlite_version: int) -> None:
             (str(sqlite_version),),
         )
         connection.execute(f"PRAGMA user_version = {sqlite_version}")
+
+
+def _write_overflowing_v4_gap_history(database: Path) -> None:
+    brain_id = new_id()
+    now = datetime.now(UTC)
+    dropped_per_bridge = 2**62
+    records: list[tuple[BridgeStreamState, BridgeGapV1, object, BridgeCommitAckV1]] = []
+    state = BrainState.genesis(brain_id)
+    for sequence in (1, 2):
+        bridge_instance_id = new_id()
+        stream = BridgeStreamState(
+            bridge_instance_id=bridge_instance_id,
+            brain_id=brain_id,
+            server_actor_id=brain_id,
+            server_adapter_id="legacy-adapter",
+            next_capture_seq=dropped_per_bridge + 1,
+            status="open",
+            connected_nonce=f"legacy-{sequence}",
+            last_seen=now,
+        )
+        gap = BridgeGapV1(
+            bridge_instance_id=bridge_instance_id,
+            first_capture_seq=1,
+            last_capture_seq=dropped_per_bridge,
+            dropped_count=dropped_per_bridge,
+            cause_counts={"queue_full": dropped_per_bridge},
+        )
+        event = (
+            build_raw_event(stream, gap)
+            .model_copy(update={"sequence": sequence})
+            .revalidated()
+        )
+        state = reduce_state(state, event)
+        projected = SQLiteLedger._project_bridge_frame(
+            state,
+            through_capture_seq=dropped_per_bridge,
+            capture_coverage=SQLiteLedger._record_capture_coverage(gap),
+            stream_connected=True,
+        )
+        frame = SQLiteLedger._as_legacy_frame_v2(projected)
+        ack = BridgeCommitAckV1(
+            record_fingerprint=gap.fingerprint(),
+            event_id=event.event_id,
+            event_sequence=sequence,
+            frame=frame,
+            through_capture_seq=dropped_per_bridge,
+        )
+        records.append((stream, gap, event, ack))
+
+    with sqlite3.connect(database) as connection:
+        connection.executescript(_CREATE_V4_SCHEMA)
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', '4')"
+        )
+        connection.execute(
+            "INSERT INTO brains(brain_id, next_sequence) VALUES (?, 3)",
+            (brain_id,),
+        )
+        recovery_digest = hashlib.sha256(RECOVERY_TOKEN.encode("ascii")).digest()
+        for stream, gap, event, ack in records:
+            connection.execute(
+                "INSERT INTO events(brain_id, sequence, event_id, "
+                "body_fingerprint, envelope_fingerprint, envelope_json) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    brain_id,
+                    event.sequence,
+                    event.event_id,
+                    event.body_fingerprint(),
+                    event.envelope_fingerprint(),
+                    event.canonical_json(),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO bridge_stream(bridge_instance_id, brain_id, "
+                "server_actor_id, server_adapter_id, recovery_token_digest, "
+                "next_capture_seq, status, connected_nonce, disconnected_reason, "
+                "disconnected_at, last_seen, closed_final_seq) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'open', ?, NULL, NULL, ?, NULL)",
+                (
+                    stream.bridge_instance_id,
+                    brain_id,
+                    brain_id,
+                    stream.server_adapter_id,
+                    recovery_digest,
+                    stream.next_capture_seq,
+                    stream.connected_nonce,
+                    now.isoformat(),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO bridge_record(bridge_instance_id, first_capture_seq, "
+                "last_capture_seq, record_kind, record_fingerprint, record_json, "
+                "event_id, ledger_sequence, ack_json, accepted_at) "
+                "VALUES (?, 1, ?, 'gap', ?, ?, ?, ?, ?, ?)",
+                (
+                    stream.bridge_instance_id,
+                    dropped_per_bridge,
+                    gap.fingerprint(),
+                    gap.canonical_json(),
+                    event.event_id,
+                    event.sequence,
+                    ack.canonical_json(),
+                    now.isoformat(),
+                ),
+            )
+        connection.execute("PRAGMA user_version = 4")
+
+
+def test_v4_migration_fails_closed_before_persisted_observability_overflow(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-v4-observability-overflow.db"
+    _write_overflowing_v4_gap_history(database)
+
+    with pytest.raises(SchemaVersionError, match="migration"):
+        SQLiteLedger.open(database)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert (
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "4"
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'brain_observability'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.parametrize("event_type", ["trace.gap", "semantic.gap"])

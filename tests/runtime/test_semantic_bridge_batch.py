@@ -8,8 +8,16 @@ import pytest
 import alice_brain_hermes.runtime.store as store_module
 from alice_brain_hermes.core.action import ActionOutcome, ActionPhase
 from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict
-from alice_brain_hermes.errors import IdempotencyConflictError, SchemaVersionError
-from alice_brain_hermes.protocol.models import BridgeCommitAckV2, validate_observation
+from alice_brain_hermes.errors import (
+    DomainCapacityError,
+    IdempotencyConflictError,
+    SchemaVersionError,
+)
+from alice_brain_hermes.protocol.models import (
+    BridgeCommitAckV2,
+    BridgeGapV1,
+    validate_observation,
+)
 from alice_brain_hermes.runtime.store import SQLITE_SCHEMA_VERSION
 from tests.protocol.test_models import HOOK_CASES
 from tests.runtime.test_bridge_store import make_engine
@@ -35,6 +43,133 @@ def test_empty_store_observability_is_complete_zero_evidence_not_a_gap(
     assert snapshot.semantic_records == 0
     assert snapshot.semantic_gap_records == 0
     assert snapshot.total_bridges == 0
+
+
+def test_global_observability_aggregates_large_brain_counts_exactly(
+    tmp_path: Path,
+) -> None:
+    from alice_brain_hermes.ids import new_id
+    from alice_brain_hermes.runtime.engine import ConsciousEngine
+    from alice_brain_hermes.runtime.store import SQLiteLedger
+
+    database = tmp_path / "large-global-observability.db"
+    per_brain = 2**62
+    brain_ids: list[str] = []
+    with SQLiteLedger.open(database) as ledger:
+        for index in range(2):
+            brain_id = new_id()
+            bridge_instance_id = new_id()
+            brain_ids.append(brain_id)
+            ledger.ensure_brain(brain_id)
+            engine = ConsciousEngine(ledger, brain_id, actor_id=brain_id)
+            ledger.attach_bridge_stream(
+                bridge_instance_id,
+                brain_id=brain_id,
+                server_actor_id=brain_id,
+                server_adapter_id="alice-brain-hermes-observer-v1",
+                connected_nonce=f"daemon-{index}",
+                recovery_token="ab" * 32,
+            )
+            engine.commit_bridge_record(
+                bridge_instance_id,
+                BridgeGapV1(
+                    bridge_instance_id=bridge_instance_id,
+                    first_capture_seq=1,
+                    last_capture_seq=per_brain,
+                    dropped_count=per_brain,
+                    cause_counts={"queue_full": per_brain},
+                ),
+            )
+
+        aggregate = ledger.observability_snapshot()
+        assert aggregate.dropped_events == per_brain * 2
+        assert aggregate.dropped_events > 2**63 - 1
+        assert aggregate.brain_count == 2
+        assert aggregate.semantic_records == 2
+        assert aggregate.semantic_gap_records == 2
+        for brain_id in brain_ids:
+            assert ledger.observability_snapshot(brain_id).dropped_events == per_brain
+
+    with SQLiteLedger.open(database) as reopened:
+        assert reopened.observability_snapshot() == aggregate
+
+
+def test_per_brain_observability_capacity_fails_atomically_and_restart_safe(
+    tmp_path: Path,
+) -> None:
+    from alice_brain_hermes.ids import new_id
+    from alice_brain_hermes.runtime.engine import ConsciousEngine
+    from alice_brain_hermes.runtime.store import SQLiteLedger
+
+    database = tmp_path / "per-brain-observability-capacity.db"
+    maximum_capture_sequence = 2**63 - 2
+    brain_id = new_id()
+    first_bridge = new_id()
+    second_bridge = new_id()
+    first_gap = BridgeGapV1(
+        bridge_instance_id=first_bridge,
+        first_capture_seq=1,
+        last_capture_seq=maximum_capture_sequence,
+        dropped_count=maximum_capture_sequence,
+        cause_counts={"queue_full": maximum_capture_sequence},
+    )
+    overflow_gap = BridgeGapV1(
+        bridge_instance_id=second_bridge,
+        first_capture_seq=1,
+        last_capture_seq=2,
+        dropped_count=2,
+        cause_counts={"queue_full": 2},
+    )
+    with SQLiteLedger.open(database) as ledger:
+        ledger.ensure_brain(brain_id)
+        engine = ConsciousEngine(ledger, brain_id, actor_id=brain_id)
+        for index, bridge_instance_id in enumerate((first_bridge, second_bridge)):
+            ledger.attach_bridge_stream(
+                bridge_instance_id,
+                brain_id=brain_id,
+                server_actor_id=brain_id,
+                server_adapter_id="alice-brain-hermes-observer-v1",
+                connected_nonce=f"daemon-{index}",
+                recovery_token="ab" * 32,
+            )
+        accepted = engine.commit_bridge_record(first_bridge, first_gap)
+        before = (
+            engine.state,
+            ledger.observability_snapshot(brain_id),
+            ledger.bridge_stream_state(second_bridge),
+            ledger._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+            ledger._connection.execute("SELECT COUNT(*) FROM bridge_record").fetchone()[
+                0
+            ],
+        )
+
+        with pytest.raises(DomainCapacityError, match="observability"):
+            engine.commit_bridge_record(second_bridge, overflow_gap)
+
+        assert (
+            engine.state,
+            ledger.observability_snapshot(brain_id),
+            ledger.bridge_stream_state(second_bridge),
+            ledger._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+            ledger._connection.execute("SELECT COUNT(*) FROM bridge_record").fetchone()[
+                0
+            ],
+        ) == before
+        assert engine.commit_bridge_record(first_bridge, first_gap) == accepted
+        assert ledger.bridge_stream_state(first_bridge).next_capture_seq == 2**63 - 1
+        [stored_count, storage_type] = ledger._connection.execute(
+            "SELECT dropped_events, typeof(dropped_events) "
+            "FROM brain_observability WHERE brain_id = ?",
+            (brain_id,),
+        ).fetchone()
+        assert stored_count == maximum_capture_sequence
+        assert storage_type == "integer"
+
+    with SQLiteLedger.open(database) as reopened:
+        assert reopened.observability_snapshot(brain_id).dropped_events == (
+            maximum_capture_sequence
+        )
+        assert reopened.bridge_stream_state(second_bridge).next_capture_seq == 1
 
 
 def test_pre_tool_commits_raw_and_complete_pc_e_st_rd_batch_atomically(
@@ -836,6 +971,188 @@ def test_real_all_open_api_span_cap_survives_restart_without_open_eviction(
         )
 
 
+def test_semantic_domain_capacity_gap_does_not_evict_closed_late_span(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from alice_brain_hermes.core.events import new_event
+    from alice_brain_hermes.core.limits import MAX_ACTION_RECORDS
+    from alice_brain_hermes.runtime.engine import ConsciousEngine
+    from alice_brain_hermes.runtime.store import SQLiteLedger
+
+    monkeypatch.setattr(store_module, "MAX_HERMES_SPANS_PER_STREAM", 1)
+    ledger, engine, instance = make_engine(tmp_path)
+    database = ledger.path
+    brain_id = engine.brain_id
+    old_pre = tool_observation(
+        instance,
+        1,
+        hook="pre_tool_call",
+        tool_call_id="old-tool",
+    )
+    old_post = tool_observation(
+        instance,
+        2,
+        hook="post_tool_call",
+        tool_call_id="old-tool",
+        status="ok",
+    )
+    rejected_pre = tool_observation(
+        instance,
+        3,
+        hook="pre_tool_call",
+        tool_call_id="new-tool",
+    )
+    with ledger:
+        engine.commit_bridge_record(instance, old_pre)
+        engine.commit_bridge_record(instance, old_post)
+        for index in range(MAX_ACTION_RECORDS - 1):
+            action_id = f"capacity-{index}"
+            engine.append(
+                new_event(
+                    "action.proposed",
+                    brain_id,
+                    brain_id,
+                    {"action_id": action_id, "intent": {}},
+                    action_id=action_id,
+                )
+            )
+        before_span = tuple(
+            tuple(row)
+            for row in ledger._connection.execute(
+                "SELECT external_id, occurrence_capture_seq, closed_capture_seq "
+                "FROM hermes_span"
+            )
+        )
+        assert before_span == (("old-tool", 1, 2),)
+
+        gap = engine.commit_bridge_record(instance, rejected_pre)
+        duplicate = engine.commit_bridge_record(instance, rejected_pre)
+
+        assert gap.semantic_status == "gap"
+        assert duplicate == gap
+        assert (
+            ledger.list_events(brain_id, after_sequence=gap.raw_event_sequence)[
+                0
+            ].payload["reason"]
+            == "semantic_domain_capacity"
+        )
+        assert (
+            tuple(
+                tuple(row)
+                for row in ledger._connection.execute(
+                    "SELECT external_id, occurrence_capture_seq, closed_capture_seq "
+                    "FROM hermes_span"
+                )
+            )
+            == before_span
+        )
+        before_conflict = (
+            engine.state,
+            ledger.observability_snapshot(brain_id),
+            ledger.bridge_stream_state(instance),
+            before_span,
+        )
+        changed_values = rejected_pre.model_dump(mode="python")
+        changed_values["payload"]["args"] = {"changed": True}
+        with pytest.raises(IdempotencyConflictError):
+            engine.commit_bridge_record(
+                instance,
+                validate_observation(changed_values),
+            )
+        assert (
+            engine.state,
+            ledger.observability_snapshot(brain_id),
+            ledger.bridge_stream_state(instance),
+            tuple(
+                tuple(row)
+                for row in ledger._connection.execute(
+                    "SELECT external_id, occurrence_capture_seq, closed_capture_seq "
+                    "FROM hermes_span"
+                )
+            ),
+        ) == before_conflict
+
+    with SQLiteLedger.open(database) as reopened:
+        restarted = ConsciousEngine(reopened, brain_id, actor_id=brain_id)
+        assert restarted.commit_bridge_record(instance, rejected_pre) == gap
+        late = restarted.commit_bridge_record(
+            instance,
+            tool_observation(
+                instance,
+                4,
+                hook="post_tool_call",
+                tool_call_id="old-tool",
+                status="error",
+            ),
+        )
+        assert late.semantic_status == "applied"
+        old_action = next(
+            action
+            for action in restarted.state.action_records
+            if action.intent.get("capture_seq") == 1
+        )
+        assert old_action.outcome is ActionOutcome.SUCCESS
+        assert old_action.receipt_history[-1].disposition.value == "conflict"
+        assert reopened.observability_snapshot(brain_id).semantic_gap_records == 1
+
+
+def test_successful_span_open_evicts_only_the_oldest_closed_victim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from alice_brain_hermes.runtime.store import SQLiteLedger
+
+    monkeypatch.setattr(store_module, "MAX_HERMES_SPANS_PER_STREAM", 2)
+    ledger, engine, instance = make_engine(tmp_path)
+    database = ledger.path
+    with ledger:
+        for capture_seq, tool_id in ((1, "oldest"), (3, "newer")):
+            engine.commit_bridge_record(
+                instance,
+                tool_observation(
+                    instance,
+                    capture_seq,
+                    hook="pre_tool_call",
+                    tool_call_id=tool_id,
+                ),
+            )
+            engine.commit_bridge_record(
+                instance,
+                tool_observation(
+                    instance,
+                    capture_seq + 1,
+                    hook="post_tool_call",
+                    tool_call_id=tool_id,
+                ),
+            )
+
+        opened = engine.commit_bridge_record(
+            instance,
+            tool_observation(
+                instance,
+                5,
+                hook="pre_tool_call",
+                tool_call_id="replacement",
+            ),
+        )
+        assert opened.semantic_status == "applied"
+        assert [
+            tuple(row)
+            for row in ledger._connection.execute(
+                "SELECT external_id, closed_capture_seq FROM hermes_span "
+                "ORDER BY occurrence_capture_seq"
+            )
+        ] == [("newer", 4), ("replacement", None)]
+
+    with SQLiteLedger.open(database) as reopened:
+        assert [
+            tuple(row)
+            for row in reopened._connection.execute(
+                "SELECT external_id, closed_capture_seq FROM hermes_span "
+                "ORDER BY occurrence_capture_seq"
+            )
+        ] == [("newer", 4), ("replacement", None)]
+
+
 def test_unmatched_post_tool_commits_raw_plus_semantic_gap(tmp_path: Path) -> None:
     ledger, engine, instance = make_engine(tmp_path)
     with ledger:
@@ -1158,6 +1475,40 @@ def test_startup_rejects_observability_metadata_that_claims_false_green(
         )
 
     from alice_brain_hermes.runtime.store import SQLiteLedger
+
+    with pytest.raises(SchemaVersionError, match="bridge or profile"):
+        SQLiteLedger.open(database)
+
+
+def test_startup_rejects_fractional_real_observability_counter_even_if_int_cast_matches(
+    tmp_path: Path,
+) -> None:
+    from alice_brain_hermes.runtime.store import SQLiteLedger
+
+    ledger, engine, instance = make_engine(tmp_path)
+    database = ledger.path
+    dropped = 10
+    with ledger:
+        engine.commit_bridge_record(
+            instance,
+            BridgeGapV1(
+                bridge_instance_id=instance,
+                first_capture_seq=1,
+                last_capture_seq=dropped,
+                dropped_count=dropped,
+                cause_counts={"queue_full": dropped},
+            ),
+        )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE brain_observability SET dropped_events = "
+            "CAST(dropped_events AS REAL) + 0.5"
+        )
+        [value, storage_type] = connection.execute(
+            "SELECT dropped_events, typeof(dropped_events) FROM brain_observability"
+        ).fetchone()
+        assert int(value) == dropped
+        assert storage_type == "real"
 
     with pytest.raises(SchemaVersionError, match="bridge or profile"):
         SQLiteLedger.open(database)
