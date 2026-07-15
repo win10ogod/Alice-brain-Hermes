@@ -65,6 +65,9 @@ def test_direct_bridge_accepts_last_persistable_capture_then_fails_closed(
     assert bridge.health.last_capture_seq == LAST_PERSISTABLE_CAPTURE_SEQUENCE
     assert bridge.health.trace_complete is False
     assert bridge.health.last_error == "capture_sequence_capacity_exhausted"
+    assert bridge.health.dropped_events == 0
+    assert bridge.health.pending_gap_ranges == 0
+    assert bridge.pending_gaps() == ()
 
 
 def test_reserved_bridge_rejects_unpersistable_capture_without_advancing(
@@ -86,6 +89,9 @@ def test_reserved_bridge_rejects_unpersistable_capture_without_advancing(
     assert bridge.retained_record is None
     assert bridge._next_capture_seq == MAX_BRIDGE_INTEGER  # type: ignore[attr-defined]
     assert bridge.health.last_capture_seq == LAST_PERSISTABLE_CAPTURE_SEQUENCE
+    assert bridge.health.dropped_events == 0
+    assert bridge.health.pending_gap_ranges == 0
+    assert bridge.pending_gaps() == ()
 
 
 def test_bootstrap_capacity_exhaustion_is_visible_without_unhandoffable_record() -> (
@@ -127,6 +133,8 @@ def test_bootstrap_capacity_exhaustion_is_visible_without_unhandoffable_record()
     assert bootstrap.health.trace_complete is False
     assert bootstrap.health.degraded is True
     assert bootstrap.health.last_error == "capture_sequence_capacity_exhausted"
+    assert bootstrap.health.dropped_events == 0
+    assert bootstrap.health.pending_gap_ranges == 0
 
 
 def test_bridge_accepts_an_attached_exhausted_successor_but_no_later_capture(
@@ -155,5 +163,8 @@ def test_bridge_accepts_an_attached_exhausted_successor_but_no_later_capture(
     assert bridge.queue.empty()
     assert bridge._next_capture_seq == MAX_BRIDGE_INTEGER  # type: ignore[attr-defined]
     assert bridge.health.last_error == "capture_sequence_capacity_exhausted"
+    assert bridge.health.dropped_events == 0
+    assert bridge.health.pending_gap_ranges == 0
+    assert bridge.pending_gaps() == ()
     assert any(method == "brain.attach" for method, _params in calls)
     bridge._disconnect_client()  # type: ignore[attr-defined]
