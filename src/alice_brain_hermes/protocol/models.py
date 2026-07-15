@@ -139,6 +139,12 @@ class _StrictModel(BaseModel):
 
 
 IdentifierText: TypeAlias = Annotated[str, Field(min_length=1, max_length=512)]
+# Hermes observer identifiers are host correlation values, not Alice UUIDs.  The
+# 0.18.x call sites intentionally use ``""`` or ``None`` when a surface has no
+# value (for example TUI finalization and pre-tool calls outside an API turn).
+# Keeping that absence is more accurate than fabricating an identifier or
+# turning a legal host observation into a trace gap.
+HostIdentifierText: TypeAlias = Annotated[str, Field(max_length=512)] | None
 WireText: TypeAlias = Annotated[str, Field(max_length=16_384)]
 NonNegativeInteger: TypeAlias = Annotated[int, Field(ge=0)]
 NonNegativeNumber: TypeAlias = Annotated[int | float, Field(ge=0)]
@@ -160,40 +166,40 @@ class ObservationContextV1(_StrictModel):
 
 
 class SessionContextV1(ObservationContextV1):
-    session_id: IdentifierText
+    session_id: HostIdentifierText
 
 
 class SessionTurnContextV1(SessionContextV1):
-    task_id: IdentifierText
-    turn_id: IdentifierText
+    task_id: HostIdentifierText
+    turn_id: HostIdentifierText
 
 
 class SessionEndContextV1(SessionContextV1):
-    task_id: IdentifierText | None = None
-    turn_id: IdentifierText | None = None
-    api_request_id: IdentifierText | None = None
+    task_id: HostIdentifierText = None
+    turn_id: HostIdentifierText = None
+    api_request_id: HostIdentifierText = None
 
 
 class PreLlmContextV1(SessionTurnContextV1):
-    sender_id: IdentifierText
+    sender_id: HostIdentifierText
 
 
 class ApiContextV1(SessionTurnContextV1):
-    api_request_id: IdentifierText
+    api_request_id: HostIdentifierText
 
 
 class ToolContextV1(ApiContextV1):
-    tool_call_id: IdentifierText
+    tool_call_id: HostIdentifierText
 
 
 class ApprovalContextV1(ObservationContextV1):
-    turn_id: IdentifierText
-    tool_call_id: IdentifierText
+    turn_id: HostIdentifierText
+    tool_call_id: HostIdentifierText
 
 
 class SubagentContextV1(ObservationContextV1):
-    parent_session_id: IdentifierText
-    child_session_id: IdentifierText
+    parent_session_id: HostIdentifierText
+    child_session_id: HostIdentifierText
 
 
 class CoverageV1(_StrictModel):
@@ -349,6 +355,7 @@ class SessionStartPayloadV1(ObservationPayloadV1):
 
 
 class SessionEndPayloadV1(SessionStartPayloadV1):
+    model: WireText | None = None
     completed: bool
     interrupted: bool
     reason: WireText | None = None
@@ -357,8 +364,8 @@ class SessionEndPayloadV1(SessionStartPayloadV1):
 class SessionBoundaryPayloadV1(ObservationPayloadV1):
     platform: WireText
     reason: WireText | None = None
-    old_session_id: IdentifierText | None = None
-    new_session_id: IdentifierText | None = None
+    old_session_id: HostIdentifierText = None
+    new_session_id: HostIdentifierText = None
 
 
 class PreLlmPayloadV1(ObservationPayloadV1):
@@ -428,10 +435,10 @@ class ApiErrorPayloadV1(ObservationPayloadV1):
     started_at: FrozenJsonValue
     ended_at: FrozenJsonValue
     status_code: FrozenJsonValue
-    retry_count: NonNegativeInteger
-    max_retries: NonNegativeInteger
-    retryable: bool
-    reason: WireText
+    retry_count: NonNegativeInteger | None = None
+    max_retries: NonNegativeInteger | None = None
+    retryable: bool | None = None
+    reason: WireText | None = None
     error: FrozenJsonValue
     request: FrozenJsonValue
 
@@ -465,18 +472,18 @@ class ApprovalResponsePayloadV1(ApprovalPayloadV1):
 
 
 class SubagentStartPayloadV1(ObservationPayloadV1):
-    parent_turn_id: IdentifierText
+    parent_turn_id: HostIdentifierText
     parent_subagent_id: FrozenJsonValue
     child_subagent_id: FrozenJsonValue
-    child_role: WireText
+    child_role: WireText | None = None
     child_goal: FrozenJsonValue
 
 
 class SubagentStopPayloadV1(ObservationPayloadV1):
-    parent_turn_id: IdentifierText
-    child_role: WireText
+    parent_turn_id: HostIdentifierText
+    child_role: WireText | None = None
     child_summary: FrozenJsonValue
-    child_status: WireText
+    child_status: WireText | None = None
     duration_ms: NonNegativeNumber
 
 

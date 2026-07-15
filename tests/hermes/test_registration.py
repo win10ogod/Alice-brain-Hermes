@@ -240,12 +240,21 @@ def test_register_adds_exact_hooks_and_cli_arguments(
     ]
 
 
-def test_callbacks_are_named_sync_immutable_and_return_none() -> None:
+def test_callbacks_are_named_sync_immutable_and_have_exact_return_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from alice_brain_hermes.hermes import registration
 
     assert isinstance(registration.HOOK_CALLBACKS, MappingProxyType)
     assert tuple(registration.HOOK_CALLBACKS) == registration.APPROVED_HOOKS
 
+    dispatched: list[tuple[str, dict[str, object]]] = []
+
+    def inert_dispatch(hook: str, kwargs: dict[str, object]) -> str | None:
+        dispatched.append((hook, kwargs))
+        return "cached context" if hook == "pre_llm_call" else None
+
+    monkeypatch.setattr(registration, "_lazy_dispatch", inert_dispatch)
     hostile = object()
     for name, callback in registration.HOOK_CALLBACKS.items():
         signature = inspect.signature(callback)
@@ -254,11 +263,54 @@ def test_callbacks_are_named_sync_immutable_and_return_none() -> None:
         assert list(signature.parameters) == ["kwargs"]
         assert signature.parameters["kwargs"].kind is inspect.Parameter.VAR_KEYWORD
         assert signature.parameters["kwargs"].annotation in {Any, "Any"}
-        assert signature.return_annotation in {None, "None"}
-        assert callback(payload=hostile) is None
+        if name == "pre_llm_call":
+            assert signature.return_annotation == "str | None"
+            assert callback(payload=hostile) == "cached context"
+        else:
+            assert signature.return_annotation in {None, "None"}
+            assert callback(payload=hostile) is None
+
+    assert [hook for hook, _kwargs in dispatched] == list(
+        registration.APPROVED_HOOKS
+    )
 
     with pytest.raises(TypeError):
         registration.HOOK_CALLBACKS["extra"] = lambda **_kwargs: None  # type: ignore[index]
+
+
+def test_public_callbacks_fail_open_when_lazy_bootstrap_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=1,
+        start_worker_on_capture=False,
+    )
+    bootstrap.publish_context("cached context")
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+
+    def failed_bootstrap(_hook: str, _kwargs: dict[str, object]) -> str | None:
+        raise RuntimeError("bootstrap failed")
+
+    monkeypatch.setattr(registration, "_lazy_dispatch", failed_bootstrap)
+
+    for name, callback in registration.HOOK_CALLBACKS.items():
+        result = callback(telemetry_schema_version="hermes.observer.v1")
+        if name == "pre_llm_call":
+            assert result == "cached context"
+        else:
+            assert result is None
+
+    first, merged = bootstrap.pending_for_test()
+    assert (first.capture_seq, first.last_capture_seq) == (1, 1)
+    assert (merged.capture_seq, merged.last_capture_seq) == (2, 16)
+    assert first.gap_cause == "callback_internal"
+    assert merged.gap_cause == "callback_internal"
+    assert dict(merged.gap_cause_counts or {}) == {"callback_internal": 15}
+    assert bootstrap.health.dropped_events == 16
+    assert bootstrap.health.pending_records == 16
+    assert bootstrap.health.pending_gap_ranges == 2
 
 
 def test_packaging_is_a_direct_bounded_runtime_dependency() -> None:
@@ -362,6 +414,116 @@ def _run_inert_registration_probe() -> dict[str, Any]:
     return json.loads(completed.stdout)
 
 
+def _run_first_callback_purity_probe() -> dict[str, Any]:
+    script = textwrap.dedent(
+        """
+        import builtins
+        import importlib.metadata
+        import json
+        import os
+        import secrets
+        import socket
+        import sqlite3
+        import subprocess
+        import sys
+        import threading
+        import types
+        import uuid
+
+        callback_thread = threading.get_ident()
+        operations = []
+        forbidden_prefixes = (
+            "alice_brain_hermes.runtime",
+            "alice_brain_hermes.protocol",
+            "alice_brain_hermes.hermes.bridge",
+            "alice_brain_hermes.hermes.hooks",
+            "alice_brain_hermes.projections",
+        )
+
+        def on_callback():
+            return threading.get_ident() == callback_thread
+
+        def forbidden(label):
+            def fail(*args, **kwargs):
+                if on_callback():
+                    operations.append(label)
+                    raise AssertionError(label)
+                raise RuntimeError("worker intentionally blocked: " + label)
+            return fail
+
+        real_import = builtins.__import__
+        def guarded_import(name, *args, **kwargs):
+            if on_callback() and name.startswith(forbidden_prefixes):
+                operations.append("import:" + name)
+                raise AssertionError("import:" + name)
+            return real_import(name, *args, **kwargs)
+
+        real_start = threading.Thread.start
+        def observed_start(self):
+            operations.append("thread.start")
+            return None
+
+        builtins.__import__ = guarded_import
+        secrets.token_hex = forbidden("secrets.token_hex")
+        uuid.uuid4 = forbidden("uuid.uuid4")
+        os.urandom = forbidden("os.urandom")
+        socket.socket = forbidden("socket.socket")
+        socket.create_connection = forbidden("socket.create_connection")
+        sqlite3.connect = forbidden("sqlite3.connect")
+        subprocess.Popen = forbidden("subprocess.Popen")
+        threading.Thread.start = observed_start
+
+        host = types.ModuleType("hermes_cli")
+        host.__version__ = "0.18.2"
+        sys.modules["hermes_cli"] = host
+
+        class Context:
+            def __init__(self):
+                self.hooks = {}
+            def register_hook(self, name, callback):
+                self.hooks[name] = callback
+            def register_cli_command(self, **kwargs):
+                pass
+
+        matches = [
+            item for item in importlib.metadata.entry_points(
+                group="hermes_agent.plugins"
+            )
+            if item.name == "alice-brain"
+            and item.dist is not None
+            and item.dist.name == "alice-brain-hermes"
+        ]
+        module = matches[0].load()
+        context = Context()
+        module.register(context)
+        result = context.hooks["on_session_start"](
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+            model="model",
+            platform="cli",
+        )
+        print(json.dumps({
+            "result": result,
+            "operations": operations,
+            "operational_modules": sorted(
+                name for name in sys.modules
+                if name.startswith(forbidden_prefixes)
+            ),
+        }, sort_keys=True))
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
 def test_register_does_not_import_operational_modules() -> None:
     result = _run_inert_registration_probe()
 
@@ -376,6 +538,137 @@ def test_register_does_not_touch_io_provider_or_threads() -> None:
     assert result["hook_count"] == 16
     assert result["cli_count"] == 1
     assert result["operations"] == []
+
+
+def test_first_callback_only_starts_worker_without_operational_import_or_entropy(
+) -> None:
+    result = _run_first_callback_purity_probe()
+
+    assert result == {
+        "result": None,
+        "operations": ["thread.start"],
+        "operational_modules": [],
+    }
+
+
+def test_bootstrap_shape_failure_reserves_exact_callback_internal_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    monkeypatch.setattr(
+        registration,
+        "_copy_bootstrap_value",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("shape")),
+    )
+
+    assert registration.on_session_start(
+        telemetry_schema_version="hermes.observer.v1",
+        session_id="session",
+        model="model",
+        platform="cli",
+    ) is None
+
+    (capture,) = bootstrap.pending_for_test()
+    assert capture.capture_seq == 1
+    assert capture.gap_cause == "callback_internal"
+    health = bootstrap.health
+    assert health.trace_complete is False
+    assert health.dropped_events == 1
+    assert health.pending_records == 1
+
+
+def test_bootstrap_copy_cost_is_bounded_for_hostile_nested_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+    import tracemalloc
+
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    huge_string = "大" * 2_000_000
+    huge_mapping = {str(index): huge_string for index in range(100_000)}
+
+    tracemalloc.start()
+    started = time.perf_counter()
+    assert registration.pre_tool_call(
+        telemetry_schema_version="hermes.observer.v1",
+        tool_name="terminal",
+        args=huge_mapping,
+        task_id="task",
+        session_id="session",
+        tool_call_id="tool",
+        turn_id="turn",
+        api_request_id="request",
+        middleware_trace=[],
+    ) is None
+    elapsed = time.perf_counter() - started
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert elapsed < 0.15
+    assert peak < 2_000_000
+    (capture,) = bootstrap.pending_for_test()
+    assert capture.capture_seq == 1
+    assert capture.gap_cause is None
+    assert capture.detached_kwargs is not None
+
+
+def test_bootstrap_overflow_merges_alternating_gap_causes_into_one_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=1,
+        start_worker_on_capture=False,
+    )
+    original_copy = registration._copy_bootstrap_value  # type: ignore[attr-defined]
+
+    def sometimes_fail(value: object, *args: object, **kwargs: object) -> object:
+        if value == "explode":
+            raise RuntimeError("hostile copier value")
+        return original_copy(value, *args, **kwargs)
+
+    monkeypatch.setattr(registration, "_copy_bootstrap_value", sometimes_fail)
+    bootstrap.capture(
+        "on_session_start",
+        {
+            "telemetry_schema_version": "hermes.observer.v1",
+            "session_id": "queued",
+        },
+    )
+    for index in range(200):
+        if index % 2 == 0:
+            payload = {"telemetry_schema_version": "invalid"}
+        else:
+            payload = {
+                "telemetry_schema_version": "hermes.observer.v1",
+                "payload": "explode",
+            }
+        bootstrap.capture("on_session_start", payload)
+
+    queued, overflow = bootstrap.pending_for_test()
+    assert queued.capture_seq == 1
+    assert overflow.capture_seq == 2
+    assert overflow.last_capture_seq == 201
+    assert overflow.gap_cause is None
+    assert dict(overflow.gap_cause_counts or {}) == {
+        "callback_internal": 100,
+        "invalid_source_schema": 100,
+    }
+    assert bootstrap.health.pending_gap_ranges == 1
+    assert bootstrap.health.pending_records == 201
 
 
 def test_same_context_registers_once(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -663,8 +956,7 @@ def test_enabled_entrypoint_loads_exact_hooks_and_cli(
 
     manager.discover_and_load()
 
-    _assert_real_manager_surface(manager, host)
-    operational_after = {
+    operational_after_discovery = {
         name
         for name in set(sys.modules) - operational_before
         if name.startswith(
@@ -676,7 +968,11 @@ def test_enabled_entrypoint_loads_exact_hooks_and_cli(
             )
         )
     }
-    assert operational_after == set()
+    assert operational_after_discovery == set()
+    # Surface validation invokes every callback.  The first callback may start
+    # the bootstrap worker; operational imports are then worker-owned rather
+    # than registration/discovery side effects.
+    _assert_real_manager_surface(manager, host)
 
 
 def test_enabled_directory_plugin_loads_exact_hooks_and_cli(
@@ -704,8 +1000,7 @@ def test_enabled_directory_plugin_loads_exact_hooks_and_cli(
             fromlist=["APPROVED_HOOKS"],
         ).APPROVED_HOOKS
     )
-    _assert_real_manager_surface(manager, host)
-    operational_after = {
+    operational_after_discovery = {
         name
         for name in set(sys.modules) - operational_before
         if name.startswith(
@@ -717,7 +1012,11 @@ def test_enabled_directory_plugin_loads_exact_hooks_and_cli(
             )
         )
     }
-    assert operational_after == set()
+    assert operational_after_discovery == set()
+    # Surface validation invokes every callback.  The first callback may start
+    # the bootstrap worker; operational imports are then worker-owned rather
+    # than registration/discovery side effects.
+    _assert_real_manager_surface(manager, host)
 
 
 def test_entrypoint_and_directory_paths_are_tested_in_isolation(
