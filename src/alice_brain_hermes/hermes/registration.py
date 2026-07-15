@@ -252,6 +252,7 @@ class _BootstrapCaptureBuffer:
         self._queue_head: _BootstrapCapture | None = None
         self._worker_retained: _BootstrapCapture | None = None
         self._worker: threading.Thread | None = None
+        self._transport_bridge: Any | None = None
         self._stop_event = threading.Event()
         self._stop_requested = False
         self._start_worker_on_capture = start_worker_on_capture
@@ -828,6 +829,39 @@ class _BootstrapCaptureBuffer:
         except BaseException as error:
             self.mark_unrepresented_callback(error)
 
+    def _adopt_transport_bridge(self, bridge: Any) -> None:
+        with self._worker_lock:
+            current = self._transport_bridge
+            if current is not None and current is not bridge:
+                raise RuntimeError("bootstrap transport bridge ownership changed")
+            self._transport_bridge = bridge
+
+    def _stop_transport_bridge(self, bridge: Any | None = None) -> None:
+        with self._worker_lock:
+            owned = self._transport_bridge
+        if owned is None:
+            return
+        if bridge is not None and owned is not bridge:
+            raise RuntimeError("bootstrap transport bridge identity changed")
+
+        cleanup_error: BaseException | None = None
+        cleanup_complete = False
+        try:
+            stop = getattr(owned, "stop_worker_for_test", None)
+            if stop is not None:
+                stop()
+                if owned.worker_started:
+                    raise RuntimeError("bootstrap transport bridge did not stop")
+            cleanup_complete = True
+        except BaseException as error:
+            cleanup_error = error
+        if cleanup_complete:
+            with self._worker_lock:
+                if self._transport_bridge is owned:
+                    self._transport_bridge = None
+        if cleanup_error is not None:
+            self.mark_worker_degraded(cleanup_error)
+
     def stop_worker_for_test(self) -> None:
         with self._worker_lock:
             self._stop_requested = True
@@ -835,7 +869,7 @@ class _BootstrapCaptureBuffer:
             self._wake.set()
             worker = self._worker
         if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=2.0)
+            worker.join(timeout=4.0)
             if worker.is_alive():
                 raise RuntimeError(
                     "bootstrap worker did not stop within the test bound"
@@ -864,17 +898,23 @@ def _bootstrap_worker_entry(buffer: _BootstrapCaptureBuffer) -> None:
     try:
         _bootstrap_worker_main(buffer)
     finally:
-        buffer._publish_worker_exit(worker)
+        try:
+            buffer._stop_transport_bridge()
+        except BaseException as error:
+            buffer.mark_worker_degraded(error)
+        finally:
+            buffer._publish_worker_exit(worker)
 
 
 def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
-    bridge: Any | None = None
+    bridge: Any | None = getattr(buffer, "_transport_bridge", None)
     while True:
         try:
             stop_probe = getattr(buffer, "worker_stop_requested", None)
             if stop_probe is not None and stop_probe():
                 return
             if bridge is None:
+                candidate: Any | None = None
                 try:
                     from alice_brain_hermes.hermes.bridge import (
                         HookBridge,
@@ -886,12 +926,35 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                         start_worker_on_capture=False,
                         context_sink=buffer.publish_context,
                     )
+                    adopt = getattr(buffer, "_adopt_transport_bridge", None)
+                    if adopt is not None:
+                        adopt(candidate)
                     candidate.start_worker()
                     if not candidate.worker_started:
                         raise RuntimeError("Hermes bridge worker did not start")
                     bridge = candidate
                 except BaseException as error:
-                    bridge = None
+                    if candidate is not None:
+                        stop_transport = getattr(
+                            buffer,
+                            "_stop_transport_bridge",
+                            None,
+                        )
+                        if stop_transport is not None:
+                            try:
+                                stop_transport(candidate)
+                            except BaseException as cleanup_error:
+                                buffer.mark_worker_degraded(cleanup_error)
+                    bridge = getattr(buffer, "_transport_bridge", None)
+                    buffer.mark_worker_degraded(error)
+                    buffer.wait(0.1)
+                    continue
+            elif not bridge.worker_started:
+                try:
+                    bridge.start_worker()
+                    if not bridge.worker_started:
+                        raise RuntimeError("Hermes bridge worker did not restart")
+                except BaseException as error:
                     buffer.mark_worker_degraded(error)
                     buffer.wait(0.1)
                     continue

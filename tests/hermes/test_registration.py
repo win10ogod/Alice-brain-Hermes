@@ -13,6 +13,7 @@ import textwrap
 import threading
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from email.parser import BytesParser
 from email.policy import compat32
 from importlib import metadata
@@ -2317,6 +2318,245 @@ def test_bootstrap_stop_and_restart_are_serialized_by_the_worker_lock(
     assert restart_finished.is_set()
 
     bootstrap.stop_worker_for_test()
+
+
+def test_bootstrap_stop_owns_child_bridge_and_restart_never_accumulates_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+    from alice_brain_hermes.hermes import registration
+
+    real_bridge = bridge_module.HookBridge
+    child_started = threading.Event()
+    handed_off = threading.Event()
+    instances: list[Any] = []
+    reservations: list[dict[str, object]] = []
+
+    class TrackingBridge(real_bridge):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            kwargs["reconnect_delay_seconds"] = 0.01
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            instances.append(self)
+
+        def start_worker(self) -> None:
+            super().start_worker()
+            if self.worker_started:
+                child_started.set()
+
+        def capture_reserved(self, **reservation: object) -> None:
+            super().capture_reserved(**reservation)  # type: ignore[arg-type]
+            reservations.append(reservation)
+            handed_off.set()
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    monkeypatch.setattr(bridge_module, "HookBridge", TrackingBridge)
+    monkeypatch.setattr(bridge_module, "default_runtime_home", lambda: tmp_path)
+
+    try:
+        bootstrap._start_worker()  # type: ignore[attr-defined]
+        assert child_started.wait(2)
+        assert len(instances) == 1
+        first = instances[0]
+        assert first.worker_started is True
+        assert len(
+            [
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "alice-brain-hermes-bridge"
+                and thread.is_alive()
+            ]
+        ) == 1
+
+        bootstrap.stop_worker_for_test()
+        assert bootstrap._worker is None  # type: ignore[attr-defined]
+        assert first.worker_started is False
+        assert bootstrap._transport_bridge is None  # type: ignore[attr-defined]
+
+        child_started.clear()
+        bootstrap._start_worker()  # type: ignore[attr-defined]
+        assert child_started.wait(2)
+        assert len(instances) == 2
+        second = instances[1]
+        assert second is not first
+        assert second.worker_started is True
+        assert len(
+            [
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "alice-brain-hermes-bridge"
+                and thread.is_alive()
+            ]
+        ) == 1
+
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        assert handed_off.wait(2)
+        bootstrap.stop_worker_for_test()
+    finally:
+        with suppress(BaseException):
+            bootstrap.stop_worker_for_test()
+        for instance in instances:
+            with suppress(BaseException):
+                instance.stop_worker_for_test()
+
+    assert len(reservations) == 1
+    assert reservations[0]["first_capture_seq"] == 1
+    assert reservations[0]["last_capture_seq"] == 1
+    assert bootstrap._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert bootstrap.pending_for_test() == ()
+    assert bootstrap._transport_bridge is None  # type: ignore[attr-defined]
+    assert all(instance.worker_started is False for instance in instances)
+
+
+def test_bootstrap_child_cleanup_baseexception_still_publishes_outer_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+    from alice_brain_hermes.hermes import registration
+
+    child_started = threading.Event()
+    instances: list[Any] = []
+    stop_calls = 0
+
+    class FakeProjections:
+        @staticmethod
+        def read_context() -> None:
+            return None
+
+    class FailingStopBridge:
+        projections = FakeProjections()
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.alive = True
+            instances.append(self)
+            child_started.set()
+
+        @property
+        def worker_started(self) -> bool:
+            return self.alive
+
+        def start_worker(self) -> None:
+            self.alive = True
+
+        def stop_worker_for_test(self) -> None:
+            nonlocal stop_calls
+            stop_calls += 1
+            if stop_calls == 1:
+                raise MemoryError("child bridge cleanup failed")
+            self.alive = False
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(bridge_module, "HookBridge", FailingStopBridge)
+    monkeypatch.setattr(bridge_module, "default_runtime_home", lambda: "unused")
+
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+    assert child_started.wait(2)
+    bootstrap.stop_worker_for_test()
+
+    assert stop_calls == 1
+    assert len(instances) == 1
+    assert bootstrap._worker is None  # type: ignore[attr-defined]
+    assert bootstrap._transport_bridge is instances[0]  # type: ignore[attr-defined]
+    assert bootstrap.worker_started is False
+    assert bootstrap.health.worker_started is False
+    assert bootstrap.health.degraded is True
+    assert bootstrap.health.last_error == "MemoryError"
+
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+    assert bootstrap.worker_started is True
+    bootstrap.stop_worker_for_test()
+
+    assert stop_calls == 2
+    assert len(instances) == 1
+    assert instances[0].worker_started is False
+    assert bootstrap._worker is None  # type: ignore[attr-defined]
+    assert bootstrap._transport_bridge is None  # type: ignore[attr-defined]
+
+
+def test_bootstrap_restarts_dead_child_without_duplicate_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+    from alice_brain_hermes.hermes import registration
+
+    child_started = threading.Event()
+    child_restarted = threading.Event()
+    capture_accepted = threading.Event()
+    instances: list[Any] = []
+    starts = 0
+    reservations: list[dict[str, object]] = []
+
+    class FakeProjections:
+        @staticmethod
+        def read_context() -> None:
+            return None
+
+    class RestartingBridge:
+        projections = FakeProjections()
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.alive = False
+            instances.append(self)
+
+        @property
+        def worker_started(self) -> bool:
+            return self.alive
+
+        def start_worker(self) -> None:
+            nonlocal starts
+            starts += 1
+            self.alive = True
+            if starts == 1:
+                child_started.set()
+            else:
+                child_restarted.set()
+
+        def capture_reserved(self, **reservation: object) -> None:
+            reservations.append(reservation)
+            self.alive = False
+            capture_accepted.set()
+
+        def stop_worker_for_test(self) -> None:
+            self.alive = False
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    monkeypatch.setattr(bridge_module, "HookBridge", RestartingBridge)
+    monkeypatch.setattr(bridge_module, "default_runtime_home", lambda: "unused")
+
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+    try:
+        assert child_started.wait(2)
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        assert capture_accepted.wait(2)
+        assert child_restarted.wait(2)
+    finally:
+        bootstrap.stop_worker_for_test()
+
+    assert len(instances) == 1
+    assert starts == 2
+    assert len(reservations) == 1
+    assert reservations[0]["first_capture_seq"] == 1
+    assert reservations[0]["last_capture_seq"] == 1
+    assert bootstrap._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert bootstrap.pending_for_test() == ()
+    assert bootstrap._transport_bridge is None  # type: ignore[attr-defined]
 
 
 def test_bootstrap_copy_cost_is_bounded_for_hostile_nested_values(
