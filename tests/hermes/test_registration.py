@@ -681,6 +681,177 @@ def test_post_reservation_queue_failure_replaces_the_same_sequence_with_a_gap(
     assert bootstrap.health.pending_gap_ranges == 1
 
 
+def test_gap_health_publication_failure_is_reconciled_by_outer_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    original_replace = registration.replace
+    failed_once = False
+
+    def fail_first_gap_health_publish(instance: object, **changes: object) -> object:
+        nonlocal failed_once
+        if (
+            not failed_once
+            and {
+                "trace_complete",
+                "dropped_events",
+                "pending_gap_ranges",
+            }
+            <= changes.keys()
+        ):
+            failed_once = True
+            raise MemoryError("gap health publish failed")
+        return original_replace(instance, **changes)
+
+    monkeypatch.setattr(registration, "replace", fail_first_gap_health_publish)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="invalid",
+            session_id="session",
+        )
+        is None
+    )
+
+    (retained,) = bootstrap.pending_for_test()
+    assert failed_once is True
+    assert (retained.capture_seq, retained.last_capture_seq) == (1, 1)
+    assert retained.gap_cause == "invalid_source_schema"
+    assert bootstrap._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert bootstrap.health.trace_complete is False
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.pending_records == 1
+    assert bootstrap.health.pending_gap_ranges == 1
+
+
+def test_merged_gap_health_retry_preserves_handed_off_dropped_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=1,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+
+    registration.on_session_start(
+        telemetry_schema_version="invalid",
+        session_id="handed-off-gap",
+    )
+    handed_off = bootstrap.next_for_worker()
+    assert handed_off is not None
+    bootstrap.mark_handed_off(handed_off)
+
+    registration.on_session_start(
+        telemetry_schema_version="hermes.observer.v1",
+        session_id="queued-observation",
+    )
+    registration.on_session_start(
+        telemetry_schema_version="invalid",
+        session_id="first-overflow-gap",
+    )
+    assert bootstrap.health.dropped_events == 2
+    assert bootstrap.health.pending_gap_ranges == 1
+
+    original_replace = registration.replace
+    failed_once = False
+
+    def fail_first_gap_health_publish(instance: object, **changes: object) -> object:
+        nonlocal failed_once
+        if (
+            not failed_once
+            and {
+                "trace_complete",
+                "dropped_events",
+                "pending_gap_ranges",
+            }
+            <= changes.keys()
+        ):
+            failed_once = True
+            raise MemoryError("merged gap health publish failed")
+        return original_replace(instance, **changes)
+
+    monkeypatch.setattr(registration, "replace", fail_first_gap_health_publish)
+
+    registration.on_session_start(
+        telemetry_schema_version="invalid",
+        session_id="second-overflow-gap",
+    )
+
+    observation, merged_gap = bootstrap.pending_for_test()
+    assert failed_once is True
+    assert observation.capture_seq == 2
+    assert observation.gap_cause is None
+    assert (merged_gap.capture_seq, merged_gap.last_capture_seq) == (3, 4)
+    assert merged_gap.gap_cause == "invalid_source_schema"
+    assert bootstrap._next_capture_seq == 5  # type: ignore[attr-defined]
+    assert bootstrap.health.trace_complete is False
+    assert bootstrap.health.dropped_events == 3
+    assert bootstrap.health.pending_records == 3
+    assert bootstrap.health.pending_gap_ranges == 1
+
+
+def test_handoff_health_failure_leaves_record_retained_and_health_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=1,
+        start_worker_on_capture=False,
+    )
+    bootstrap.capture(
+        "on_session_start",
+        {
+            "telemetry_schema_version": "invalid",
+            "session_id": "gap",
+        },
+    )
+    retained = bootstrap.next_for_worker()
+    assert retained is not None
+    health_before = bootstrap.health
+    original_replace = registration.replace
+    failed_once = False
+
+    def fail_first_handoff_health_publish(
+        instance: object,
+        **changes: object,
+    ) -> object:
+        nonlocal failed_once
+        if (
+            not failed_once
+            and changes.get("pending_records") == 0
+            and "worker_error" in changes
+        ):
+            failed_once = True
+            raise MemoryError("handoff health publish failed")
+        return original_replace(instance, **changes)
+
+    monkeypatch.setattr(registration, "replace", fail_first_handoff_health_publish)
+
+    with pytest.raises(MemoryError, match="handoff health publish failed"):
+        bootstrap.mark_handed_off(retained)
+
+    assert failed_once is True
+    assert bootstrap.next_for_worker() is retained
+    assert bootstrap.pending_for_test() == (retained,)
+    assert bootstrap.health == health_before
+
+    bootstrap.mark_handed_off(retained)
+    assert bootstrap.pending_for_test() == ()
+    assert bootstrap.health.trace_complete is False
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.pending_records == 0
+    assert bootstrap.health.pending_gap_ranges == 0
+
+
 @pytest.mark.parametrize(
     "failure",
     [RuntimeError("after reservation"), KeyboardInterrupt(), MemoryError()],

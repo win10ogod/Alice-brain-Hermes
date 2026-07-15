@@ -247,6 +247,7 @@ class _BootstrapCaptureBuffer:
         self._worker: threading.Thread | None = None
         self._start_worker_on_capture = start_worker_on_capture
         self._health = _BootstrapHealth()
+        self._handed_off_dropped_events = 0
         self._context: str | None = None
 
     @property
@@ -434,16 +435,40 @@ class _BootstrapCaptureBuffer:
             gap_cause_counts=MappingProxyType({cause: 1}),
         )
         pending_state = self._replace_pending_with_gap_locked(gap)
-        if pending_state == "gap":
-            return
-        range_delta = (
-            1 if pending_state == "replaced" else self._retain_new_gap_locked(gap)
-        )
+        if pending_state == "missing":
+            self._retain_new_gap_locked(gap)
+        self._reconcile_gap_health_locked()
+
+    def _pending_gap_metrics_locked(
+        self,
+        *,
+        exclude: _BootstrapCapture | None = None,
+    ) -> tuple[int, int]:
+        items = [self._worker_retained, self._queue_head]
+        with self._queue.mutex:
+            items.extend(self._queue.queue)
+        items.extend(self._overflow)
+        pending_gap_ranges = 0
+        pending_dropped_events = 0
+        for item in items:
+            if item is None or item is exclude or not item.is_gap:
+                continue
+            pending_gap_ranges += 1
+            pending_dropped_events += item.capture_count
+        return pending_gap_ranges, pending_dropped_events
+
+    def _reconcile_gap_health_locked(self) -> None:
+        pending_gap_ranges, pending_dropped_events = self._pending_gap_metrics_locked()
+        dropped_events = self._handed_off_dropped_events + pending_dropped_events
         self._health = replace(
             self._health,
-            trace_complete=False,
-            dropped_events=self._health.dropped_events + 1,
-            pending_gap_ranges=self._health.pending_gap_ranges + range_delta,
+            trace_complete=(
+                self._health.trace_complete
+                and dropped_events == 0
+                and self._health.registration_failures == 0
+            ),
+            dropped_events=dropped_events,
+            pending_gap_ranges=pending_gap_ranges,
         )
 
     def _notify_worker(self) -> None:
@@ -498,18 +523,30 @@ class _BootstrapCaptureBuffer:
         with self._capture_lock:
             if self._worker_retained is not capture:
                 raise RuntimeError("bootstrap handoff identity changed")
-            self._worker_retained = None
-            pending_gaps = self._health.pending_gap_ranges
+            handed_off_dropped_events = self._handed_off_dropped_events
             if capture.is_gap:
-                pending_gaps -= 1
-            self._health = replace(
+                handed_off_dropped_events += capture.capture_count
+            pending_gap_ranges, pending_dropped_events = (
+                self._pending_gap_metrics_locked(exclude=capture)
+            )
+            dropped_events = handed_off_dropped_events + pending_dropped_events
+            updated_health = replace(
                 self._health,
+                trace_complete=(
+                    self._health.trace_complete
+                    and dropped_events == 0
+                    and self._health.registration_failures == 0
+                ),
+                dropped_events=dropped_events,
                 pending_records=self._health.pending_records - capture.capture_count,
-                pending_gap_ranges=pending_gaps,
+                pending_gap_ranges=pending_gap_ranges,
                 degraded=self._health.registration_failures > 0,
                 last_error=self._health.registration_error,
                 worker_error=None,
             )
+            self._handed_off_dropped_events = handed_off_dropped_events
+            self._worker_retained = None
+            self._health = updated_health
 
     def mark_worker_degraded(self, error: BaseException) -> None:
         error_name = type(error).__name__[:160]
