@@ -197,34 +197,36 @@ def configure_control_parser(
     identity = commands.add_parser(
         "identity", help="inspect replay-derived self identity"
     )
-    identity_commands = identity.add_subparsers(
-        dest="alice_brain_identity_command", required=True
+    identity.add_argument(
+        "alice_brain_identity_command",
+        nargs="?",
+        choices=("get",),
+        default="get",
+        help="optional explicit operation (default: get)",
     )
-    identity_get = identity_commands.add_parser(
-        "get", help="read one exact persisted identity"
-    )
-    identity_get.add_argument(
+    identity.add_argument(
         "--brain-id",
         help="brain UUID; optional only when exactly one brain exists",
     )
     trace = commands.add_parser("trace", help="inspect the ordered event trace")
-    trace_commands = trace.add_subparsers(
-        dest="alice_brain_trace_command", required=True
+    trace.add_argument(
+        "alice_brain_trace_command",
+        nargs="?",
+        choices=("list",),
+        default="list",
+        help="optional explicit operation (default: list)",
     )
-    trace_list = trace_commands.add_parser(
-        "list", help="read a bounded event page after a sequence cursor"
-    )
-    trace_list.add_argument(
+    trace.add_argument(
         "--brain-id",
         help="brain UUID; optional only when exactly one brain exists",
     )
-    trace_list.add_argument(
+    trace.add_argument(
         "--after-sequence",
         type=_nonnegative_sequence,
         default=0,
         help="exclusive non-negative event sequence cursor",
     )
-    trace_list.add_argument(
+    trace.add_argument(
         "--limit",
         type=_trace_limit,
         default=100,

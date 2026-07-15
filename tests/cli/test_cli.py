@@ -124,11 +124,10 @@ def test_shared_control_parser_builds_the_standalone_command_surface() -> None:
     returned = cli.configure_control_parser(parser)
 
     assert returned is parser
-    identity = parser.parse_args(["identity", "get", "--brain-id", "brain"])
+    identity = parser.parse_args(["identity", "--brain-id", "brain"])
     trace = parser.parse_args(
         [
             "trace",
-            "list",
             "--brain-id",
             "brain",
             "--after-sequence",
@@ -137,6 +136,8 @@ def test_shared_control_parser_builds_the_standalone_command_surface() -> None:
             "25",
         ]
     )
+    explicit_identity = parser.parse_args(["identity", "get"])
+    explicit_trace = parser.parse_args(["trace", "list"])
     assert identity.alice_brain_command == "identity"
     assert identity.alice_brain_identity_command == "get"
     assert identity.brain_id == "brain"
@@ -144,6 +145,8 @@ def test_shared_control_parser_builds_the_standalone_command_surface() -> None:
     assert trace.alice_brain_trace_command == "list"
     assert trace.after_sequence == 4
     assert trace.limit == 25
+    assert explicit_identity.alice_brain_identity_command == "get"
+    assert explicit_trace.alice_brain_trace_command == "list"
 
 
 def test_usage_error_is_machine_json_and_does_not_create_home(tmp_path: Path) -> None:
@@ -367,13 +370,12 @@ def test_identity_and_trace_commands_use_the_live_typed_rpc(tmp_path: Path) -> N
             client.close()
 
         identity = _success(
-            _run_cli(home, "identity", "get", "--brain-id", created["brain_id"])
+            _run_cli(home, "identity", "--brain-id", created["brain_id"])
         )
         first = _success(
             _run_cli(
                 home,
                 "trace",
-                "list",
                 "--brain-id",
                 created["brain_id"],
                 "--limit",
@@ -384,7 +386,6 @@ def test_identity_and_trace_commands_use_the_live_typed_rpc(tmp_path: Path) -> N
             _run_cli(
                 home,
                 "trace",
-                "list",
                 "--brain-id",
                 created["brain_id"],
                 "--after-sequence",
