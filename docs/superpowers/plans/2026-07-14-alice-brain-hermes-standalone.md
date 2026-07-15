@@ -279,6 +279,41 @@ Run: `uv run python -m compileall -q src && uv run ruff check src tests && uv ru
 
 Expected: auth, handshake, wrong-token, lease, readiness, shutdown, stale recovery, C0-after-client-exit, and restart/replay tests pass.
 
+- [ ] **Step 6: Seal the startup audit and keep bridge hot paths bounded**
+
+After the one full startup replay/schema/bridge audit, retain each brain's audited
+final state for immediate `ConsciousEngine` bootstrap. A later engine may use that
+state only while its sequence still equals the authoritative database head;
+otherwise it performs an explicit replay.
+
+Install a permanent SQLite mutation seal after startup initialization:
+
+- detect commits from other connections with the connection-local
+  `PRAGMA data_version`;
+- detect write/DDL/transaction authorization from the owned connection outside
+  `SQLiteLedger._transaction()` with `sqlite3.Connection.set_authorizer()`;
+- once either signal fires, every public operation fails closed with
+  `LedgerIntegrityError` containing `mutation seal`, even if the unauthorized
+  same-connection transaction was rolled back;
+- authorized commit and rollback paths refresh the seal without poisoning it.
+
+Because startup performed the complete historical audit and the seal detects any
+out-of-band mutation, resumed attach, frame projection, and exact duplicate ACK
+retry must use bounded row/head checks and must not call
+`_full_replay_in_transaction()`, `_replay_target_states_in_transaction()`, or
+`_validate_bridge_stream_history()` on their hot paths. This is an integrity-
+preserving optimization, not removal of validation.
+
+Every persisted bridge lifecycle timestamp uses
+`max(current_utc, persisted_last_seen)` so wall-clock rollback cannot regress
+`last_seen` or restart grace.
+
+Run: `uv run pytest tests/runtime/test_store.py tests/runtime/test_bridge_store.py tests/protocol -v`
+
+Expected: mutation-seal poisoning, authorized rollback recovery, non-regressing
+timestamps, one-pass startup replay, no-history-scan hot paths, protocol, and
+daemon lifecycle tests all pass.
+
 Commit: `git add src/alice_brain_hermes/protocol src/alice_brain_hermes/runtime tests/protocol && git commit -m "feat: add private Hermes consciousness daemon"`
 
 ### Task 5: Hermes Plugin Packaging and Registration
