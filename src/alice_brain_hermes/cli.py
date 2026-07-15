@@ -192,6 +192,8 @@ def configure_control_parser(
     daemon_commands.add_parser("stop", help="request authenticated daemon shutdown")
     daemon_commands.add_parser("status", help="report live daemon status")
 
+    commands.add_parser("start", help="alias for 'daemon start'")
+    commands.add_parser("stop", help="alias for 'daemon stop'")
     commands.add_parser("status", help="alias for 'daemon status'")
     commands.add_parser("doctor", help="diagnose package, home, and daemon health")
     identity = commands.add_parser(
@@ -1058,16 +1060,17 @@ def _dispatch(arguments: argparse.Namespace) -> int:
             ),
         )
         return 0
-    if (
-        command == "daemon"
-        and arguments.alice_brain_daemon_command == "start"
+    if command == "start" or (
+        command == "daemon" and arguments.alice_brain_daemon_command == "start"
     ):
         _write_success(
             "daemon.start",
             _start(home, timeout_seconds=timeout_seconds),
         )
         return 0
-    if command == "daemon" and arguments.alice_brain_daemon_command == "stop":
+    if command == "stop" or (
+        command == "daemon" and arguments.alice_brain_daemon_command == "stop"
+    ):
         _write_success(
             "daemon.stop",
             _stop(home, timeout_seconds=timeout_seconds),

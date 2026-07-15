@@ -111,6 +111,8 @@ def test_help_is_human_readable_and_does_not_create_runtime_home(
     assert result.returncode == 0
     assert result.stderr == ""
     assert "daemon" in result.stdout
+    assert "start" in result.stdout
+    assert "stop" in result.stdout
     assert "doctor" in result.stdout
     assert "identity" in result.stdout
     assert "trace" in result.stdout
@@ -306,7 +308,7 @@ def test_start_is_idempotent_status_is_live_and_stop_is_authenticated(
     home = tmp_path / "runtime"
     first_pid = 0
     try:
-        first = _success(_run_cli(home, "daemon", "start"))
+        first = _success(_run_cli(home, "start"))
         first_data = first["data"]
         first_pid = int(first_data["pid"])
         assert first["command"] == "daemon.start"
@@ -332,7 +334,7 @@ def test_start_is_idempotent_status_is_live_and_stop_is_authenticated(
         assert status_data["daemon"]["pid"] == first_pid
         assert status_data["daemon"]["continuous_runtime"] is True
 
-        stopped = _success(_run_cli(home, "daemon", "stop", timeout=20))
+        stopped = _success(_run_cli(home, "stop", timeout=20))
         assert stopped["command"] == "daemon.stop"
         assert stopped["data"] == {
             "already_stopped": False,
