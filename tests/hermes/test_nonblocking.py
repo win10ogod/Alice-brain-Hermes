@@ -11,6 +11,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -29,12 +30,15 @@ from alice_brain_hermes.protocol.models import (
 
 
 def _session_start(hooks: HermesHooks, session_id: str = "session") -> None:
-    assert hooks.on_session_start(
-        telemetry_schema_version="hermes.observer.v1",
-        session_id=session_id,
-        model="model",
-        platform="cli",
-    ) is None
+    assert (
+        hooks.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id=session_id,
+            model="model",
+            platform="cli",
+        )
+        is None
+    )
 
 
 def _wait_until(predicate: Any, timeout: float = 2.0) -> None:
@@ -44,6 +48,25 @@ def _wait_until(predicate: Any, timeout: float = 2.0) -> None:
             return
         time.sleep(0.005)
     raise AssertionError("condition did not become true")
+
+
+def _bootstrap_observation_reservation(
+    *,
+    session_id: str = "session",
+) -> dict[str, object]:
+    return {
+        "hook": "on_session_start",
+        "detached_kwargs": MappingProxyType(
+            {
+                "telemetry_schema_version": "hermes.observer.v1",
+                "session_id": session_id,
+            }
+        ),
+        "first_capture_seq": 1,
+        "last_capture_seq": 1,
+        "gap_cause_counts": None,
+        "copy_stats": MappingProxyType({}),
+    }
 
 
 def test_callback_thread_never_touches_transport_sqlite_or_process(
@@ -85,6 +108,213 @@ def test_callback_thread_never_touches_transport_sqlite_or_process(
     assert callback_thread not in transport_threads
     assert bridge.worker_started is True
     bridge.stop_worker_for_test()
+
+
+def test_direct_callback_health_allocation_failure_never_escapes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+
+    bridge = HookBridge(tmp_path, start_worker_on_capture=False)
+    hooks = HermesHooks(bridge)
+
+    def fail_all_health_allocations(*_args: object, **_kwargs: object) -> object:
+        raise MemoryError("health allocation unavailable")
+
+    monkeypatch.setattr(bridge_module, "replace", fail_all_health_allocations)
+
+    assert (
+        hooks.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    assert bridge._next_capture_seq == 1  # type: ignore[attr-defined]
+    assert bridge.queue.empty()
+    assert bridge.pending_gaps() == ()
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_error == "MemoryError"
+
+
+@pytest.mark.parametrize("record_kind", ["observation", "gap"])
+def test_capture_reserved_health_allocation_failure_is_atomically_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record_kind: str,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+
+    bridge = HookBridge(tmp_path, start_worker_on_capture=False)
+    if record_kind == "observation":
+        reservation = _bootstrap_observation_reservation()
+    else:
+        reservation = {
+            "hook": None,
+            "detached_kwargs": None,
+            "first_capture_seq": 1,
+            "last_capture_seq": 1,
+            "gap_cause_counts": MappingProxyType({"callback_internal": 1}),
+            "copy_stats": MappingProxyType({}),
+        }
+    original_replace = bridge_module.replace
+    failed = False
+
+    def fail_first_reservation_health(
+        instance: object,
+        **changes: object,
+    ) -> object:
+        nonlocal failed
+        if not failed and (
+            set(changes) == {"last_capture_seq"}
+            or {
+                "trace_complete",
+                "dropped_events",
+                "pending_gap_ranges",
+                "last_capture_seq",
+            }
+            <= changes.keys()
+        ):
+            failed = True
+            raise MemoryError("reservation health allocation failed")
+        return original_replace(instance, **changes)
+
+    monkeypatch.setattr(bridge_module, "replace", fail_first_reservation_health)
+
+    with pytest.raises(MemoryError, match="reservation health allocation failed"):
+        bridge.capture_reserved(**reservation)  # type: ignore[arg-type]
+
+    assert failed is True
+    assert bridge._next_capture_seq == 1  # type: ignore[attr-defined]
+    assert bridge.health.last_capture_seq == 0
+    assert bridge.queue.empty()
+    assert bridge.pending_gaps() == ()
+
+    bridge.capture_reserved(**reservation)  # type: ignore[arg-type]
+    assert bridge._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert bridge.health.last_capture_seq == 1
+    if record_kind == "observation":
+        assert bridge.queue.qsize() == 1
+        assert bridge.pending_gaps() == ()
+    else:
+        assert bridge.queue.empty()
+        (gap,) = bridge.pending_gaps()
+        assert (gap.first_capture_seq, gap.last_capture_seq) == (1, 1)
+
+
+@pytest.mark.parametrize("record_kind", ["observation", "gap"])
+def test_capture_reserved_exact_handoff_retry_is_idempotent(
+    tmp_path: Path,
+    record_kind: str,
+) -> None:
+    bridge = HookBridge(tmp_path, start_worker_on_capture=False)
+    if record_kind == "observation":
+        reservation = _bootstrap_observation_reservation()
+    else:
+        reservation = {
+            "hook": None,
+            "detached_kwargs": None,
+            "first_capture_seq": 1,
+            "last_capture_seq": 1,
+            "gap_cause_counts": MappingProxyType({"callback_internal": 1}),
+            "copy_stats": MappingProxyType({}),
+        }
+
+    bridge.capture_reserved(**reservation)  # type: ignore[arg-type]
+    bridge.capture_reserved(**reservation)  # type: ignore[arg-type]
+
+    assert bridge._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert bridge.health.last_capture_seq == 1
+    if record_kind == "observation":
+        assert bridge.queue.qsize() == 1
+        assert bridge.pending_gaps() == ()
+    else:
+        assert bridge.queue.empty()
+        (gap,) = bridge.pending_gaps()
+        assert (gap.first_capture_seq, gap.last_capture_seq) == (1, 1)
+
+    conflicting = dict(reservation)
+    if record_kind == "observation":
+        conflicting["detached_kwargs"] = MappingProxyType(
+            {
+                "telemetry_schema_version": "hermes.observer.v1",
+                "session_id": "changed",
+            }
+        )
+    else:
+        conflicting["gap_cause_counts"] = MappingProxyType({"queue_full": 1})
+    with pytest.raises(ValueError, match=r"reservation.*changed|changed.*reservation"):
+        bridge.capture_reserved(**conflicting)  # type: ignore[arg-type]
+
+
+def test_worker_start_health_allocation_failure_does_not_publish_a_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+
+    bridge = HookBridge(tmp_path, start_worker_on_capture=False)
+    original_replace = bridge_module.replace
+    starts = 0
+
+    class FakeThread:
+        def start(self) -> None:
+            nonlocal starts
+            starts += 1
+
+    monkeypatch.setattr(
+        bridge_module.threading,
+        "Thread",
+        lambda **_kwargs: FakeThread(),
+    )
+    failed = False
+
+    def fail_first_worker_health(instance: object, **changes: object) -> object:
+        nonlocal failed
+        if not failed and changes.get("worker_started") is True:
+            failed = True
+            raise MemoryError("worker health allocation failed")
+        return original_replace(instance, **changes)
+
+    monkeypatch.setattr(bridge_module, "replace", fail_first_worker_health)
+
+    bridge.start_worker()
+    assert failed is True
+    assert bridge.worker_started is False
+    assert starts == 0
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_error == "MemoryError"
+
+    bridge.start_worker()
+    assert bridge.worker_started is True
+    assert starts == 1
+
+
+def test_connection_health_allocation_failure_is_conservatively_contained(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+
+    bridge = HookBridge(tmp_path, start_worker_on_capture=False)
+
+    def fail_connection_health(*_args: object, **changes: object) -> object:
+        if "connection" in changes:
+            raise MemoryError("connection health allocation failed")
+        raise AssertionError("unexpected health allocation")
+
+    monkeypatch.setattr(bridge_module, "replace", fail_connection_health)
+
+    bridge._publish_connection(  # type: ignore[attr-defined]
+        "disconnected",
+        error="transport_error",
+    )
+
+    assert bridge.health.connection == "disconnected"
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_error == "MemoryError"
 
 
 def test_missing_daemon_does_not_auto_start_or_create_runtime_home(
@@ -147,9 +377,7 @@ class _FakeClient:
             validated = validate_bridge_record_json(
                 json.dumps(record, separators=(",", ":"), sort_keys=True)
             )
-            through = int(
-                record.get("capture_seq", record.get("last_capture_seq", 0))
-            )
+            through = int(record.get("capture_seq", record.get("last_capture_seq", 0)))
             self._through_capture_seq = through
             self._next_capture_seq = through + 1
             frame = _frame(self._brain_id, through)
@@ -293,6 +521,142 @@ def test_reserved_bootstrap_handoff_preserves_cursor_and_multicause_gap(
     assert bridge.health.dropped_events == 2
 
 
+def test_gap_materialization_failure_leaves_span_available_for_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+
+    bridge = HookBridge(tmp_path, start_worker_on_capture=False)
+    HermesHooks(bridge).on_session_start(
+        telemetry_schema_version="invalid",
+        session_id="gap",
+    )
+    original_gap_type = bridge_module.BridgeGapV1
+    failed = False
+
+    def fail_first_gap_materialization(*args: object, **kwargs: object) -> object:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise MemoryError("gap materialization failed")
+        return original_gap_type(*args, **kwargs)
+
+    monkeypatch.setattr(bridge_module, "BridgeGapV1", fail_first_gap_materialization)
+
+    with pytest.raises(MemoryError, match="gap materialization failed"):
+        bridge._select_next_record()  # type: ignore[attr-defined]
+
+    assert failed is True
+    monkeypatch.setattr(bridge_module, "BridgeGapV1", original_gap_type)
+    (pending,) = bridge.pending_gaps()
+    assert (pending.first_capture_seq, pending.last_capture_seq) == (1, 1)
+
+    selected = bridge._select_next_record()  # type: ignore[attr-defined]
+    assert isinstance(selected, original_gap_type)
+    assert (selected.first_capture_seq, selected.last_capture_seq) == (1, 1)
+
+
+def test_worker_retries_transient_record_selection_baseexception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    selection_failed = threading.Event()
+    committed = threading.Event()
+
+    class CommitProbe(_FakeClient):
+        def call(
+            self,
+            method: str,
+            params: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            result = super().call(method, params)
+            if method == "bridge.commit":
+                committed.set()
+            return result
+
+    client = CommitProbe(calls)
+    bridge = HookBridge(
+        tmp_path,
+        bridge_instance_id=new_id(),
+        reconnect_delay_seconds=0.01,
+        client_factory=lambda *_args, **_kwargs: client,
+        start_worker_on_capture=False,
+    )
+    original_gap_from_span = bridge._gap_from_span  # type: ignore[attr-defined]
+    failed = False
+
+    def fail_first_gap_selection(span: object) -> BridgeGapV1:
+        nonlocal failed
+        if not failed:
+            failed = True
+            selection_failed.set()
+            raise MemoryError("record selection allocation failed")
+        return original_gap_from_span(span)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(bridge, "_gap_from_span", fail_first_gap_selection)
+    HermesHooks(bridge).on_session_start(
+        telemetry_schema_version="invalid",
+        session_id="gap",
+    )
+
+    bridge.start_worker()
+    assert selection_failed.wait(2)
+    assert committed.wait(2)
+    bridge.stop_worker_for_test()
+
+    assert bridge.retained_record is None
+    assert bridge.pending_gaps() == ()
+    assert bridge.last_ack is not None
+    assert bridge.last_ack.through_capture_seq == 1
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_error == "MemoryError"
+
+
+def test_gap_ack_health_allocation_failure_retains_exact_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+
+    calls: list[tuple[str, dict[str, object]]] = []
+    client = _FakeClient(calls)
+    bridge = HookBridge(
+        tmp_path,
+        client_factory=lambda *_args, **_kwargs: client,
+        start_worker_on_capture=False,
+    )
+    HermesHooks(bridge).on_session_start(
+        telemetry_schema_version="invalid",
+        session_id="gap",
+    )
+    record = bridge._select_next_record()  # type: ignore[attr-defined]
+    assert isinstance(record, BridgeGapV1)
+    assert bridge._connect() is True  # type: ignore[attr-defined]
+    original_replace = bridge_module.replace
+    failed = False
+
+    def fail_first_gap_ack_health(instance: object, **changes: object) -> object:
+        nonlocal failed
+        if not failed and set(changes) == {"pending_gap_ranges"}:
+            failed = True
+            raise MemoryError("gap ACK health allocation failed")
+        return original_replace(instance, **changes)
+
+    monkeypatch.setattr(bridge_module, "replace", fail_first_gap_ack_health)
+
+    assert bridge._commit_retained(record) is False  # type: ignore[attr-defined]
+    assert failed is True
+    assert bridge.retained_record is record
+    assert bridge.health.pending_gap_ranges == 1
+
+    assert bridge._connect() is True  # type: ignore[attr-defined]
+    assert bridge._commit_retained(record) is True  # type: ignore[attr-defined]
+    assert bridge.retained_record is None
+    assert bridge.health.pending_gap_ranges == 0
+
+
 def test_transport_outage_retains_head_without_fabricating_gap(
     tmp_path: Path,
 ) -> None:
@@ -393,13 +757,9 @@ def test_lost_ack_retries_identical_record_and_accepts_duplicate_false(
 
     sent = [params["record"] for method, params in calls if method == "bridge.commit"]
     assert sent[0] == sent[1]
-    attachments = [
-        params for method, params in calls if method == "brain.attach"
-    ]
+    attachments = [params for method, params in calls if method == "brain.attach"]
     assert len(attachments) == 2
-    assert attachments[0]["bridge_instance_id"] == attachments[1][
-        "bridge_instance_id"
-    ]
+    assert attachments[0]["bridge_instance_id"] == attachments[1]["bridge_instance_id"]
     assert attachments[0]["recovery_token"] == attachments[1]["recovery_token"]
     assert bridge.retained_record is None
     assert isinstance(bridge.last_ack, BridgeCommitAckV1)
@@ -462,6 +822,139 @@ def test_recovery_token_is_stable_until_typed_abandonment(tmp_path: Path) -> Non
     assert bridge.health.last_abandonment is not None
     assert bridge.health.last_abandonment["exact_replay_permitted"] is False
     assert not any(method == "bridge.commit" for method, _params in calls)
+
+
+@pytest.mark.parametrize("failure_point", ["audit", "health"])
+def test_abandonment_allocation_failure_preserves_all_local_records_for_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+
+    bridge = HookBridge(
+        tmp_path,
+        bridge_instance_id=new_id(),
+        start_worker_on_capture=False,
+    )
+    hooks = HermesHooks(bridge)
+    _session_start(hooks, "first")
+    _session_start(hooks, "second")
+    retained = bridge._select_next_record()  # type: ignore[attr-defined]
+    assert retained is not None
+    original_id = bridge.bridge_instance_id
+    original_token = bridge.recovery_token
+    original_mapping_proxy = bridge_module.MappingProxyType
+    original_replace = bridge_module.replace
+    failed = False
+
+    def fail_audit(*args: object, **kwargs: object) -> object:
+        nonlocal failed
+        failed = True
+        raise MemoryError("abandonment audit allocation failed")
+
+    def fail_health(instance: object, **changes: object) -> object:
+        nonlocal failed
+        if "abandoned_streams" in changes:
+            failed = True
+            raise MemoryError("abandonment health allocation failed")
+        return original_replace(instance, **changes)
+
+    if failure_point == "audit":
+        monkeypatch.setattr(bridge_module, "MappingProxyType", fail_audit)
+    else:
+        monkeypatch.setattr(bridge_module, "replace", fail_health)
+
+    with pytest.raises(MemoryError, match=r"abandonment .* allocation failed"):
+        bridge._rotate_abandoned_stream()  # type: ignore[attr-defined]
+
+    assert failed is True
+    assert bridge.bridge_instance_id == original_id
+    assert bridge.recovery_token == original_token
+    assert bridge._next_capture_seq == 3  # type: ignore[attr-defined]
+    assert bridge.retained_record is retained
+    assert bridge.queue.qsize() == 1
+    assert bridge.health.abandoned_streams == 0
+
+    monkeypatch.setattr(bridge_module, "MappingProxyType", original_mapping_proxy)
+    monkeypatch.setattr(bridge_module, "replace", original_replace)
+    bridge._rotate_abandoned_stream()  # type: ignore[attr-defined]
+
+    assert bridge.bridge_instance_id != original_id
+    assert bridge.recovery_token != original_token
+    assert bridge._next_capture_seq == 1  # type: ignore[attr-defined]
+    assert bridge.retained_record is None
+    assert bridge.queue.empty()
+    assert bridge.health.abandoned_streams == 1
+    assert bridge.health.abandoned_local_records == 2
+    assert bridge.health.dropped_events == 2
+
+
+@pytest.mark.parametrize("operation", ["connect", "commit", "refresh"])
+def test_abandonment_rotation_failure_is_contained_by_every_worker_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    client = _FakeClient(calls)
+    bridge = HookBridge(
+        tmp_path,
+        bridge_instance_id=new_id(),
+        client_factory=lambda *_args, **_kwargs: client,
+        start_worker_on_capture=False,
+    )
+    hooks = HermesHooks(bridge)
+    original_call = client.call
+
+    if operation != "connect":
+        assert bridge._connect() is True  # type: ignore[attr-defined]
+
+    _session_start(hooks)
+    retained = None
+    if operation == "commit":
+        retained = bridge._select_next_record()  # type: ignore[attr-defined]
+        assert retained is not None
+
+    abandoned_method = {
+        "connect": "brain.attach",
+        "commit": "bridge.commit",
+        "refresh": "state.get",
+    }[operation]
+
+    def abandon(
+        method: str,
+        params: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        if method == abandoned_method:
+            raise DaemonRpcError("bridge_abandoned", "abandoned", {})
+        return original_call(method, params)
+
+    def fail_rotation() -> None:
+        raise MemoryError("abandonment rotation allocation failed")
+
+    monkeypatch.setattr(client, "call", abandon)
+    monkeypatch.setattr(bridge, "_rotate_abandoned_stream", fail_rotation)
+
+    if operation == "connect":
+        result = bridge._connect()  # type: ignore[attr-defined]
+    elif operation == "commit":
+        assert retained is not None
+        result = bridge._commit_retained(retained)  # type: ignore[attr-defined]
+    else:
+        result = bridge._refresh_frame()  # type: ignore[attr-defined]
+
+    assert result is False
+    assert client.closed is True
+    assert bridge._next_capture_seq == 2  # type: ignore[attr-defined]
+    if operation == "commit":
+        assert bridge.retained_record is retained
+    else:
+        assert bridge.queue.qsize() == 1
+    assert bridge.health.connection == "disconnected"
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_capture_seq == 1
+    assert bridge.health.last_error == "MemoryError"
 
 
 def test_typed_abandonment_accounts_possibly_acked_record_without_replay(
@@ -578,10 +1071,12 @@ def test_abandonment_rebind_clears_stream_cursor_without_regressing_brain(
     _session_start(hooks)
 
     _wait_until(
-        lambda: bridge.health.abandoned_streams == 1
-        and bridge.health.connection == "connected"
-        and bridge.projections.frame is not None
-        and bridge.projections.frame.through_capture_seq == 0
+        lambda: (
+            bridge.health.abandoned_streams == 1
+            and bridge.health.connection == "connected"
+            and bridge.projections.frame is not None
+            and bridge.projections.frame.through_capture_seq == 0
+        )
     )
     assert regressed.closed is True
     assert bridge.projections.frame is not None
@@ -620,9 +1115,12 @@ def test_session_boundaries_do_not_close_stream_or_stop_daemon(
                 "platform": "cli",
                 "reason": "boundary",
             }
-        assert getattr(hooks, name)(
-            telemetry_schema_version="hermes.observer.v1", **payload
-        ) is None
+        assert (
+            getattr(hooks, name)(
+                telemetry_schema_version="hermes.observer.v1", **payload
+            )
+            is None
+        )
 
     assert bridge.stop_requested is False
     assert bridge.close_requested is False
@@ -699,8 +1197,7 @@ def test_gap_retained_during_outage_remains_pending_in_health(
     )
 
     _wait_until(
-        lambda: attempts > 0
-        and isinstance(bridge.retained_record, BridgeGapV1)
+        lambda: attempts > 0 and isinstance(bridge.retained_record, BridgeGapV1)
     )
     assert bridge.health.pending_gap_ranges == 1
     assert len(bridge.pending_gaps()) == 1
@@ -720,9 +1217,7 @@ def test_idle_worker_refreshes_atomic_frame_from_daemon(tmp_path: Path) -> None:
     hooks = HermesHooks(bridge)
     _session_start(hooks)
 
-    _wait_until(
-        lambda: len([call for call in calls if call[0] == "state.get"]) >= 2
-    )
+    _wait_until(lambda: len([call for call in calls if call[0] == "state.get"]) >= 2)
     assert bridge.projections.frame is not None
     assert bridge.projections.frame.through_capture_seq == 1
     bridge.stop_worker_for_test()
@@ -1014,9 +1509,7 @@ def test_lost_close_ack_uses_authenticated_recovery_without_daemon_stop(
     _session_start(hooks)
     bridge.request_clean_close()
 
-    _wait_until(
-        lambda: any(method == "bridge.close.recover" for method, _ in calls)
-    )
+    _wait_until(lambda: any(method == "bridge.close.recover" for method, _ in calls))
     recovery = next(
         params for method, params in calls if method == "bridge.close.recover"
     )
@@ -1155,6 +1648,4 @@ def test_projection_thaws_nested_immutable_frame_values(tmp_path: Path) -> None:
     assert type(context) is str
     decoded = json.loads(context)["alice_brain"]
     assert decoded["pc"] == {"traits": {"care": {"value": 0.75}}}
-    assert decoded["semantic_context"] == {
-        "nested": {"items": [1, {"two": 2}]}
-    }
+    assert decoded["semantic_context"] == {"nested": {"items": [1, {"two": 2}]}}

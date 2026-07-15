@@ -68,6 +68,26 @@ class _GapSpan:
     cause_counts: dict[str, int]
 
 
+@dataclass(frozen=True, slots=True)
+class _BootstrapReservationReceipt:
+    first_capture_seq: int
+    last_capture_seq: int
+    hook: str | None
+    detached_kwargs: Mapping[str, object] | None
+    gap_cause_counts: tuple[tuple[str, int], ...] | None
+    copy_stats: tuple[tuple[str, int], ...]
+
+    def matches(self, other: _BootstrapReservationReceipt) -> bool:
+        return (
+            self.first_capture_seq == other.first_capture_seq
+            and self.last_capture_seq == other.last_capture_seq
+            and self.hook == other.hook
+            and self.detached_kwargs == other.detached_kwargs
+            and self.gap_cause_counts == other.gap_cause_counts
+            and self.copy_stats == other.copy_stats
+        )
+
+
 def default_runtime_home() -> Path:
     """Resolve the project-owned home without creating or inspecting it."""
 
@@ -486,6 +506,9 @@ class HookBridge:
         self._next_capture_seq = 1
         self._gap_spans: deque[_GapSpan] = deque()
         self._health = BridgeHealth()
+        self._emergency_trace_incomplete = False
+        self._emergency_connection_disconnected = False
+        self._emergency_last_error: str | None = None
         self._worker: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -505,6 +528,7 @@ class HookBridge:
         self._close_final_capture_seq: int | None = None
         self._ever_had_capture = False
         self._last_frame_refresh_monotonic = 0.0
+        self._last_bootstrap_reservation: _BootstrapReservationReceipt | None = None
 
     @staticmethod
     def _default_client_factory(runtime_home: Path, **kwargs: object) -> Any:
@@ -524,7 +548,37 @@ class HookBridge:
 
     @property
     def health(self) -> BridgeHealth:
-        return self._health
+        health = self._health
+        if not self._emergency_trace_incomplete:
+            return health
+        return BridgeHealth(
+            connection=(
+                "disconnected"
+                if self._emergency_connection_disconnected
+                else health.connection
+            ),
+            trace_complete=False,
+            dropped_events=health.dropped_events,
+            pending_gap_ranges=health.pending_gap_ranges,
+            last_capture_seq=health.last_capture_seq,
+            through_capture_seq=health.through_capture_seq,
+            worker_started=health.worker_started,
+            last_error=self._emergency_last_error or health.last_error,
+            abandoned_streams=health.abandoned_streams,
+            abandoned_local_records=health.abandoned_local_records,
+            ambiguous_records=health.ambiguous_records,
+            late_after_close=health.late_after_close,
+            last_abandonment=health.last_abandonment,
+            capabilities=health.capabilities,
+        )
+
+    def _mark_emergency_failure(self, error: BaseException) -> None:
+        self._emergency_trace_incomplete = True
+        self._emergency_connection_disconnected = True
+        try:
+            self._emergency_last_error = type(error).__name__[:160]
+        except BaseException:
+            self._emergency_last_error = "callback_internal"
 
     @property
     def worker_started(self) -> bool:
@@ -549,41 +603,60 @@ class HookBridge:
     def capture(self, hook: str, kwargs: dict[str, Any]) -> None:
         """Reserve one sequence, detach a bounded copy, and never raise."""
 
-        produced = False
-        with self._capture_lock:
+        try:
+            produced = self._capture_atomic(hook, kwargs)
+        except BaseException as error:
+            self._mark_emergency_failure(error)
+            return
+        if produced:
+            try:
+                self._wake_event.set()
+                if self._start_worker_on_capture:
+                    self.start_worker()
+            except BaseException as error:
+                self._mark_emergency_failure(error)
+
+    def _capture_atomic(self, hook: str, kwargs: dict[str, Any]) -> bool:
+        with self._capture_lock, self._health_lock:
             if self._close_sealed:
-                with self._health_lock:
-                    self._health = replace(
-                        self._health,
-                        trace_complete=False,
-                        dropped_events=self._health.dropped_events + 1,
-                        late_after_close=self._health.late_after_close + 1,
-                        last_error="capture_after_close_seal",
-                    )
-                return
+                updated_health = replace(
+                    self._health,
+                    trace_complete=False,
+                    dropped_events=self._health.dropped_events + 1,
+                    late_after_close=self._health.late_after_close + 1,
+                    last_error="capture_after_close_seal",
+                )
+                self._health = updated_health
+                return False
             capture_seq = self._next_capture_seq
-            self._next_capture_seq += 1
-            self._ever_had_capture = True
-            self._publish_capture_cursor(capture_seq)
+            next_capture_seq = capture_seq + 1
             if kwargs.get("telemetry_schema_version") != SOURCE_SCHEMA_VERSION:
-                self._record_gap_locked(capture_seq, "invalid_source_schema")
-                produced = True
+                prepared_gap = self._prepare_gap_publication_locked(
+                    capture_seq,
+                    capture_seq,
+                    {"invalid_source_schema": 1},
+                    health_last_capture_seq=capture_seq,
+                )
+                self._publish_gap_locked(*prepared_gap)
             else:
                 try:
                     record = self._shape_observation(hook, capture_seq, kwargs)
-                    self.queue.put_nowait(record)
-                    produced = True
-                except queue.Full:
-                    self._record_gap_locked(capture_seq, "queue_full")
-                    produced = True
                 except BaseException:
-                    # Callback failures remain visible but cannot interrupt Hermes.
-                    self._record_gap_locked(capture_seq, "callback_internal")
-                    produced = True
-        if produced:
-            self._wake_event.set()
-            if self._start_worker_on_capture:
-                self.start_worker()
+                    prepared_gap = self._prepare_gap_publication_locked(
+                        capture_seq,
+                        capture_seq,
+                        {"callback_internal": 1},
+                        health_last_capture_seq=capture_seq,
+                    )
+                    self._publish_gap_locked(*prepared_gap)
+                else:
+                    self._publish_observation_or_gap_locked(
+                        record,
+                        capture_seq=capture_seq,
+                    )
+            self._next_capture_seq = next_capture_seq
+            self._ever_had_capture = True
+            return True
 
     def capture_reserved(
         self,
@@ -644,16 +717,48 @@ class HookBridge:
             if sum(gap_cause_counts.values()) != capture_count:
                 raise ValueError("gap cause counts do not match the interval")
 
+        canonical_gap_causes = (
+            None
+            if gap_cause_counts is None
+            else tuple(sorted(gap_cause_counts.items()))
+        )
+        canonical_copy_stats = tuple(
+            (name, validated_stats[name])
+            for name in (
+                "redacted_paths",
+                "truncated_paths",
+                "unsupported_paths",
+                "omitted_nodes",
+            )
+        )
+        receipt = _BootstrapReservationReceipt(
+            first_capture_seq=first_capture_seq,
+            last_capture_seq=last_capture_seq,
+            hook=hook,
+            detached_kwargs=detached_kwargs,
+            gap_cause_counts=canonical_gap_causes,
+            copy_stats=canonical_copy_stats,
+        )
+
         with self._capture_lock:
             if first_capture_seq != self._next_capture_seq:
+                previous = self._last_bootstrap_reservation
+                if (
+                    previous is not None
+                    and first_capture_seq == previous.first_capture_seq
+                    and last_capture_seq == previous.last_capture_seq
+                    and self._next_capture_seq == previous.last_capture_seq + 1
+                ):
+                    if previous.matches(receipt):
+                        return
+                    raise ValueError("bootstrap reservation changed after acceptance")
                 raise ValueError("bootstrap capture sequence is not contiguous")
             if self._close_sealed:
                 # The clean-close cursor is already immutable, but bootstrap
                 # reservations still need an input cursor so each late capture
                 # is accounted exactly once instead of blocking handoff.
-                self._next_capture_seq = last_capture_seq + 1
                 with self._health_lock:
-                    self._health = replace(
+                    updated_health = replace(
                         self._health,
                         trace_complete=False,
                         dropped_events=self._health.dropped_events + capture_count,
@@ -662,35 +767,142 @@ class HookBridge:
                         ),
                         last_error="capture_after_close_seal",
                     )
+                    next_capture_seq = last_capture_seq + 1
+                    self._health = updated_health
+                    self._next_capture_seq = next_capture_seq
+                    self._last_bootstrap_reservation = receipt
                 return
-            self._next_capture_seq = last_capture_seq + 1
-            self._ever_had_capture = True
-            self._publish_capture_cursor(last_capture_seq)
-            if gap_cause_counts is not None:
-                self._record_gap_range_locked(
-                    first_capture_seq,
-                    last_capture_seq,
-                    dict(gap_cause_counts),
-                )
-            else:
-                try:
-                    stats = _DetachStats(**validated_stats)
-                    if hook is None or detached_kwargs is None:
-                        raise ValueError("observation reservation is incomplete")
-                    record = self._shape_observation(
-                        hook,
+            next_capture_seq = last_capture_seq + 1
+            with self._health_lock:
+                if gap_cause_counts is not None:
+                    prepared_gap = self._prepare_gap_publication_locked(
                         first_capture_seq,
-                        detached_kwargs,
-                        stats=stats,
+                        last_capture_seq,
+                        dict(gap_cause_counts),
+                        health_last_capture_seq=last_capture_seq,
                     )
-                    self.queue.put_nowait(record)
-                except queue.Full:
-                    self._record_gap_locked(first_capture_seq, "queue_full")
-                except BaseException:
-                    self._record_gap_locked(first_capture_seq, "callback_internal")
+                    self._publish_gap_locked(*prepared_gap)
+                else:
+                    try:
+                        stats = _DetachStats(**validated_stats)
+                        if hook is None or detached_kwargs is None:
+                            raise ValueError("observation reservation is incomplete")
+                        record = self._shape_observation(
+                            hook,
+                            first_capture_seq,
+                            detached_kwargs,
+                            stats=stats,
+                        )
+                    except BaseException:
+                        prepared_gap = self._prepare_gap_publication_locked(
+                            first_capture_seq,
+                            last_capture_seq,
+                            {"callback_internal": capture_count},
+                            health_last_capture_seq=last_capture_seq,
+                        )
+                        self._publish_gap_locked(*prepared_gap)
+                    else:
+                        self._publish_observation_or_gap_locked(
+                            record,
+                            capture_seq=last_capture_seq,
+                        )
+                self._next_capture_seq = next_capture_seq
+                self._ever_had_capture = True
+                self._last_bootstrap_reservation = receipt
         self._wake_event.set()
         if self._start_worker_on_capture:
             self.start_worker()
+
+    def _publish_observation_or_gap_locked(
+        self,
+        record: HermesObservationV1,
+        *,
+        capture_seq: int,
+    ) -> None:
+        observation_health = replace(
+            self._health,
+            last_capture_seq=capture_seq,
+        )
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            prepared_gap = self._prepare_gap_publication_locked(
+                capture_seq,
+                capture_seq,
+                {"queue_full": 1},
+                health_last_capture_seq=capture_seq,
+            )
+            self._publish_gap_locked(*prepared_gap)
+        except BaseException as error:
+            with self.queue.mutex:
+                inserted = any(item is record for item in self.queue.queue)
+            if inserted:
+                self._health = observation_health
+                self._mark_emergency_failure(error)
+            else:
+                prepared_gap = self._prepare_gap_publication_locked(
+                    capture_seq,
+                    capture_seq,
+                    {"callback_internal": 1},
+                    health_last_capture_seq=capture_seq,
+                )
+                self._publish_gap_locked(*prepared_gap)
+        else:
+            self._health = observation_health
+
+    def _prepare_gap_publication_locked(
+        self,
+        first_capture_seq: int,
+        last_capture_seq: int,
+        cause_counts: dict[str, int],
+        *,
+        health_last_capture_seq: int,
+    ) -> tuple[_GapSpan, bool, BridgeHealth]:
+        replace_last = bool(
+            self._gap_spans
+            and self._gap_spans[-1].last_capture_seq + 1 == first_capture_seq
+        )
+        if replace_last:
+            previous = self._gap_spans[-1]
+            merged_causes = dict(previous.cause_counts)
+            for cause, count in cause_counts.items():
+                merged_causes[cause] = merged_causes.get(cause, 0) + count
+            span = _GapSpan(
+                previous.first_capture_seq,
+                last_capture_seq,
+                merged_causes,
+            )
+        else:
+            span = _GapSpan(
+                first_capture_seq,
+                last_capture_seq,
+                dict(cause_counts),
+            )
+        claimed_gap = 1 if isinstance(self._retained, BridgeGapV1) else 0
+        pending_gap_ranges = (
+            len(self._gap_spans) + claimed_gap + (0 if replace_last else 1)
+        )
+        dropped_count = last_capture_seq - first_capture_seq + 1
+        updated_health = replace(
+            self._health,
+            trace_complete=False,
+            dropped_events=self._health.dropped_events + dropped_count,
+            pending_gap_ranges=pending_gap_ranges,
+            last_capture_seq=health_last_capture_seq,
+        )
+        return span, replace_last, updated_health
+
+    def _publish_gap_locked(
+        self,
+        span: _GapSpan,
+        replace_last: bool,
+        updated_health: BridgeHealth,
+    ) -> None:
+        if replace_last:
+            self._gap_spans[-1] = span
+        else:
+            self._gap_spans.append(span)
+        self._health = updated_health
 
     def _shape_observation(
         self,
@@ -707,8 +919,7 @@ class HookBridge:
             raise ValueError("hook payload contains no recognized host fields")
         stats = stats or _DetachStats()
         context = {
-            key: _host_identifier(kwargs.get(key), stats)
-            for key in _CONTEXT_KEYS[hook]
+            key: _host_identifier(kwargs.get(key), stats) for key in _CONTEXT_KEYS[hook]
         }
         payload = {
             key: _shape_value(kind, kwargs.get(key), stats)
@@ -765,56 +976,10 @@ class HookBridge:
         }
         return validate_observation(raw)
 
-    def _publish_capture_cursor(self, capture_seq: int) -> None:
-        with self._health_lock:
-            self._health = replace(self._health, last_capture_seq=capture_seq)
-
-    def _record_gap_locked(self, capture_seq: int, cause: str) -> None:
-        self._record_gap_range_locked(
-            capture_seq,
-            capture_seq,
-            {cause: 1},
-        )
-
-    def _record_gap_range_locked(
-        self,
-        first_capture_seq: int,
-        last_capture_seq: int,
-        cause_counts: dict[str, int],
-    ) -> None:
-        if (
-            self._gap_spans
-            and self._gap_spans[-1].last_capture_seq + 1 == first_capture_seq
-        ):
-            span = self._gap_spans[-1]
-            span.last_capture_seq = last_capture_seq
-            for cause, count in cause_counts.items():
-                span.cause_counts[cause] = span.cause_counts.get(cause, 0) + count
-        else:
-            self._gap_spans.append(
-                _GapSpan(
-                    first_capture_seq,
-                    last_capture_seq,
-                    dict(cause_counts),
-                )
-            )
-        dropped_count = last_capture_seq - first_capture_seq + 1
-        with self._health_lock:
-            claimed_gap = 1 if isinstance(self._retained, BridgeGapV1) else 0
-            self._health = replace(
-                self._health,
-                trace_complete=False,
-                dropped_events=self._health.dropped_events + dropped_count,
-                pending_gap_ranges=len(self._gap_spans) + claimed_gap,
-            )
-        self._wake_event.set()
-
     def pending_gaps(self) -> tuple[BridgeGapV1, ...]:
         with self._capture_lock:
             claimed = (
-                (self._retained,)
-                if isinstance(self._retained, BridgeGapV1)
-                else ()
+                (self._retained,) if isinstance(self._retained, BridgeGapV1) else ()
             )
             return claimed + tuple(
                 self._gap_from_span(span) for span in self._gap_spans
@@ -833,36 +998,46 @@ class HookBridge:
         with self._capture_lock:
             if not self._gap_spans:
                 return None
-            span = self._gap_spans.popleft()
-            return self._gap_from_span(span)
+            span = self._gap_spans[0]
+            gap = self._gap_from_span(span)
+            self._gap_spans.popleft()
+            return gap
 
     def start_worker(self) -> None:
         with self._worker_lock:
             if self._worker is not None:
                 return
             try:
-                worker = threading.Thread(
-                    target=self._run_worker,
-                    name="alice-brain-hermes-bridge",
-                    daemon=True,
-                )
-                self._worker = worker
-                worker.start()
-            except BaseException as error:
-                self._worker = None
                 with self._health_lock:
-                    self._health = replace(
-                        self._health,
-                        last_error=self._error_label(error),
+                    previous_health = self._health
+                    updated_health = replace(self._health, worker_started=True)
+                    worker = threading.Thread(
+                        target=self._run_worker,
+                        name="alice-brain-hermes-bridge",
+                        daemon=True,
                     )
+                    self._health = updated_health
+                    self._worker = worker
+                    try:
+                        worker.start()
+                    except BaseException:
+                        self._worker = None
+                        self._health = previous_health
+                        raise
+            except BaseException as error:
+                self._mark_emergency_failure(error)
                 return
-            with self._health_lock:
-                self._health = replace(self._health, worker_started=True)
 
     def _run_worker(self) -> None:
         try:
             while not self._stop_event.is_set():
-                record = self._select_next_record()
+                try:
+                    record = self._select_next_record()
+                except BaseException as error:
+                    self._mark_emergency_failure(error)
+                    self._disconnect_client(error=self._error_label(error))
+                    self._wait_reconnect()
+                    continue
                 if record is None:
                     if self._close_requested and self._seal_close_if_ready():
                         if self._client is None and not self._connect():
@@ -940,10 +1115,7 @@ class HookBridge:
             and not permit_historical_state
         ):
             raise DaemonClientError("state frame regressed the stable brain")
-        if (
-            frame.freshness.projected_at_state_sequence
-            != frame.state_sequence
-        ):
+        if frame.freshness.projected_at_state_sequence != frame.state_sequence:
             raise DaemonClientError("state frame freshness sequence is invalid")
         if frame.freshness.stream_connection != "connected":
             raise DaemonClientError("state frame is not connected")
@@ -1062,9 +1234,12 @@ class HookBridge:
                 return False
             if client is not None:
                 self._close_client(client)
+            failure: BaseException = error
             if error.code == "bridge_abandoned":
-                self._rotate_abandoned_stream()
-            self._publish_connection("disconnected", error=self._error_label(error))
+                rotation_error = self._try_rotate_abandoned_stream()
+                if rotation_error is not None:
+                    failure = rotation_error
+            self._publish_connection("disconnected", error=self._error_label(failure))
             return False
         except (
             ValidationError,
@@ -1102,8 +1277,7 @@ class HookBridge:
                 or ack.frame.through_capture_seq != record.last_capture_seq
                 or ack.frame.brain_id != self._brain_id
                 or ack.event_sequence != ack.frame.state_sequence
-                or ack.frame.freshness.projected_at_state_sequence
-                != ack.event_sequence
+                or ack.frame.freshness.projected_at_state_sequence != ack.event_sequence
                 or ack.frame.freshness.stream_connection != "connected"
                 or ack.frame.freshness.scheduler_sample != "not_sampled"
             ):
@@ -1131,24 +1305,35 @@ class HookBridge:
             else:
                 raise DaemonClientError("historical ACK has no current projection")
             self._last_frame_refresh_monotonic = time.monotonic()
-            self._last_ack = ack
             was_gap = isinstance(record, BridgeGapV1)
-            self._retained = None
-            self._retained_attempted = False
-            self._exact_retry_pending = False
-            self._attached_next_capture_seq = record.last_capture_seq + 1
+            attached_next_capture_seq = record.last_capture_seq + 1
             if was_gap:
                 with self._capture_lock, self._health_lock:
-                    self._health = replace(
+                    updated_health = replace(
                         self._health,
                         pending_gap_ranges=len(self._gap_spans),
                     )
+                    self._last_ack = ack
+                    self._retained = None
+                    self._retained_attempted = False
+                    self._exact_retry_pending = False
+                    self._attached_next_capture_seq = attached_next_capture_seq
+                    self._health = updated_health
+            else:
+                self._last_ack = ack
+                self._retained = None
+                self._retained_attempted = False
+                self._exact_retry_pending = False
+                self._attached_next_capture_seq = attached_next_capture_seq
             self._publish_connection("connected", frame=effective_frame)
             return True
         except DaemonRpcError as error:
+            failure: BaseException = error
             if error.code == "bridge_abandoned":
-                self._rotate_abandoned_stream()
-            self._disconnect_client(error=self._error_label(error))
+                rotation_error = self._try_rotate_abandoned_stream()
+                if rotation_error is not None:
+                    failure = rotation_error
+            self._disconnect_client(error=self._error_label(failure))
             return False
         except (
             ValidationError,
@@ -1182,9 +1367,12 @@ class HookBridge:
             self._publish_connection("connected", frame=frame)
             return True
         except DaemonRpcError as error:
+            failure: BaseException = error
             if error.code == "bridge_abandoned":
-                self._rotate_abandoned_stream()
-            self._disconnect_client(error=self._error_label(error))
+                rotation_error = self._try_rotate_abandoned_stream()
+                if rotation_error is not None:
+                    failure = rotation_error
+            self._disconnect_client(error=self._error_label(failure))
             return False
         except (
             ValidationError,
@@ -1199,6 +1387,14 @@ class HookBridge:
             self._disconnect_client(error=self._error_label(error))
             return False
 
+    def _try_rotate_abandoned_stream(self) -> BaseException | None:
+        try:
+            self._rotate_abandoned_stream()
+        except BaseException as error:
+            self._mark_emergency_failure(error)
+            return error
+        return None
+
     def _rotate_abandoned_stream(self) -> None:
         with self._capture_lock:
             old_bridge_instance_id = self._bridge_instance_id
@@ -1208,11 +1404,8 @@ class HookBridge:
                 records.append(retained)
             if self._queue_head is not None:
                 records.append(self._queue_head)
-            while True:
-                try:
-                    records.append(self.queue.get_nowait())
-                except queue.Empty:
-                    break
+            with self.queue.mutex:
+                records.extend(self.queue.queue)
             gap_capture_count = sum(
                 span.last_capture_seq - span.first_capture_seq + 1
                 for span in self._gap_spans
@@ -1227,9 +1420,7 @@ class HookBridge:
                 if retained is not None and self._retained_attempted
                 else 0
             )
-            unsent_capture_count = (
-                abandoned_capture_count - ambiguous_capture_count
-            )
+            unsent_capture_count = abandoned_capture_count - ambiguous_capture_count
             newly_lost_observations = sum(
                 record.last_capture_seq - record.first_capture_seq + 1
                 for record in records
@@ -1245,20 +1436,10 @@ class HookBridge:
                     "daemon_accounting": "unknown_capture_range_trace_gap",
                 }
             )
-            self._bridge_instance_id = new_id()
-            self._recovery_token = secrets.token_hex(32)
-            self._next_capture_seq = 1
-            self._gap_spans.clear()
-            self._queue_head = None
-            self._retained = None
-            self._retained_attempted = False
-            self._exact_retry_pending = False
-            self._attached_next_capture_seq = None
-            self._close_sealed = False
-            self._close_final_capture_seq = None
-            self.projections.clear()
+            replacement_bridge_instance_id = new_id()
+            replacement_recovery_token = secrets.token_hex(32)
             with self._health_lock:
-                self._health = replace(
+                updated_health = replace(
                     self._health,
                     trace_complete=False,
                     dropped_events=(
@@ -1270,14 +1451,31 @@ class HookBridge:
                     last_error="bridge_abandoned",
                     abandoned_streams=self._health.abandoned_streams + 1,
                     abandoned_local_records=(
-                        self._health.abandoned_local_records
-                        + abandoned_capture_count
+                        self._health.abandoned_local_records + abandoned_capture_count
                     ),
                     ambiguous_records=(
                         self._health.ambiguous_records + ambiguous_capture_count
                     ),
                     last_abandonment=audit,
                 )
+            self.projections.clear()
+            with self.queue.mutex:
+                self.queue.queue.clear()
+            self._bridge_instance_id = replacement_bridge_instance_id
+            self._recovery_token = replacement_recovery_token
+            self._next_capture_seq = 1
+            self._gap_spans.clear()
+            self._queue_head = None
+            self._retained = None
+            self._retained_attempted = False
+            self._exact_retry_pending = False
+            self._attached_next_capture_seq = None
+            self._close_sealed = False
+            self._close_final_capture_seq = None
+            self._last_ack = None
+            self._last_bootstrap_reservation = None
+            with self._health_lock:
+                self._health = updated_health
 
     def _publish_connection(
         self,
@@ -1286,28 +1484,36 @@ class HookBridge:
         frame: ConsciousnessFrameV2 | None = None,
         error: str | None = None,
     ) -> None:
-        with self._health_lock:
-            through = (
-                frame.through_capture_seq
-                if frame is not None
-                else self._health.through_capture_seq
-            )
-            trace_complete = self._health.trace_complete
-            if frame is not None:
-                trace_complete = trace_complete and frame.trace_complete
-            self._health = replace(
-                self._health,
-                connection=connection,
-                trace_complete=trace_complete,
-                through_capture_seq=through,
-                last_error=error,
-            )
+        try:
+            with self._health_lock:
+                through = (
+                    frame.through_capture_seq
+                    if frame is not None
+                    else self._health.through_capture_seq
+                )
+                trace_complete = self._health.trace_complete
+                if frame is not None:
+                    trace_complete = trace_complete and frame.trace_complete
+                updated_health = replace(
+                    self._health,
+                    connection=connection,
+                    trace_complete=trace_complete,
+                    through_capture_seq=through,
+                    last_error=error,
+                )
+                self._health = updated_health
+                self._emergency_connection_disconnected = False
+        except BaseException as health_error:
+            self._mark_emergency_failure(health_error)
 
     @staticmethod
     def _error_label(error: BaseException) -> str:
-        if isinstance(error, DaemonRpcError):
-            return error.code[:160]
-        return type(error).__name__[:160]
+        try:
+            if isinstance(error, DaemonRpcError):
+                return error.code[:160]
+            return type(error).__name__[:160]
+        except BaseException:
+            return "callback_internal"
 
     @staticmethod
     def _close_client(client: Any) -> None:

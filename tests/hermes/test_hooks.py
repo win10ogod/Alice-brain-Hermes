@@ -252,22 +252,28 @@ def test_legal_host_empty_identifiers_are_observed_not_downgraded_to_gap(
 ) -> None:
     hooks = HermesHooks(bridge)
 
-    assert hooks.on_session_finalize(
-        telemetry_schema_version="hermes.observer.v1",
-        session_id=None,
-        platform="gateway",
-        reason="shutdown",
-    ) is None
-    assert hooks.subagent_start(
-        telemetry_schema_version="hermes.observer.v1",
-        parent_session_id=None,
-        parent_turn_id="",
-        parent_subagent_id=None,
-        child_session_id=None,
-        child_subagent_id=None,
-        child_role="worker",
-        child_goal="goal",
-    ) is None
+    assert (
+        hooks.on_session_finalize(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id=None,
+            platform="gateway",
+            reason="shutdown",
+        )
+        is None
+    )
+    assert (
+        hooks.subagent_start(
+            telemetry_schema_version="hermes.observer.v1",
+            parent_session_id=None,
+            parent_turn_id="",
+            parent_subagent_id=None,
+            child_session_id=None,
+            child_subagent_id=None,
+            child_role="worker",
+            child_goal="goal",
+        )
+        is None
+    )
 
     first = bridge.queue.get_nowait()
     second = bridge.queue.get_nowait()
@@ -334,14 +340,70 @@ def test_callback_internal_failure_is_reported_and_never_raised(
 
     monkeypatch.setattr(bridge, "_shape_observation", broken_shape)
 
-    assert hooks.on_session_start(
-        telemetry_schema_version="hermes.observer.v1",
-        session_id="session",
-        model="model",
-        platform="cli",
-    ) is None
+    assert (
+        hooks.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+            model="model",
+            platform="cli",
+        )
+        is None
+    )
     (gap,) = bridge.pending_gaps()
     assert dict(gap.cause_counts) == {"callback_internal": 1}
+
+
+@pytest.mark.parametrize(
+    "failure_type",
+    [RuntimeError, KeyboardInterrupt, MemoryError],
+    ids=["exception", "keyboard-interrupt", "memory-error"],
+)
+def test_callback_facade_contains_every_capture_baseexception(
+    bridge: HookBridge,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    hooks = HermesHooks(bridge)
+
+    def fail_capture(*_args: object, **_kwargs: object) -> None:
+        raise failure_type("capture boundary failed")
+
+    monkeypatch.setattr(bridge, "capture", fail_capture)
+
+    for hook_name, payload in _host_payloads().items():
+        assert (
+            getattr(hooks, hook_name)(
+                telemetry_schema_version="hermes.observer.v1",
+                **payload,
+            )
+            is None
+        )
+
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_error == failure_type.__name__
+
+
+def test_pre_llm_cache_read_baseexception_never_escapes(
+    bridge: HookBridge,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hooks = HermesHooks(bridge)
+
+    def fail_cache_read() -> None:
+        raise MemoryError("projection cache read failed")
+
+    monkeypatch.setattr(bridge.projections, "read_context", fail_cache_read)
+
+    assert (
+        hooks.pre_llm_call(
+            telemetry_schema_version="hermes.observer.v1",
+            **_host_payloads()["pre_llm_call"],
+        )
+        is None
+    )
+    assert bridge.queue.qsize() == 1
+    assert bridge.health.trace_complete is False
+    assert bridge.health.last_error == "MemoryError"
 
 
 def test_capture_metadata_is_utc_and_monotonic(bridge: HookBridge) -> None:
@@ -364,11 +426,7 @@ def test_gap_causes_never_invent_transport_or_daemon_loss(
     hooks = HermesHooks(bridge)
     hooks.on_session_start(telemetry_schema_version="1")
 
-    causes = {
-        cause
-        for gap in bridge.pending_gaps()
-        for cause in gap.cause_counts
-    }
+    causes = {cause for gap in bridge.pending_gaps() for cause in gap.cause_counts}
     assert causes == {"invalid_source_schema"}
     assert not causes.intersection(
         {"transport_failed", "daemon_unavailable", "backpressure"}

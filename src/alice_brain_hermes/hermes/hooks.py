@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import suppress
 from typing import Any
 
 from alice_brain_hermes.hermes.bridge import HookBridge, default_runtime_home
@@ -17,7 +18,11 @@ class HermesHooks:
         self.bridge = bridge
 
     def _observe(self, hook: str, kwargs: dict[str, Any]) -> None:
-        self.bridge.capture(hook, kwargs)
+        try:
+            self.bridge.capture(hook, kwargs)
+        except BaseException as error:
+            with suppress(BaseException):
+                self.bridge._mark_emergency_failure(error)
 
     def on_session_start(self, **kwargs: Any) -> None:
         self._observe("on_session_start", kwargs)
@@ -37,7 +42,12 @@ class HermesHooks:
 
     def pre_llm_call(self, **kwargs: Any) -> str | None:
         self._observe("pre_llm_call", kwargs)
-        context = self.bridge.projections.read_context()
+        try:
+            context = self.bridge.projections.read_context()
+        except BaseException as error:
+            with suppress(BaseException):
+                self.bridge._mark_emergency_failure(error)
+            return None
         return context if type(context) is str and context else None
 
     def post_llm_call(self, **kwargs: Any) -> None:

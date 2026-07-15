@@ -773,6 +773,161 @@ def test_attempt_reservation_assignment_failure_never_publishes_a_cursor_early(
 
 
 @pytest.mark.parametrize(
+    "failure_type",
+    [RuntimeError, KeyboardInterrupt, MemoryError],
+    ids=["exception", "keyboard-interrupt", "memory-error"],
+)
+def test_attempt_construction_failure_never_escapes_public_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+
+    def fail_attempt_construction() -> object:
+        raise failure_type("attempt construction failed")
+
+    monkeypatch.setattr(registration, "_DispatchAttempt", fail_attempt_construction)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    assert bootstrap.pending_for_test() == ()
+    assert bootstrap._next_capture_seq == 1  # type: ignore[attr-defined]
+    health = bootstrap.health
+    assert health.trace_complete is False
+    assert health.degraded is True
+    assert health.last_error == failure_type.__name__
+
+
+def test_dispatch_state_cleanup_failure_cannot_leak_the_capture_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+
+    class CleanupFailureState:
+        def __delattr__(self, name: str) -> None:
+            if name == "attempt":
+                raise MemoryError("dispatch state cleanup failed")
+            object.__delattr__(self, name)
+
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    monkeypatch.setattr(registration, "_DISPATCH_STATE", CleanupFailureState())
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    acquired = threading.Event()
+
+    def probe_capture_lock() -> None:
+        if bootstrap._capture_lock.acquire(timeout=0.25):  # type: ignore[attr-defined]
+            acquired.set()
+            bootstrap._capture_lock.release()  # type: ignore[attr-defined]
+
+    probe = threading.Thread(target=probe_capture_lock)
+    probe.start()
+    probe.join(1)
+
+    assert not probe.is_alive()
+    assert acquired.is_set()
+    assert bootstrap.health.trace_complete is False
+    assert bootstrap.health.last_error == "MemoryError"
+
+
+def test_dispatch_state_publication_failure_is_cleaned_up_and_accounted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+
+    class InsertThenFailState:
+        def __init__(self) -> None:
+            object.__setattr__(self, "failed", False)
+
+        def __setattr__(self, name: str, value: object) -> None:
+            object.__setattr__(self, name, value)
+            if name == "attempt" and not self.failed:
+                object.__setattr__(self, "failed", True)
+                raise MemoryError("dispatch state publication failed")
+
+    state = InsertThenFailState()
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    monkeypatch.setattr(registration, "_DISPATCH_STATE", state)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    assert not hasattr(state, "attempt")
+    (retained,) = bootstrap.pending_for_test()
+    assert retained.capture_seq == 1
+    assert retained.gap_cause == "callback_internal"
+    assert bootstrap.health.trace_complete is False
+    assert bootstrap.health.last_error is None
+
+
+def test_persistent_health_allocation_failure_is_conservatively_visible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+
+    def fail_all_health_allocations(*_args: object, **_kwargs: object) -> object:
+        raise MemoryError("health allocation unavailable")
+
+    monkeypatch.setattr(registration, "replace", fail_all_health_allocations)
+
+    assert (
+        registration.on_session_start(
+            telemetry_schema_version="hermes.observer.v1",
+            session_id="session",
+        )
+        is None
+    )
+
+    assert bootstrap.pending_for_test() == ()
+    assert bootstrap._next_capture_seq == 1  # type: ignore[attr-defined]
+    health = bootstrap.health
+    assert health.pending_records == 0
+    assert health.trace_complete is False
+    assert health.degraded is True
+    assert health.last_error == "MemoryError"
+
+
+@pytest.mark.parametrize(
     "constructor_name",
     ["_BootstrapCapture", "MappingProxyType"],
     ids=["capture", "mapping-proxy"],
@@ -1274,6 +1429,150 @@ def test_worker_cannot_observe_a_reservation_before_its_callback_finishes(
     assert retained.gap_cause == "callback_internal"
 
 
+def test_bootstrap_worker_retries_a_bridge_whose_worker_did_not_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+    from alice_brain_hermes.hermes import registration
+
+    class StopProbe(BaseException):
+        pass
+
+    bridges: list[FakeBridge] = []
+    next_calls = 0
+
+    class FakeProjections:
+        @staticmethod
+        def read_context() -> None:
+            return None
+
+    class FakeBridge:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.projections = FakeProjections()
+            self.worker_started = False
+            bridges.append(self)
+
+        def start_worker(self) -> None:
+            self.worker_started = len(bridges) >= 2
+
+    class FakeBuffer:
+        @staticmethod
+        def mark_worker_degraded(_error: BaseException) -> None:
+            return None
+
+        @staticmethod
+        def wait(_timeout: float) -> None:
+            return None
+
+        @staticmethod
+        def publish_context(_context: object) -> None:
+            return None
+
+        @staticmethod
+        def next_for_worker() -> None:
+            nonlocal next_calls
+            next_calls += 1
+            if len(bridges) >= 2 or next_calls >= 3:
+                raise StopProbe
+            return None
+
+    monkeypatch.setattr(bridge_module, "HookBridge", FakeBridge)
+    monkeypatch.setattr(bridge_module, "default_runtime_home", lambda: "unused")
+
+    with pytest.raises(StopProbe):
+        registration._bootstrap_worker_main(FakeBuffer())  # type: ignore[arg-type,attr-defined]
+
+    assert len(bridges) == 2
+    assert bridges[0].worker_started is False
+    assert bridges[1].worker_started is True
+
+
+def test_bootstrap_worker_retries_baseexception_and_handoff_without_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import bridge as bridge_module
+    from alice_brain_hermes.hermes import registration
+
+    class StopProbe(BaseException):
+        pass
+
+    capture_calls = 0
+    handoff_calls = 0
+
+    class FakeProjections:
+        @staticmethod
+        def read_context() -> None:
+            return None
+
+    class FakeBridge:
+        worker_started = True
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.projections = FakeProjections()
+
+        @staticmethod
+        def start_worker() -> None:
+            return None
+
+        @staticmethod
+        def capture_reserved(**_kwargs: object) -> None:
+            nonlocal capture_calls
+            capture_calls += 1
+            if capture_calls == 1:
+                raise KeyboardInterrupt("capture interrupted")
+
+    class FakeCapture:
+        hook = "on_session_start"
+        detached_kwargs = MappingProxyType(
+            {
+                "telemetry_schema_version": "hermes.observer.v1",
+                "session_id": "session",
+            }
+        )
+        capture_seq = 1
+        last_capture_seq = 1
+        gap_cause_counts = None
+        copy_stats = MappingProxyType({})
+
+    retained = FakeCapture()
+
+    class FakeBuffer:
+        @staticmethod
+        def mark_worker_degraded(_error: BaseException) -> None:
+            return None
+
+        @staticmethod
+        def wait(_timeout: float) -> None:
+            return None
+
+        @staticmethod
+        def publish_context(_context: object) -> None:
+            return None
+
+        @staticmethod
+        def next_for_worker() -> object:
+            if handoff_calls >= 2:
+                raise StopProbe
+            return retained
+
+        @staticmethod
+        def mark_handed_off(item: object) -> None:
+            nonlocal handoff_calls
+            assert item is retained
+            handoff_calls += 1
+            if handoff_calls == 1:
+                raise MemoryError("handoff health publication failed")
+
+    monkeypatch.setattr(bridge_module, "HookBridge", FakeBridge)
+    monkeypatch.setattr(bridge_module, "default_runtime_home", lambda: "unused")
+
+    with pytest.raises(StopProbe):
+        registration._bootstrap_worker_main(FakeBuffer())  # type: ignore[arg-type,attr-defined]
+
+    assert capture_calls == 3
+    assert handoff_calls == 2
+
+
 @pytest.mark.parametrize(
     "failure",
     [RuntimeError("cache failed"), KeyboardInterrupt(), MemoryError()],
@@ -1458,6 +1757,52 @@ def test_worker_start_failure_and_capture_gap_use_the_same_health_lock(
     assert bootstrap.health.pending_records == 1
 
 
+def test_bootstrap_worker_health_allocation_failure_does_not_publish_a_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    original_replace = registration.replace
+    starts = 0
+
+    class FakeThread:
+        def start(self) -> None:
+            nonlocal starts
+            starts += 1
+
+    monkeypatch.setattr(
+        registration.threading,
+        "Thread",
+        lambda **_kwargs: FakeThread(),
+    )
+    failed = False
+
+    def fail_first_worker_health(instance: object, **changes: object) -> object:
+        nonlocal failed
+        if not failed and changes.get("worker_started") is True:
+            failed = True
+            raise MemoryError("bootstrap worker health allocation failed")
+        return original_replace(instance, **changes)
+
+    monkeypatch.setattr(registration, "replace", fail_first_worker_health)
+
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+    assert failed is True
+    assert bootstrap._worker is None  # type: ignore[attr-defined]
+    assert starts == 0
+    assert bootstrap.health.trace_complete is False
+    assert bootstrap.health.degraded is True
+    assert bootstrap.health.last_error == "MemoryError"
+
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+    assert bootstrap._worker is not None  # type: ignore[attr-defined]
+    assert starts == 1
+
+
 def test_bootstrap_copy_cost_is_bounded_for_hostile_nested_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1547,6 +1892,67 @@ def test_bootstrap_overflow_merges_alternating_gap_causes_into_one_interval(
     }
     assert bootstrap.health.pending_gap_ranges == 1
     assert bootstrap.health.pending_records == 201
+
+
+def test_overflow_merge_allocation_failure_keeps_every_reserved_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=1,
+        start_worker_on_capture=False,
+    )
+    monkeypatch.setattr(registration, "_BOOTSTRAP", bootstrap)
+    registration.on_session_start(
+        telemetry_schema_version="hermes.observer.v1",
+        session_id="queued",
+    )
+    registration.on_session_start(
+        telemetry_schema_version="invalid",
+        session_id="first-gap",
+    )
+
+    original_mapping_proxy = registration.MappingProxyType
+    construction_calls = 0
+
+    def allow_reserved_fallback_then_fail(
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal construction_calls
+        construction_calls += 1
+        if construction_calls > 1:
+            raise MemoryError("overflow merge allocation failed")
+        return original_mapping_proxy(*args, **kwargs)
+
+    monkeypatch.setattr(
+        registration,
+        "MappingProxyType",
+        allow_reserved_fallback_then_fail,
+    )
+    registration.on_session_start(
+        telemetry_schema_version="hermes.observer.v1",
+        session_id="fallback-gap",
+    )
+    monkeypatch.setattr(registration, "MappingProxyType", original_mapping_proxy)
+    registration.on_session_start(
+        telemetry_schema_version="hermes.observer.v1",
+        session_id="later-gap",
+    )
+
+    pending = bootstrap.pending_for_test()
+    covered = [
+        sequence
+        for item in pending
+        for sequence in range(item.capture_seq, item.last_capture_seq + 1)
+    ]
+    assert covered == [1, 2, 3, 4]
+    assert bootstrap._next_capture_seq == 5  # type: ignore[attr-defined]
+    assert bootstrap.health.pending_records == 4
+    assert bootstrap.health.dropped_events == 3
+    assert bootstrap.health.trace_complete is False
+    assert bootstrap.health.pending_gap_ranges == 2
 
 
 def test_same_context_registers_once(monkeypatch: pytest.MonkeyPatch) -> None:

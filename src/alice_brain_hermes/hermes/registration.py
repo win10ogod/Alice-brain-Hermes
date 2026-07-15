@@ -251,27 +251,51 @@ class _BootstrapCaptureBuffer:
         self._health = _BootstrapHealth()
         self._handed_off_dropped_events = 0
         self._health_reconciliation_required = False
+        self._emergency_trace_incomplete = False
+        self._emergency_degraded = False
+        self._emergency_last_error: str | None = None
         self._context: str | None = None
 
     @property
     def health(self) -> _BootstrapHealth:
         with self._capture_lock:
             health = self._health
-            if not self._health_reconciliation_required:
+            if (
+                not self._health_reconciliation_required
+                and not self._emergency_trace_incomplete
+                and not self._emergency_degraded
+            ):
                 return health
-            pending_gap_ranges, pending_dropped_events = (
-                self._pending_gap_metrics_locked()
-            )
-            return _BootstrapHealth(
-                trace_complete=False,
-                dropped_events=(
+            if self._health_reconciliation_required:
+                pending_gap_ranges, pending_dropped_events = (
+                    self._pending_gap_metrics_locked()
+                )
+                dropped_events = (
                     self._handed_off_dropped_events + pending_dropped_events
+                )
+            else:
+                pending_gap_ranges = health.pending_gap_ranges
+                dropped_events = health.dropped_events
+            return _BootstrapHealth(
+                trace_complete=(
+                    health.trace_complete
+                    and not self._health_reconciliation_required
+                    and not self._emergency_trace_incomplete
                 ),
+                dropped_events=dropped_events,
                 pending_records=health.pending_records,
                 pending_gap_ranges=pending_gap_ranges,
                 worker_started=health.worker_started,
-                degraded=True,
-                last_error=health.last_error or "health_reconciliation_required",
+                degraded=(
+                    health.degraded
+                    or self._health_reconciliation_required
+                    or self._emergency_degraded
+                ),
+                last_error=(
+                    self._emergency_last_error
+                    or health.last_error
+                    or "health_reconciliation_required"
+                ),
                 worker_error=health.worker_error,
                 registration_attempts=health.registration_attempts,
                 registration_failures=health.registration_failures,
@@ -350,13 +374,14 @@ class _BootstrapCaptureBuffer:
         capture_seq = self._next_capture_seq
         fallback_gap = self._new_gap(capture_seq, "callback_internal")
         reservation = _DispatchReservation(self, capture_seq, fallback_gap)
+        next_capture_seq = capture_seq + 1
         updated_health = replace(
             self._health,
             pending_records=self._health.pending_records + 1,
         )
         if attempt is not None:
             attempt.reservation = reservation
-        self._next_capture_seq = capture_seq + 1
+        self._next_capture_seq = next_capture_seq
         self._health = updated_health
         if attempt is not None:
             attempt.notify_buffer = self
@@ -455,15 +480,23 @@ class _BootstrapCaptureBuffer:
             self._overflow
             and self._overflow[-1].last_capture_seq + 1 == gap.capture_seq
         ):
-            previous = self._overflow[-1]
-            causes = dict(previous.gap_cause_counts or {})
-            for cause, count in (gap.gap_cause_counts or {}).items():
-                causes[cause] = causes.get(cause, 0) + count
-            self._overflow[-1] = replace(
-                previous,
-                last_capture_seq=gap.last_capture_seq,
-                gap_cause_counts=MappingProxyType(causes),
-            )
+            try:
+                previous = self._overflow[-1]
+                causes = dict(previous.gap_cause_counts or {})
+                for cause, count in (gap.gap_cause_counts or {}).items():
+                    causes[cause] = causes.get(cause, 0) + count
+                merged = replace(
+                    previous,
+                    last_capture_seq=gap.last_capture_seq,
+                    gap_cause_counts=MappingProxyType(causes),
+                )
+            except BaseException:
+                # The exact fallback is already constructed for this sequence.
+                # Retaining a second adjacent range is safer than losing it
+                # merely because the optional merge allocation failed.
+                self._overflow.append(gap)
+                return 1
+            self._overflow[-1] = merged
             return 0
         self._overflow.append(gap)
         return 1
@@ -544,20 +577,28 @@ class _BootstrapCaptureBuffer:
             if self._worker is not None:
                 return
             try:
-                worker = threading.Thread(
-                    target=_bootstrap_worker_main,
-                    args=(self,),
-                    name="alice-brain-hermes-bootstrap",
-                    daemon=True,
-                )
-                self._worker = worker
-                worker.start()
+                with self._capture_lock:
+                    previous_health = self._health
+                    updated_health = replace(self._health, worker_started=True)
+                    worker = threading.Thread(
+                        target=_bootstrap_worker_main,
+                        args=(self,),
+                        name="alice-brain-hermes-bootstrap",
+                        daemon=True,
+                    )
+                    self._health = updated_health
+                    self._worker = worker
+                    try:
+                        worker.start()
+                    except BaseException:
+                        self._worker = None
+                        self._health = previous_health
+                        raise
             except BaseException as error:
-                self._worker = None
+                with self._capture_lock:
+                    self.mark_unrepresented_callback(error)
                 self.mark_worker_degraded(error)
                 return
-            with self._capture_lock:
-                self._health = replace(self._health, worker_started=True)
 
     def next_for_worker(self) -> _BootstrapCapture | None:
         with self._capture_lock:
@@ -610,14 +651,30 @@ class _BootstrapCaptureBuffer:
             self._health_reconciliation_required = False
 
     def mark_worker_degraded(self, error: BaseException) -> None:
-        error_name = type(error).__name__[:160]
-        with self._capture_lock:
-            self._health = replace(
-                self._health,
-                degraded=True,
-                last_error=error_name,
-                worker_error=error_name,
-            )
+        try:
+            error_name = type(error).__name__[:160]
+        except BaseException:
+            error_name = "callback_internal"
+        try:
+            with self._capture_lock:
+                self._health = replace(
+                    self._health,
+                    degraded=True,
+                    last_error=error_name,
+                    worker_error=error_name,
+                )
+        except BaseException:
+            self.mark_unrepresented_callback(error)
+
+    def mark_unrepresented_callback(self, error: BaseException) -> None:
+        """Publish an allocation-free conservative latch for an unseen callback."""
+
+        self._emergency_trace_incomplete = True
+        self._emergency_degraded = True
+        try:
+            self._emergency_last_error = type(error).__name__[:160]
+        except BaseException:
+            self._emergency_last_error = "callback_internal"
 
     def record_registration_success(self) -> None:
         """Record one complete context without erasing earlier partial installs."""
@@ -705,13 +762,17 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                     default_runtime_home,
                 )
 
-                bridge = HookBridge(
+                candidate = HookBridge(
                     default_runtime_home(),
                     start_worker_on_capture=False,
                     context_sink=buffer.publish_context,
                 )
-                bridge.start_worker()
-            except Exception as error:
+                candidate.start_worker()
+                if not candidate.worker_started:
+                    raise RuntimeError("Hermes bridge worker did not start")
+                bridge = candidate
+            except BaseException as error:
+                bridge = None
                 buffer.mark_worker_degraded(error)
                 buffer.wait(0.1)
                 continue
@@ -729,12 +790,20 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                 gap_cause_counts=capture.gap_cause_counts,
                 copy_stats=capture.copy_stats,
             )
-        except Exception as error:
+        except BaseException as error:
             buffer.mark_worker_degraded(error)
             buffer.wait(0.1)
             continue
-        buffer.mark_handed_off(capture)
-        buffer.publish_context(bridge.projections.read_context())
+        try:
+            buffer.mark_handed_off(capture)
+        except BaseException as error:
+            buffer.mark_worker_degraded(error)
+            buffer.wait(0.1)
+            continue
+        try:
+            buffer.publish_context(bridge.projections.read_context())
+        except BaseException as error:
+            buffer.mark_worker_degraded(error)
 
 
 _BOOTSTRAP = _BootstrapCaptureBuffer()
@@ -753,14 +822,14 @@ def _lazy_dispatch(hook: str, kwargs: dict[str, Any]) -> str | None:
     return _capture_hook(hook, kwargs)
 
 
-def _safe_dispatch(hook: str, kwargs: dict[str, Any]) -> str | None:
+def _dispatch_attempt(hook: str, kwargs: dict[str, Any]) -> str | None:
     missing = object()
     previous = getattr(_DISPATCH_STATE, "attempt", missing)
     attempt = _DispatchAttempt()
-    _DISPATCH_STATE.attempt = attempt
     dispatch_buffer = _BOOTSTRAP
     lock_acquired = False
     try:
+        _DISPATCH_STATE.attempt = attempt
         dispatch_buffer._capture_lock.acquire()
         lock_acquired = True
         return _lazy_dispatch(hook, kwargs)
@@ -777,23 +846,54 @@ def _safe_dispatch(hook: str, kwargs: dict[str, Any]) -> str | None:
             pass
         return None
     finally:
-        if previous is missing:
-            with suppress(AttributeError):
-                del _DISPATCH_STATE.attempt
-        else:
-            _DISPATCH_STATE.attempt = previous
-        if lock_acquired:
-            dispatch_buffer._capture_lock.release()
-        notify_buffer = attempt.notify_buffer
-        if notify_buffer is not None:
-            if isinstance(previous, _DispatchAttempt):
-                previous.notify_buffer = notify_buffer
+        cleanup_error: BaseException | None = None
+        try:
+            if previous is missing:
+                with suppress(AttributeError):
+                    del _DISPATCH_STATE.attempt
             else:
-                try:
+                _DISPATCH_STATE.attempt = previous
+        except BaseException as error:
+            cleanup_error = error
+        try:
+            if lock_acquired:
+                dispatch_buffer._capture_lock.release()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        try:
+            notify_buffer = attempt.notify_buffer
+        except BaseException as error:
+            notify_buffer = None
+            if cleanup_error is None:
+                cleanup_error = error
+        if notify_buffer is not None:
+            try:
+                if isinstance(previous, _DispatchAttempt):
+                    previous.notify_buffer = notify_buffer
+                else:
                     notify_buffer._notify_worker()
-                except BaseException as error:
-                    with suppress(BaseException):
-                        notify_buffer.mark_worker_degraded(error)
+            except BaseException as error:
+                with suppress(BaseException):
+                    notify_buffer.mark_worker_degraded(error)
+        if cleanup_error is not None:
+            raise cleanup_error
+
+
+def _safe_dispatch(hook: str, kwargs: dict[str, Any]) -> str | None:
+    """Contain every callback failure, including prologue and cleanup failures."""
+
+    try:
+        return _dispatch_attempt(hook, kwargs)
+    except BaseException as error:
+        buffer = _BOOTSTRAP
+        with suppress(BaseException):
+            buffer.mark_unrepresented_callback(error)
+        if hook == "pre_llm_call":
+            with suppress(BaseException):
+                context = buffer.read_context()
+                return context if type(context) is str and context else None
+        return None
 
 
 def on_session_start(**kwargs: Any) -> None:
