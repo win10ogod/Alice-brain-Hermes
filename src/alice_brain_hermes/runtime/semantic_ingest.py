@@ -393,6 +393,7 @@ def _semantic_gap(
     raw_event: EventEnvelope,
     *,
     reason: str,
+    span_close: HermesSpan | None = None,
 ) -> SemanticPlan:
     event = _derived_event(
         stream,
@@ -415,6 +416,7 @@ def _semantic_gap(
         semantic_status="gap",
         semantic_complete=False,
         derived_events=(event,),
+        span_close=span_close,
     )
 
 
@@ -701,7 +703,17 @@ def build_semantic_plan(
     if forced_gap_reason is not None:
         if not forced_gap_reason.strip() or len(forced_gap_reason) > 160:
             raise ValueError("forced semantic gap reason must be non-blank and bounded")
-        return _semantic_gap(stream, record, raw_event, reason=forced_gap_reason)
+        return _semantic_gap(
+            stream,
+            record,
+            raw_event,
+            reason=forced_gap_reason,
+            span_close=(
+                matched_span
+                if matched_span is not None and matched_span.closed_capture_seq is None
+                else None
+            ),
+        )
     if record.hook == "pre_tool_call":
         if matched_span is not None:
             raise ValueError("pre-tool observation cannot close a span")

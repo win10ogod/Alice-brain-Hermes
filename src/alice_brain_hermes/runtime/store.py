@@ -3812,22 +3812,30 @@ class SQLiteLedger:
         record: BridgeRecordV1,
         matched_span: HermesSpan | None,
     ) -> str | None:
-        """Reject a known late tool/domain mismatch before deriving a receipt."""
+        """Reject a tool/domain lifecycle mismatch before deriving action events."""
         if (
             not isinstance(record, HermesObservationV1)
             or record.hook != "post_tool_call"
             or matched_span is None
-            or matched_span.closed_capture_seq is None
-            or record.payload.status == "blocked"
         ):
             return None
+        late = matched_span.closed_capture_seq is not None
         if matched_span.action_id is None:
-            return "late_action_unavailable"
+            return "late_action_unavailable" if late else "action_unavailable"
         action = state.actions.get(matched_span.action_id)
         if action is None:
-            return "late_action_unavailable"
-        if action.phase is ActionPhase.BLOCKED:
+            return "late_action_unavailable" if late else "action_unavailable"
+        if (
+            ActionPhase.BLOCKED in action.phase_history
+            or action.execution_confirmed is False
+        ):
             return "late_completion_after_blocked"
+        if not late:
+            return (
+                None
+                if action.phase is ActionPhase.PREPARED
+                else "action_state_mismatch"
+            )
         if action.phase not in {ActionPhase.RECEIPT, ActionPhase.RECONSTRUCTED}:
             return "late_action_state_mismatch"
         return None

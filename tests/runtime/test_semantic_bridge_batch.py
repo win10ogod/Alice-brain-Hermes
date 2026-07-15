@@ -285,11 +285,14 @@ def test_late_receipt_matches_latest_closed_occurrence_without_redispatch(
         assert reopened.observability_snapshot(engine.brain_id).semantic_complete
 
 
+@pytest.mark.parametrize("reconstruct_before_late", [False, True])
 @pytest.mark.parametrize("late_status", ["ok", "error", "timeout", "cancelled"])
 def test_late_completion_after_blocked_is_gap_without_receipt_or_redispatch(
     tmp_path: Path,
     late_status: str,
+    reconstruct_before_late: bool,
 ) -> None:
+    from alice_brain_hermes.core.events import new_event
     from alice_brain_hermes.runtime.engine import ConsciousEngine
     from alice_brain_hermes.runtime.store import SQLiteLedger
 
@@ -311,6 +314,20 @@ def test_late_completion_after_blocked_is_gap_without_receipt_or_redispatch(
             instance,
             tool_observation(instance, 2, hook="post_tool_call", status="blocked"),
         )
+        [blocked_action] = engine.state.action_records
+        if reconstruct_before_late:
+            engine.append(
+                new_event(
+                    "action.reconstructed",
+                    brain_id,
+                    brain_id,
+                    {
+                        "action_id": blocked_action.action_id,
+                        "analysis": "blocked action reconstruction",
+                    },
+                    action_id=blocked_action.action_id,
+                )
+            )
 
         late = engine.commit_bridge_record(instance, late_record)
         duplicate = engine.commit_bridge_record(instance, late_record)
@@ -327,12 +344,25 @@ def test_late_completion_after_blocked_is_gap_without_receipt_or_redispatch(
             "late_completion_after_blocked"
         )
         [action] = engine.state.action_records
-        assert action.phase is ActionPhase.BLOCKED
+        assert action.phase is (
+            ActionPhase.RECONSTRUCTED
+            if reconstruct_before_late
+            else ActionPhase.BLOCKED
+        )
         assert ActionPhase.DISPATCHED not in action.phase_history
         assert ActionPhase.RECEIPT not in action.phase_history
         assert action.execution_confirmed is False
         assert action.outcome is None
         assert action.effect_confirmed is None
+        snapshot = ledger.observability_snapshot(brain_id)
+        assert ledger.bridge_stream_state(instance).next_capture_seq == 4
+        [closed_capture_seq] = ledger._connection.execute(
+            "SELECT closed_capture_seq FROM hermes_span"
+        ).fetchone()
+        assert closed_capture_seq == 2
+        assert snapshot.semantic_records == 3
+        assert snapshot.semantic_gap_records == 1
+        assert snapshot.semantic_complete is False
         before = (
             len(ledger.list_events(brain_id)),
             ledger.bridge_stream_state(instance),
@@ -356,9 +386,133 @@ def test_late_completion_after_blocked_is_gap_without_receipt_or_redispatch(
 
         assert duplicate_after_restart.canonical_json() == late.canonical_json()
         [action] = restarted.state.action_records
-        assert action.phase is ActionPhase.BLOCKED
+        assert action.phase is (
+            ActionPhase.RECONSTRUCTED
+            if reconstruct_before_late
+            else ActionPhase.BLOCKED
+        )
         assert ActionPhase.DISPATCHED not in action.phase_history
         assert ActionPhase.RECEIPT not in action.phase_history
+
+
+@pytest.mark.parametrize("reconstruct_before_post", [False, True])
+@pytest.mark.parametrize("post_status", ["ok", "error", "timeout", "cancelled"])
+def test_completion_after_direct_blocked_open_span_is_gap_and_restart_safe(
+    tmp_path: Path,
+    post_status: str,
+    reconstruct_before_post: bool,
+) -> None:
+    from alice_brain_hermes.core.events import new_event
+    from alice_brain_hermes.runtime.engine import ConsciousEngine
+    from alice_brain_hermes.runtime.store import SQLiteLedger
+
+    ledger, engine, instance = make_engine(tmp_path)
+    database = ledger.path
+    brain_id = engine.brain_id
+    post_record = tool_observation(
+        instance,
+        2,
+        hook="post_tool_call",
+        status=post_status,
+    )
+    with ledger:
+        engine.commit_bridge_record(
+            instance,
+            tool_observation(instance, 1, hook="pre_tool_call"),
+        )
+        [prepared_action] = engine.state.action_records
+        engine.append(
+            new_event(
+                "action.blocked",
+                brain_id,
+                brain_id,
+                {"action_id": prepared_action.action_id},
+                action_id=prepared_action.action_id,
+            )
+        )
+        if reconstruct_before_post:
+            engine.append(
+                new_event(
+                    "action.reconstructed",
+                    brain_id,
+                    brain_id,
+                    {
+                        "action_id": prepared_action.action_id,
+                        "analysis": "blocked action reconstruction",
+                    },
+                    action_id=prepared_action.action_id,
+                )
+            )
+
+        accepted = engine.commit_bridge_record(instance, post_record)
+        duplicate = engine.commit_bridge_record(instance, post_record)
+
+        assert duplicate.canonical_json() == accepted.canonical_json()
+        assert accepted.semantic_status == "gap"
+        assert accepted.derived_event_count == 1
+        assert [
+            event.event_type
+            for event in ledger.list_events(brain_id)
+            if event.sequence is not None
+            and event.sequence >= accepted.raw_event_sequence
+        ] == ["hermes.observer.post_tool_call", "semantic.gap"]
+        assert ledger.list_events(brain_id)[-1].payload["reason"] == (
+            "late_completion_after_blocked"
+        )
+        [action] = engine.state.action_records
+        assert action.phase is (
+            ActionPhase.RECONSTRUCTED
+            if reconstruct_before_post
+            else ActionPhase.BLOCKED
+        )
+        assert ActionPhase.DISPATCHED not in action.phase_history
+        assert ActionPhase.RECEIPT not in action.phase_history
+        assert action.execution_confirmed is False
+        assert action.outcome is None
+        assert action.effect_confirmed is None
+        snapshot = ledger.observability_snapshot(brain_id)
+        assert ledger.bridge_stream_state(instance).next_capture_seq == 3
+        [closed_capture_seq] = ledger._connection.execute(
+            "SELECT closed_capture_seq FROM hermes_span"
+        ).fetchone()
+        assert closed_capture_seq == 2
+        assert snapshot.semantic_records == 2
+        assert snapshot.semantic_gap_records == 1
+        assert snapshot.semantic_complete is False
+        before = (
+            len(ledger.list_events(brain_id)),
+            ledger.bridge_stream_state(instance),
+            snapshot,
+        )
+
+        changed_values = post_record.model_dump(mode="python")
+        changed_values["payload"]["result"] = {"changed": True}
+        changed = validate_observation(changed_values)
+        with pytest.raises(IdempotencyConflictError):
+            engine.commit_bridge_record(instance, changed)
+        assert (
+            len(ledger.list_events(brain_id)),
+            ledger.bridge_stream_state(instance),
+            ledger.observability_snapshot(brain_id),
+        ) == before
+
+    with SQLiteLedger.open(database) as reopened:
+        restarted = ConsciousEngine(reopened, brain_id, actor_id=brain_id)
+        duplicate_after_restart = restarted.commit_bridge_record(instance, post_record)
+
+        assert duplicate_after_restart.canonical_json() == accepted.canonical_json()
+        [action] = restarted.state.action_records
+        assert action.phase is (
+            ActionPhase.RECONSTRUCTED
+            if reconstruct_before_post
+            else ActionPhase.BLOCKED
+        )
+        assert ActionPhase.DISPATCHED not in action.phase_history
+        assert ActionPhase.RECEIPT not in action.phase_history
+        [closed_capture_seq] = reopened._connection.execute(
+            "SELECT closed_capture_seq FROM hermes_span"
+        ).fetchone()
+        assert closed_capture_seq == 2
 
 
 def test_late_conflict_keeps_canonical_outcome_and_projects_typed_disposition(
