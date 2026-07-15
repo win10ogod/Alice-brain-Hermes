@@ -204,19 +204,19 @@ def require_supported_hermes(version: str | None) -> str:
 
 
 def setup_alice_brain_cli(parser: Any) -> None:
-    """Attach the harmless Task 5 CLI placeholder to *parser*."""
+    """Attach the shared runtime CLI lazily when Hermes builds its parser."""
 
-    parser.set_defaults(_alice_brain_hermes_parser=parser)
+    from alice_brain_hermes.hermes.cli import setup_alice_brain_cli as setup
+
+    setup(parser)
 
 
 def handle_alice_brain_cli(args: Any) -> int:
-    """Print the placeholder command help without contacting the runtime."""
+    """Dispatch the Hermes command through the shared in-process handler."""
 
-    parser = getattr(args, "_alice_brain_hermes_parser", None)
-    if parser is None:
-        raise RuntimeError("Alice-brain-Hermes CLI parser is unavailable")
-    parser.print_help()
-    return 0
+    from alice_brain_hermes.hermes.cli import handle_alice_brain_cli as handle
+
+    return handle(args)
 
 
 def register(ctx: Any) -> None:

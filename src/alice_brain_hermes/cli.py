@@ -163,8 +163,13 @@ def _runtime_home(explicit: str | None) -> Path:
 
 def configure_control_parser(
     parser: argparse.ArgumentParser,
+    *,
+    command_required: bool = True,
 ) -> argparse.ArgumentParser:
     """Build the shared Python command surface without contacting the runtime."""
+
+    if type(command_required) is not bool:
+        raise TypeError("command_required must be a boolean")
 
     parser.add_argument(
         "--home",
@@ -179,7 +184,10 @@ def configure_control_parser(
         default=_DEFAULT_TIMEOUT_SECONDS,
         help="bounded startup, RPC, and shutdown timeout in seconds",
     )
-    commands = parser.add_subparsers(dest="alice_brain_command", required=True)
+    commands = parser.add_subparsers(
+        dest="alice_brain_command",
+        required=command_required,
+    )
 
     daemon = commands.add_parser("daemon", help="run or control the private daemon")
     daemon_commands = daemon.add_subparsers(
