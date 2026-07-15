@@ -23,8 +23,9 @@ from alice_brain_hermes.ids import new_id
 from alice_brain_hermes.projections import MAX_EPHEMERAL_CONTEXT_BYTES
 from alice_brain_hermes.protocol.client import DaemonClient
 from alice_brain_hermes.protocol.models import (
-    BridgeCommitAckV1,
+    BridgeCommitAckV2,
     BridgeGapV1,
+    ConsciousnessFrameV3,
     validate_bridge_record_json,
 )
 
@@ -385,11 +386,17 @@ class _FakeClient:
             assert isinstance(freshness, dict)
             freshness["scheduler_sample"] = "not_sampled"
             return {
-                "schema_version": 1,
+                "schema_version": 2,
                 "record_fingerprint": validated.fingerprint(),
                 "duplicate": False,
-                "event_id": new_id(),
-                "event_sequence": through,
+                "raw_event_id": new_id(),
+                "raw_event_sequence": through,
+                "derived_event_ids": [],
+                "derived_event_count": 0,
+                "last_event_sequence": through,
+                "semantic_status": "not_applicable",
+                "semantic_complete": True,
+                "semantic_fingerprint": "a" * 64,
                 "frame": frame,
                 "through_capture_seq": through,
             }
@@ -403,7 +410,7 @@ class _FakeClient:
 
 def _frame(brain_id: str, through: int) -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "brain_id": brain_id,
         "state_sequence": through,
         "through_capture_seq": through,
@@ -424,6 +431,15 @@ def _frame(brain_id: str, through: int) -> dict[str, object]:
             "reasoning_capture": "unobserved",
         },
         "semantic_context": {},
+        "semantic_schema_version": 1,
+        "aggregate_semantic_complete": through == 0,
+        "semantic_evidence": {
+            "schema_version": 1,
+            "semantic_records": through,
+            "legacy_raw_only_records": 0,
+            "semantic_gap_records": 0,
+            "dropped_events": 0,
+        },
         "unresolved_evidence": False,
         "capture_coverage": {},
         "freshness": {
@@ -762,7 +778,7 @@ def test_lost_ack_retries_identical_record_and_accepts_duplicate_false(
     assert attachments[0]["bridge_instance_id"] == attachments[1]["bridge_instance_id"]
     assert attachments[0]["recovery_token"] == attachments[1]["recovery_token"]
     assert bridge.retained_record is None
-    assert isinstance(bridge.last_ack, BridgeCommitAckV1)
+    assert isinstance(bridge.last_ack, BridgeCommitAckV2)
     assert bridge.last_ack.duplicate is False
     assert bridge.projections.frame is not None
     assert bridge.projections.frame.state_sequence == 2
@@ -1285,7 +1301,7 @@ def test_initial_state_frame_must_match_resolve_attach_and_freshness(
     [
         "brain_id",
         "frame_cursor",
-        "event_sequence",
+        "last_event_sequence",
         "freshness_sequence",
         "scheduler_sample",
         "duplicate",
@@ -1312,8 +1328,8 @@ def test_commit_ack_relations_are_strictly_bound(
                 frame["brain_id"] = new_id()
             elif mutation == "frame_cursor":
                 frame["through_capture_seq"] = 0
-            elif mutation == "event_sequence":
-                result["event_sequence"] = 2
+            elif mutation == "last_event_sequence":
+                result["last_event_sequence"] = 2
             elif mutation == "freshness_sequence":
                 freshness = frame["freshness"]
                 assert isinstance(freshness, dict)
@@ -1566,6 +1582,13 @@ def test_real_daemon_commit_projection_and_clean_close(tmp_path: Path) -> None:
         _session_start(hooks, "real-daemon-session")
         _wait_until(lambda: bridge.last_ack is not None, timeout=10)
         assert bridge.last_ack is not None
+        assert isinstance(bridge.last_ack, BridgeCommitAckV2)
+        assert bridge.last_ack.schema_version == 2
+        assert bridge.last_ack.semantic_status == "applied"
+        assert bridge.last_ack.semantic_complete is True
+        assert (
+            bridge.last_ack.last_event_sequence == bridge.last_ack.frame.state_sequence
+        )
         assert bridge.last_ack.through_capture_seq == 1
         assert bridge.last_ack.frame.freshness.scheduler_sample == "not_sampled"
         assert bridge.health.through_capture_seq == 1
@@ -1613,10 +1636,8 @@ def test_oversized_projection_falls_back_to_valid_bounded_json(
         **{f"extra-{index}": "x" * 1_000 for index in range(128)},
     }
     raw["omission_counts"] = {"large": "x" * 100_000}
-    from alice_brain_hermes.protocol.models import ConsciousnessFrameV2
-
     bridge.projections.publish_frame(
-        ConsciousnessFrameV2.model_validate(raw, strict=True)
+        ConsciousnessFrameV3.model_validate(raw, strict=True)
     )
 
     context = bridge.projections.read_context()
@@ -1638,10 +1659,8 @@ def test_projection_thaws_nested_immutable_frame_values(tmp_path: Path) -> None:
     raw = _frame(brain_id, 0)
     raw["pc"] = {"traits": {"care": {"value": 0.75}}}
     raw["semantic_context"] = {"nested": {"items": [1, {"two": 2}]}}
-    from alice_brain_hermes.protocol.models import ConsciousnessFrameV2
-
     bridge.projections.publish_frame(
-        ConsciousnessFrameV2.model_validate(raw, strict=True)
+        ConsciousnessFrameV3.model_validate(raw, strict=True)
     )
 
     context = bridge.projections.read_context()
@@ -1649,3 +1668,11 @@ def test_projection_thaws_nested_immutable_frame_values(tmp_path: Path) -> None:
     decoded = json.loads(context)["alice_brain"]
     assert decoded["pc"] == {"traits": {"care": {"value": 0.75}}}
     assert decoded["semantic_context"] == {"nested": {"items": [1, {"two": 2}]}}
+    assert decoded["aggregate_semantic_complete"] is True
+    assert decoded["semantic_evidence"] == {
+        "schema_version": 1,
+        "semantic_records": 0,
+        "legacy_raw_only_records": 0,
+        "semantic_gap_records": 0,
+        "dropped_events": 0,
+    }

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from alice_brain_hermes.core.events import thaw_json
-from alice_brain_hermes.protocol.models import ConsciousnessFrameV2
+from alice_brain_hermes.protocol.models import ConsciousnessFrameV3
 
 MAX_EPHEMERAL_CONTEXT_BYTES = 16_384
 
@@ -57,12 +57,12 @@ class AtomicProjectionCache:
     ) -> None:
         if context_sink is not None and not callable(context_sink):
             raise TypeError("context_sink must be callable or None")
-        self._frame: ConsciousnessFrameV2 | None = None
+        self._frame: ConsciousnessFrameV3 | None = None
         self._context: str | None = None
         self._context_sink = context_sink
 
     @property
-    def frame(self) -> ConsciousnessFrameV2 | None:
+    def frame(self) -> ConsciousnessFrameV3 | None:
         return self._frame
 
     def read_context(self) -> str | None:
@@ -72,15 +72,13 @@ class AtomicProjectionCache:
         if value is not None and type(value) is not str:
             raise TypeError("ephemeral context must be an exact str or None")
         self._context = (
-            None
-            if not value
-            else _truncate_utf8(value, MAX_EPHEMERAL_CONTEXT_BYTES)
+            None if not value else _truncate_utf8(value, MAX_EPHEMERAL_CONTEXT_BYTES)
         )
         self._publish_context_sink()
 
-    def publish_frame(self, frame: ConsciousnessFrameV2) -> None:
-        if type(frame) is not ConsciousnessFrameV2:
-            raise TypeError("frame must be an exact ConsciousnessFrameV2")
+    def publish_frame(self, frame: ConsciousnessFrameV3) -> None:
+        if type(frame) is not ConsciousnessFrameV3:
+            raise TypeError("frame must be an exact ConsciousnessFrameV3")
         context = self._compact_context(frame)
         # Publish the derived string first and frame second.  Hook readers only
         # consume the string; diagnostic readers that see the new frame also see
@@ -108,7 +106,7 @@ class AtomicProjectionCache:
             return
 
     @staticmethod
-    def _compact_context(frame: ConsciousnessFrameV2) -> str | None:
+    def _compact_context(frame: ConsciousnessFrameV3) -> str | None:
         body = {
             "alice_brain": {
                 "schema_version": frame.schema_version,
@@ -123,6 +121,8 @@ class AtomicProjectionCache:
                 "rd": thaw_json(frame.rd),
                 "a": thaw_json(frame.a),
                 "semantic_context": thaw_json(frame.semantic_context),
+                "aggregate_semantic_complete": frame.aggregate_semantic_complete,
+                "semantic_evidence": frame.semantic_evidence.model_dump(mode="json"),
                 "unresolved_evidence": frame.unresolved_evidence,
                 "capabilities": thaw_json(frame.capabilities),
                 "omission_counts": thaw_json(frame.omission_counts),
@@ -145,6 +145,8 @@ class AtomicProjectionCache:
                 "through_capture_seq": frame.through_capture_seq,
                 "trace_complete": frame.trace_complete,
                 "runtime_health": frame.runtime_health,
+                "aggregate_semantic_complete": frame.aggregate_semantic_complete,
+                "semantic_evidence": frame.semantic_evidence.model_dump(mode="json"),
                 "unresolved_evidence": frame.unresolved_evidence,
                 "capabilities": {
                     "chunk_capture": (

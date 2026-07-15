@@ -30,11 +30,11 @@ from alice_brain_hermes.protocol.models import (
     MAX_BRIDGE_STRING_BYTES,
     MIN_BRIDGE_INTEGER,
     BrainProfileV1,
-    BridgeCommitAckV1,
+    BridgeCommitAckV2,
     BridgeGapV1,
     BridgeRecordV1,
     BridgeStreamState,
-    ConsciousnessFrameV2,
+    ConsciousnessFrameV3,
     HermesObservationV1,
     validate_observation,
 )
@@ -518,7 +518,7 @@ class HookBridge:
         self._binding: str | None = None
         self._brain_id: str | None = None
         self._brain_state_sequence_floor = 0
-        self._last_ack: BridgeCommitAckV1 | None = None
+        self._last_ack: BridgeCommitAckV2 | None = None
         self._attached_next_capture_seq: int | None = None
         self._retained_attempted = False
         self._exact_retry_pending = False
@@ -589,7 +589,7 @@ class HookBridge:
         return self._retained
 
     @property
-    def last_ack(self) -> BridgeCommitAckV1 | None:
+    def last_ack(self) -> BridgeCommitAckV2 | None:
         return self._last_ack
 
     @property
@@ -1091,7 +1091,7 @@ class HookBridge:
 
     def _validate_connected_frame(
         self,
-        frame: ConsciousnessFrameV2,
+        frame: ConsciousnessFrameV3,
         *,
         brain_id: str,
         expected_through_capture_seq: int | None = None,
@@ -1203,7 +1203,7 @@ class HookBridge:
                     "brain.attach cursor does not match local committed history"
                 )
             frame_result = client.call("state.get", {"binding": binding})
-            frame = ConsciousnessFrameV2.model_validate(frame_result, strict=True)
+            frame = ConsciousnessFrameV3.model_validate(frame_result, strict=True)
             self._validate_connected_frame(
                 frame,
                 brain_id=brain_id,
@@ -1269,15 +1269,25 @@ class HookBridge:
                 "bridge.commit",
                 {"binding": binding, "record": record.model_dump(mode="json")},
             )
-            ack = BridgeCommitAckV1.model_validate(result, strict=True)
+            if (
+                type(result) is not dict
+                or type(result.get("derived_event_ids")) is not list
+            ):
+                raise DaemonClientError(
+                    "bridge acknowledgement is not an exact JSON object"
+                )
+            ack_values = dict(result)
+            ack_values["derived_event_ids"] = tuple(result["derived_event_ids"])
+            ack = BridgeCommitAckV2.model_validate(ack_values, strict=True)
             if (
                 ack.duplicate is not False
                 or ack.record_fingerprint != record.fingerprint()
                 or ack.through_capture_seq != record.last_capture_seq
                 or ack.frame.through_capture_seq != record.last_capture_seq
                 or ack.frame.brain_id != self._brain_id
-                or ack.event_sequence != ack.frame.state_sequence
-                or ack.frame.freshness.projected_at_state_sequence != ack.event_sequence
+                or ack.last_event_sequence != ack.frame.state_sequence
+                or ack.frame.freshness.projected_at_state_sequence
+                != ack.last_event_sequence
                 or ack.frame.freshness.stream_connection != "connected"
                 or ack.frame.freshness.scheduler_sample != "not_sampled"
             ):
@@ -1356,7 +1366,7 @@ class HookBridge:
             return False
         try:
             result = client.call("state.get", {"binding": binding})
-            frame = ConsciousnessFrameV2.model_validate(result, strict=True)
+            frame = ConsciousnessFrameV3.model_validate(result, strict=True)
             self._validate_connected_frame(frame, brain_id=brain_id)
             self.projections.publish_frame(frame)
             self._brain_state_sequence_floor = max(
@@ -1481,7 +1491,7 @@ class HookBridge:
         self,
         connection: str,
         *,
-        frame: ConsciousnessFrameV2 | None = None,
+        frame: ConsciousnessFrameV3 | None = None,
         error: str | None = None,
     ) -> None:
         try:
