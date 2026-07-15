@@ -212,8 +212,20 @@ class IdentityNamingWorker:
 
     @property
     def worker_started(self) -> bool:
+        return self._worker_alive_strict()
+
+    def _worker_alive_strict(self) -> bool:
+        """Probe the exact owned thread without converting an ambiguous result."""
+
         with self._lifecycle_lock:
             return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def terminal_intent_pending(self) -> bool:
+        """Report whether the exact RAM terminal operation still needs an ACK."""
+
+        with self._iteration_lock:
+            return self._terminal_intent is not None
 
     @property
     def last_internal_error_type(self) -> str | None:

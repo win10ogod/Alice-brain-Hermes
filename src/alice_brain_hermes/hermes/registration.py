@@ -290,6 +290,9 @@ class _BootstrapCaptureBuffer:
         self._stop_event = threading.Event()
         self._stop_requested = False
         self._host_context: Any | None = None
+        self._host_access: _HermesHostAccess | None = None
+        self._host_profile_factory: Any | None = None
+        self._host_llm_factory: Any | None = None
         self._identity_worker: Any | None = None
         self._start_worker_on_capture = start_worker_on_capture
         self._health = _BootstrapHealth()
@@ -362,6 +365,10 @@ class _BootstrapCaptureBuffer:
         """Retain the opaque context without reading any lazy host property."""
 
         with self._worker_lock:
+            if self._host_context is not context:
+                self._host_access = None
+                self._host_profile_factory = None
+                self._host_llm_factory = None
             self._host_context = context
 
     def host_context_for_worker(self) -> Any:
@@ -378,6 +385,25 @@ class _BootstrapCaptureBuffer:
         with self._worker_lock:
             return self._host_context
 
+    def host_factories_for_worker(self) -> tuple[Any, Any, Any] | None:
+        """Return one process-owned access object and its exact bound factories."""
+
+        with self._worker_lock:
+            context = self._host_context
+            if context is None:
+                return None
+            access = self._host_access
+            if access is None:
+                access = _HermesHostAccess(context)
+                self._host_access = access
+                self._host_profile_factory = access.brain_profile
+                self._host_llm_factory = access.llm
+            profile_factory = self._host_profile_factory
+            llm_factory = self._host_llm_factory
+            if not callable(profile_factory) or not callable(llm_factory):
+                raise RuntimeError("Hermes host factories are unavailable")
+            return access, profile_factory, llm_factory
+
     @property
     def identity_worker_for_test(self) -> Any | None:
         return self.identity_worker_for_worker()
@@ -393,20 +419,67 @@ class _BootstrapCaptureBuffer:
                 raise RuntimeError("bootstrap identity worker ownership changed")
             self._identity_worker = worker
 
-    def _stop_identity_worker(self, worker: Any | None = None) -> None:
+    def _stop_identity_worker(
+        self,
+        worker: Any | None = None,
+        *,
+        release: bool = True,
+    ) -> None:
         with self._worker_lock:
             owned = self._identity_worker
         if owned is None:
             return
         if worker is not None and owned is not worker:
             raise RuntimeError("bootstrap identity worker identity changed")
-        stop = getattr(owned, "stop_for_test", None)
-        if not callable(stop):
-            raise RuntimeError("identity worker has no bounded stop operation")
-        stop()
+        try:
+            stop = getattr(owned, "stop_for_test", None)
+            if not callable(stop):
+                raise RuntimeError("identity worker has no bounded stop operation")
+            stop()
+            strict_probe = getattr(owned, "_worker_alive_strict", None)
+            if not callable(strict_probe):
+                raise RuntimeError("identity worker has no strict liveness probe")
+            try:
+                alive = strict_probe()
+            except BaseException as error:
+                raise RuntimeError("identity worker liveness is unknown") from error
+            if type(alive) is not bool:
+                raise RuntimeError("identity worker liveness is invalid")
+            if alive:
+                raise RuntimeError("identity worker did not stop")
+            if not release:
+                return
+            try:
+                terminal_intent_pending = owned.terminal_intent_pending
+            except BaseException as error:
+                raise RuntimeError(
+                    "identity worker terminal intent state is unknown"
+                ) from error
+            if type(terminal_intent_pending) is not bool:
+                raise RuntimeError("identity worker terminal intent state is invalid")
+            if terminal_intent_pending:
+                raise RuntimeError("identity worker terminal intent remains pending")
+        except BaseException as error:
+            self.mark_worker_degraded(error.__cause__ or error)
+            raise
         with self._worker_lock:
             if self._identity_worker is owned:
                 self._identity_worker = None
+
+    def _stop_owned_children(self) -> None:
+        errors: list[BaseException] = []
+        for cleanup in (self._stop_identity_worker, self._stop_transport_bridge):
+            try:
+                cleanup()
+            except BaseException as error:
+                errors.append(error)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup(
+                "bootstrap child cleanup failed",
+                errors,
+            )
 
     def capture(self, hook: str, kwargs: dict[str, Any]) -> None:
         with self._capture_lock:
@@ -1034,7 +1107,7 @@ class _BootstrapCaptureBuffer:
                         )
                 except BaseException as error:
                     self.mark_worker_degraded(error)
-            self._stop_transport_bridge()
+            self._stop_owned_children()
 
     def pending_for_test(self) -> tuple[_BootstrapCapture, ...]:
         with self._capture_lock, self._queue.mutex:
@@ -1134,40 +1207,84 @@ def _bootstrap_worker_entry(buffer: _BootstrapCaptureBuffer) -> None:
     try:
         _bootstrap_worker_main(buffer)
     finally:
-        for cleanup_name in ("_stop_identity_worker", "_stop_transport_bridge"):
-            cleanup = getattr(buffer, cleanup_name, None)
+        identity_cleanup = getattr(buffer, "_stop_identity_worker", None)
+        transport_cleanup = getattr(buffer, "_stop_transport_bridge", None)
+        cleanups = (
+            (
+                identity_cleanup,
+                {"release": False},
+            ),
+            (transport_cleanup, {}),
+        )
+        for cleanup, kwargs in cleanups:
             if not callable(cleanup):
                 continue
             try:
-                cleanup()
+                cleanup(**kwargs)
             except BaseException as error:
-                buffer.mark_worker_degraded(error)
+                buffer.mark_worker_degraded(error.__cause__ or error)
         buffer._publish_worker_exit(worker)
 
 
 def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
-    from alice_brain_hermes.hermes.bridge import HookBridge, default_runtime_home
-
-    bridge: Any | None = getattr(buffer, "_transport_bridge", None)
-    runtime_home = getattr(bridge, "runtime_home", None)
-    if runtime_home is None:
-        runtime_home = default_runtime_home()
-    host_access: _HermesHostAccess | None = None
+    bridge: Any | None = None
+    runtime_home: Any = None
+    hook_bridge_factory: Any = None
     shared_profile_factory: Any | None = None
-    bound_host_context = getattr(buffer, "bound_host_context_for_worker", None)
-    if callable(bound_host_context):
-        context = bound_host_context()
-        if context is not None:
-            host_access = _HermesHostAccess(context)
-            shared_profile_factory = host_access.brain_profile
-    identity_owner = getattr(buffer, "identity_worker_for_worker", None)
-    identity_configured = callable(identity_owner) and identity_owner() is not None
+    shared_llm_factory: Any | None = None
+    identity_configured = False
     identity_retry_after = 0.0
+    prelude_ready = False
     while True:
         try:
             stop_probe = getattr(buffer, "worker_stop_requested", None)
             if stop_probe is not None and stop_probe():
                 return
+            if not prelude_ready:
+                from alice_brain_hermes.hermes.bridge import (
+                    HookBridge,
+                    default_runtime_home,
+                )
+
+                adopted_bridge = getattr(buffer, "_transport_bridge", None)
+                candidate_runtime_home = getattr(
+                    adopted_bridge,
+                    "runtime_home",
+                    None,
+                )
+                if candidate_runtime_home is None:
+                    candidate_runtime_home = default_runtime_home()
+                host_factories = None
+                host_factory_access = getattr(
+                    buffer,
+                    "host_factories_for_worker",
+                    None,
+                )
+                if callable(host_factory_access):
+                    host_factories = host_factory_access()
+                candidate_profile_factory = None
+                candidate_llm_factory = None
+                if host_factories is not None:
+                    (
+                        _host_access,
+                        candidate_profile_factory,
+                        candidate_llm_factory,
+                    ) = host_factories
+                identity_owner = getattr(
+                    buffer,
+                    "identity_worker_for_worker",
+                    None,
+                )
+                candidate_identity_configured = (
+                    callable(identity_owner) and identity_owner() is not None
+                )
+                bridge = adopted_bridge
+                runtime_home = candidate_runtime_home
+                hook_bridge_factory = HookBridge
+                shared_profile_factory = candidate_profile_factory
+                shared_llm_factory = candidate_llm_factory
+                identity_configured = candidate_identity_configured
+                prelude_ready = True
             terminal = False
             if bridge is None:
                 candidate: Any | None = None
@@ -1178,7 +1295,10 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                     }
                     if shared_profile_factory is not None:
                         bridge_arguments["profile_factory"] = shared_profile_factory
-                    candidate = HookBridge(runtime_home, **bridge_arguments)
+                    candidate = hook_bridge_factory(
+                        runtime_home,
+                        **bridge_arguments,
+                    )
                     adopt = getattr(buffer, "_adopt_transport_bridge", None)
                     if adopt is not None:
                         adopt(candidate)
@@ -1217,7 +1337,7 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                         continue
             current_time = time.monotonic()
             if (
-                host_access is not None
+                shared_llm_factory is not None
                 and not identity_configured
                 and current_time >= identity_retry_after
             ):
@@ -1226,7 +1346,7 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                         buffer,
                         runtime_home=runtime_home,
                         profile_factory=shared_profile_factory,
-                        llm_factory=host_access.llm,
+                        llm_factory=shared_llm_factory,
                     )
                 except BaseException as error:
                     buffer.mark_worker_degraded(error)
