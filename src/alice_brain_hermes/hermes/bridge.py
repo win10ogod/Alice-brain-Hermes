@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ValidationError
 
@@ -52,6 +52,7 @@ MAX_COPY_CONTAINER_ITEMS = 64
 _TOKEN = re.compile(r"^[0-9a-f]{64}$")
 
 ClientFactory = Callable[..., Any]
+_BootstrapCaptureDisposition = Literal["accepted", "late_after_close"]
 
 
 @dataclass(slots=True)
@@ -78,6 +79,7 @@ class _BootstrapReservationReceipt:
     detached_kwargs: Mapping[str, object] | None
     gap_cause_counts: tuple[tuple[str, int], ...] | None
     copy_stats: tuple[tuple[str, int], ...]
+    disposition: _BootstrapCaptureDisposition
 
     def matches(self, other: _BootstrapReservationReceipt) -> bool:
         return (
@@ -616,6 +618,10 @@ class HookBridge:
     def close_requested(self) -> bool:
         return self._close_requested
 
+    @property
+    def close_sealed(self) -> bool:
+        return self._close_sealed
+
     def capture(self, hook: str, kwargs: dict[str, Any]) -> None:
         """Reserve one sequence, detach a bounded copy, and never raise."""
 
@@ -713,7 +719,7 @@ class HookBridge:
         last_capture_seq: int,
         gap_cause_counts: Mapping[str, int] | None,
         copy_stats: Mapping[str, int],
-    ) -> None:
+    ) -> _BootstrapCaptureDisposition:
         """Accept one exact bootstrap reservation without renumbering it."""
 
         for name, value in (
@@ -786,6 +792,7 @@ class HookBridge:
             detached_kwargs=detached_kwargs,
             gap_cause_counts=canonical_gap_causes,
             copy_stats=canonical_copy_stats,
+            disposition="accepted",
         )
 
         with self._capture_lock:
@@ -798,7 +805,7 @@ class HookBridge:
                     and self._next_capture_seq == previous.last_capture_seq + 1
                 ):
                     if previous.matches(receipt):
-                        return
+                        return previous.disposition
                     raise ValueError("bootstrap reservation changed after acceptance")
                 raise ValueError("bootstrap capture sequence is not contiguous")
             if self._close_sealed:
@@ -816,10 +823,19 @@ class HookBridge:
                         last_error="capture_after_close_seal",
                     )
                     next_capture_seq = last_capture_seq + 1
+                    terminal_receipt = _BootstrapReservationReceipt(
+                        first_capture_seq=receipt.first_capture_seq,
+                        last_capture_seq=receipt.last_capture_seq,
+                        hook=receipt.hook,
+                        detached_kwargs=receipt.detached_kwargs,
+                        gap_cause_counts=receipt.gap_cause_counts,
+                        copy_stats=receipt.copy_stats,
+                        disposition="late_after_close",
+                    )
                     self._health = updated_health
                     self._next_capture_seq = next_capture_seq
-                    self._last_bootstrap_reservation = receipt
-                return
+                    self._last_bootstrap_reservation = terminal_receipt
+                return "late_after_close"
             next_capture_seq = last_capture_seq + 1
             with self._health_lock:
                 if gap_cause_counts is not None:
@@ -858,6 +874,7 @@ class HookBridge:
                 self._ever_had_capture = True
                 self._last_bootstrap_reservation = receipt
         self._notify_worker()
+        return "accepted"
 
     def _publish_observation_or_gap_locked(
         self,

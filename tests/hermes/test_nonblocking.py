@@ -293,6 +293,29 @@ def test_capture_reserved_exact_handoff_retry_is_idempotent(
         bridge.capture_reserved(**conflicting)  # type: ignore[arg-type]
 
 
+def test_terminal_capture_duplicate_returns_same_late_disposition(
+    tmp_path: Path,
+) -> None:
+    bridge = HookBridge(tmp_path, start_worker_on_capture=False)
+    assert bridge._seal_close_if_ready() is True  # type: ignore[attr-defined]
+    bridge.stop_worker_for_test()
+    reservation = _bootstrap_observation_reservation()
+
+    first = bridge.capture_reserved(**reservation)  # type: ignore[arg-type]
+    duplicate = bridge.capture_reserved(**reservation)  # type: ignore[arg-type]
+
+    assert first == "late_after_close"
+    assert duplicate == "late_after_close"
+    assert bridge._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert bridge.health.late_after_close == 1
+    assert bridge.health.dropped_events == 1
+    assert bridge.health.trace_complete is False
+    assert bridge.queue.empty()
+    assert bridge.pending_gaps() == ()
+    assert bridge.last_ack is None
+    assert bridge.worker_started is False
+
+
 def test_worker_start_health_allocation_failure_does_not_publish_a_thread(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

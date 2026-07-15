@@ -59,6 +59,7 @@ class _BootstrapHealth:
     dropped_events: int = 0
     pending_records: int = 0
     pending_gap_ranges: int = 0
+    late_after_close: int = 0
     worker_started: bool = False
     degraded: bool = False
     last_error: str | None = None
@@ -296,6 +297,7 @@ class _BootstrapCaptureBuffer:
                 dropped_events=dropped_events,
                 pending_records=health.pending_records,
                 pending_gap_ranges=pending_gap_ranges,
+                late_after_close=health.late_after_close,
                 worker_started=worker_started,
                 degraded=(
                     health.degraded
@@ -714,6 +716,34 @@ class _BootstrapCaptureBuffer:
             self._health = updated_health
             self._health_reconciliation_required = False
 
+    def mark_late_after_close(self, capture: _BootstrapCapture) -> None:
+        with self._capture_lock:
+            if self._worker_retained is not capture:
+                raise RuntimeError("bootstrap terminal disposition identity changed")
+            terminal_dropped_events = (
+                self._handed_off_dropped_events + capture.capture_count
+            )
+            pending_gap_ranges, pending_dropped_events = (
+                self._pending_gap_metrics_locked(exclude=capture)
+            )
+            updated_health = replace(
+                self._health,
+                trace_complete=False,
+                dropped_events=terminal_dropped_events + pending_dropped_events,
+                pending_records=self._health.pending_records - capture.capture_count,
+                pending_gap_ranges=pending_gap_ranges,
+                late_after_close=(
+                    self._health.late_after_close + capture.capture_count
+                ),
+                degraded=True,
+                last_error="capture_after_close_seal",
+                worker_error=None,
+            )
+            self._handed_off_dropped_events = terminal_dropped_events
+            self._worker_retained = None
+            self._health = updated_health
+            self._health_reconciliation_required = False
+
     def mark_worker_degraded(self, error: BaseException) -> None:
         try:
             error_name = type(error).__name__[:160]
@@ -960,6 +990,7 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
             stop_probe = getattr(buffer, "worker_stop_requested", None)
             if stop_probe is not None and stop_probe():
                 return
+            terminal = False
             if bridge is None:
                 candidate: Any | None = None
                 try:
@@ -996,22 +1027,26 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                     buffer.mark_worker_degraded(error)
                     buffer.wait(0.1)
                     continue
-            elif not bridge.worker_started:
-                try:
-                    bridge.start_worker()
-                    if not bridge.worker_started:
-                        raise RuntimeError("Hermes bridge worker did not restart")
-                except BaseException as error:
-                    buffer.mark_worker_degraded(error)
-                    buffer.wait(0.1)
-                    continue
+            else:
+                terminal = getattr(bridge, "close_sealed", False)
+                if type(terminal) is not bool:
+                    raise RuntimeError("Hermes bridge terminal state is invalid")
+                if not terminal and not bridge.worker_started:
+                    try:
+                        bridge.start_worker()
+                        if not bridge.worker_started:
+                            raise RuntimeError("Hermes bridge worker did not restart")
+                    except BaseException as error:
+                        buffer.mark_worker_degraded(error)
+                        buffer.wait(0.1)
+                        continue
             capture = buffer.next_for_worker()
             if capture is None:
                 buffer.publish_context(bridge.projections.read_context())
                 buffer.wait(0.05)
                 continue
             try:
-                bridge.capture_reserved(
+                disposition = bridge.capture_reserved(
                     hook=capture.hook,
                     detached_kwargs=capture.detached_kwargs,
                     first_capture_seq=capture.capture_seq,
@@ -1024,7 +1059,12 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                 buffer.wait(0.1)
                 continue
             try:
-                buffer.mark_handed_off(capture)
+                if disposition == "late_after_close":
+                    buffer.mark_late_after_close(capture)
+                elif disposition == "accepted":
+                    buffer.mark_handed_off(capture)
+                else:
+                    raise RuntimeError("Hermes bridge disposition is invalid")
             except BaseException as error:
                 buffer.mark_worker_degraded(error)
                 buffer.wait(0.1)

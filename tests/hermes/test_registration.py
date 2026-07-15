@@ -1515,11 +1515,12 @@ def test_bootstrap_worker_retries_baseexception_and_handoff_without_sleep(
             return None
 
         @staticmethod
-        def capture_reserved(**_kwargs: object) -> None:
+        def capture_reserved(**_kwargs: object) -> str:
             nonlocal capture_calls
             capture_calls += 1
             if capture_calls == 1:
                 raise KeyboardInterrupt("capture interrupted")
+            return "accepted"
 
     class FakeCapture:
         hook = "on_session_start"
@@ -1989,9 +1990,10 @@ def test_bootstrap_worker_survives_wait_memoryerror_and_hands_off_exact_capture(
             return self.alive
 
         @staticmethod
-        def capture_reserved(**reservation: object) -> None:
+        def capture_reserved(**reservation: object) -> str:
             captures.append(reservation)
             handed_off.set()
+            return "accepted"
 
     class OneShotWaitFailure:
         def __init__(self, delegate: threading.Event) -> None:
@@ -2072,9 +2074,10 @@ def test_bootstrap_worker_survives_persistent_stop_probe_hands_off_once_and_stop
             self.alive = True
 
         @staticmethod
-        def capture_reserved(**reservation: object) -> None:
+        def capture_reserved(**reservation: object) -> str:
             captures.append(reservation)
             handed_off.set()
+            return "accepted"
 
         def stop_worker_for_test(self) -> None:
             self.alive = False
@@ -2229,9 +2232,10 @@ def test_bootstrap_test_stop_can_restart_and_handoff_exact_capture(
             self.alive = True
 
         @staticmethod
-        def capture_reserved(**reservation: object) -> None:
+        def capture_reserved(**reservation: object) -> str:
             captures.append(reservation)
             handed_off.set()
+            return "accepted"
 
         def stop_worker_for_test(self) -> None:
             self.alive = False
@@ -2583,10 +2587,13 @@ def test_bootstrap_stop_owns_child_bridge_and_restart_never_accumulates_workers(
             if self.worker_started:
                 child_started.set()
 
-        def capture_reserved(self, **reservation: object) -> None:
-            super().capture_reserved(**reservation)  # type: ignore[arg-type]
+        def capture_reserved(self, **reservation: object) -> str:
+            disposition = super().capture_reserved(
+                **reservation,  # type: ignore[arg-type]
+            )
             reservations.append(reservation)
             handed_off.set()
+            return disposition
 
     bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
         queue_capacity=4,
@@ -2768,10 +2775,11 @@ def test_bootstrap_restarts_dead_child_without_duplicate_handoff(
             else:
                 child_restarted.set()
 
-        def capture_reserved(self, **reservation: object) -> None:
+        def capture_reserved(self, **reservation: object) -> str:
             reservations.append(reservation)
             self.alive = False
             capture_accepted.set()
+            return "accepted"
 
         def stop_worker_for_test(self) -> None:
             self.alive = False
@@ -2807,6 +2815,306 @@ def test_bootstrap_restarts_dead_child_without_duplicate_handoff(
     assert bootstrap._next_capture_seq == 2  # type: ignore[attr-defined]
     assert bootstrap.pending_for_test() == ()
     assert bootstrap._transport_bridge is None  # type: ignore[attr-defined]
+
+
+def _new_clean_sealed_child(tmp_path: Path) -> tuple[Any, list[str]]:
+    from alice_brain_hermes.hermes.bridge import HookBridge
+
+    transport_attempts: list[str] = []
+
+    def unexpected_connect(*_args: object, **_kwargs: object) -> None:
+        transport_attempts.append("connect")
+        raise AssertionError("terminal child attempted to reconnect")
+
+    child = HookBridge(
+        tmp_path,
+        client_factory=unexpected_connect,
+        start_worker_on_capture=False,
+    )
+    assert child._seal_close_if_ready() is True  # type: ignore[attr-defined]
+    child.stop_worker_for_test()
+    return child, transport_attempts
+
+
+def _wait_for_bootstrap_pending_to_clear(buffer: Any) -> None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if buffer.pending_for_test() == ():
+            return
+        time.sleep(0.005)
+    raise AssertionError("terminal bootstrap reservation remained pending")
+
+
+def test_bootstrap_terminal_observation_is_accounted_without_handoff_or_ack(
+    tmp_path: Path,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    child, transport_attempts = _new_clean_sealed_child(tmp_path)
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    bootstrap.capture(
+        "on_session_start",
+        {
+            "telemetry_schema_version": "hermes.observer.v1",
+            "session_id": "late",
+        },
+    )
+    start_calls = 0
+    normal_handoffs = 0
+
+    def unexpected_start() -> None:
+        nonlocal start_calls
+        start_calls += 1
+        raise AssertionError("terminal child attempted to restart")
+
+    def unexpected_handoff(_capture: object) -> None:
+        nonlocal normal_handoffs
+        normal_handoffs += 1
+        raise AssertionError("terminal reservation used normal handoff")
+
+    child.start_worker = unexpected_start
+    bootstrap.mark_handed_off = unexpected_handoff  # type: ignore[method-assign]
+    bootstrap._transport_bridge = child  # type: ignore[attr-defined]
+
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+    try:
+        _wait_for_bootstrap_pending_to_clear(bootstrap)
+    finally:
+        bootstrap.stop_worker_for_test()
+
+    assert start_calls == 0
+    assert normal_handoffs == 0
+    assert transport_attempts == []
+    assert child._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert child.health.late_after_close == 1
+    assert child.health.dropped_events == 1
+    assert child.health.trace_complete is False
+    assert child.last_ack is None
+    assert child.queue.empty()
+    assert child.pending_gaps() == ()
+    assert bootstrap._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert bootstrap.health.pending_records == 0
+    assert bootstrap.health.pending_gap_ranges == 0
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.late_after_close == 1
+    assert bootstrap.health.trace_complete is False
+
+
+def test_bootstrap_terminal_retry_is_idempotent_after_publication_failure(
+    tmp_path: Path,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    child, transport_attempts = _new_clean_sealed_child(tmp_path)
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    bootstrap.capture(
+        "on_session_start",
+        {
+            "telemetry_schema_version": "hermes.observer.v1",
+            "session_id": "late-retry",
+        },
+    )
+    dispositions: list[object] = []
+    mark_calls = 0
+    normal_handoffs = 0
+    original_capture = child.capture_reserved
+    original_mark = bootstrap.mark_late_after_close  # type: ignore[attr-defined]
+
+    def tracked_capture(**reservation: object) -> object:
+        disposition = original_capture(**reservation)
+        dispositions.append(disposition)
+        return disposition
+
+    def fail_first_terminal_publication(capture: object) -> None:
+        nonlocal mark_calls
+        mark_calls += 1
+        if mark_calls == 1:
+            raise MemoryError("terminal publication failed")
+        original_mark(capture)
+
+    def unexpected_handoff(_capture: object) -> None:
+        nonlocal normal_handoffs
+        normal_handoffs += 1
+        raise AssertionError("terminal retry used normal handoff")
+
+    child.capture_reserved = tracked_capture
+    bootstrap.mark_late_after_close = fail_first_terminal_publication  # type: ignore[attr-defined,method-assign]
+    bootstrap.mark_handed_off = unexpected_handoff  # type: ignore[method-assign]
+    bootstrap._transport_bridge = child  # type: ignore[attr-defined]
+
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+    try:
+        _wait_for_bootstrap_pending_to_clear(bootstrap)
+    finally:
+        bootstrap.stop_worker_for_test()
+
+    assert dispositions == ["late_after_close", "late_after_close"]
+    assert mark_calls == 2
+    assert normal_handoffs == 0
+    assert transport_attempts == []
+    assert child._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert child.health.late_after_close == 1
+    assert child.health.dropped_events == 1
+    assert child.last_ack is None
+    assert bootstrap.health.pending_records == 0
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.late_after_close == 1
+
+
+def test_bootstrap_accepted_duplicate_hands_off_after_child_seals() -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    bootstrap.capture(
+        "on_session_start",
+        {
+            "telemetry_schema_version": "hermes.observer.v1",
+            "session_id": "accepted-before-seal",
+        },
+    )
+    capture_calls = 0
+    mark_calls = 0
+    late_calls = 0
+    restart_calls = 0
+    handed_off = threading.Event()
+
+    class FakeProjections:
+        @staticmethod
+        def read_context() -> None:
+            return None
+
+    class ReceiptBoundBridge:
+        projections = FakeProjections()
+
+        def __init__(self) -> None:
+            self.close_sealed = False
+            self.alive = True
+            self.receipt: dict[str, object] | None = None
+
+        @property
+        def worker_started(self) -> bool:
+            return self.alive
+
+        def start_worker(self) -> None:
+            nonlocal restart_calls
+            restart_calls += 1
+            if self.close_sealed:
+                raise AssertionError("clean-sealed child attempted to restart")
+            self.alive = True
+
+        def capture_reserved(self, **reservation: object) -> str:
+            nonlocal capture_calls
+            capture_calls += 1
+            if self.receipt is None:
+                self.receipt = dict(reservation)
+            else:
+                assert reservation == self.receipt
+            return "accepted"
+
+        def seal_cleanly(self) -> None:
+            assert self.receipt is not None
+            self.close_sealed = True
+            self.alive = False
+
+        def stop_worker_for_test(self) -> None:
+            self.alive = False
+
+        def _worker_alive_strict(self) -> bool:
+            return self.alive
+
+    child = ReceiptBoundBridge()
+    original_mark = bootstrap.mark_handed_off
+
+    def fail_first_publication(capture: object) -> None:
+        nonlocal mark_calls
+        mark_calls += 1
+        if mark_calls == 1:
+            child.seal_cleanly()
+            raise MemoryError("handoff publication failed after acceptance")
+        original_mark(capture)  # type: ignore[arg-type]
+        handed_off.set()
+
+    def unexpected_terminal_publication(_capture: object) -> None:
+        nonlocal late_calls
+        late_calls += 1
+        raise AssertionError("accepted receipt was reclassified after clean seal")
+
+    bootstrap.mark_handed_off = fail_first_publication  # type: ignore[method-assign]
+    bootstrap.mark_late_after_close = unexpected_terminal_publication  # type: ignore[attr-defined,method-assign]
+    bootstrap._transport_bridge = child  # type: ignore[attr-defined]
+
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+    try:
+        assert handed_off.wait(2)
+    finally:
+        bootstrap.stop_worker_for_test()
+
+    assert capture_calls == 2
+    assert mark_calls == 2
+    assert late_calls == 0
+    assert restart_calls == 0
+    assert bootstrap.pending_for_test() == ()
+    assert bootstrap.health.pending_records == 0
+    assert bootstrap.health.dropped_events == 0
+    assert bootstrap.health.late_after_close == 0
+
+
+def test_bootstrap_terminal_gap_moves_drop_without_double_counting(
+    tmp_path: Path,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    child, transport_attempts = _new_clean_sealed_child(tmp_path)
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        queue_capacity=4,
+        start_worker_on_capture=False,
+    )
+    bootstrap.capture(
+        "on_session_start",
+        {
+            "telemetry_schema_version": "invalid",
+            "session_id": "late-gap",
+        },
+    )
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.pending_gap_ranges == 1
+    normal_handoffs = 0
+
+    def unexpected_handoff(_capture: object) -> None:
+        nonlocal normal_handoffs
+        normal_handoffs += 1
+        raise AssertionError("terminal gap used normal handoff")
+
+    bootstrap.mark_handed_off = unexpected_handoff  # type: ignore[method-assign]
+    bootstrap._transport_bridge = child  # type: ignore[attr-defined]
+
+    bootstrap._start_worker()  # type: ignore[attr-defined]
+    try:
+        _wait_for_bootstrap_pending_to_clear(bootstrap)
+    finally:
+        bootstrap.stop_worker_for_test()
+
+    assert normal_handoffs == 0
+    assert transport_attempts == []
+    assert child._next_capture_seq == 2  # type: ignore[attr-defined]
+    assert child.health.late_after_close == 1
+    assert child.health.dropped_events == 1
+    assert child.pending_gaps() == ()
+    assert child.last_ack is None
+    assert bootstrap.health.pending_records == 0
+    assert bootstrap.health.pending_gap_ranges == 0
+    assert bootstrap.health.dropped_events == 1
+    assert bootstrap.health.late_after_close == 1
+    assert bootstrap.health.trace_complete is False
 
 
 def test_bootstrap_copy_cost_is_bounded_for_hostile_nested_values(
