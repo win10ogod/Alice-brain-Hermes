@@ -38,7 +38,7 @@ Ask a fresh agent, without loading a Skill, for one concise sequence that starts
 Run:
 
 ```bash
-python /home/win10/.codex/skills/.system/skill-creator/scripts/init_skill.py \
+python3 /home/win10/.codex/skills/.system/skill-creator/scripts/init_skill.py \
   operating-alice-brain-hermes \
   --path .agents/skills \
   --interface 'display_name=Operate Alice-brain-Hermes' \
@@ -87,7 +87,7 @@ For a complete trace, begin at cursor `0`; while the result reports more events,
 Run:
 
 ```bash
-python /home/win10/.codex/skills/.system/skill-creator/scripts/quick_validate.py .agents/skills/operating-alice-brain-hermes
+python3 /home/win10/.codex/skills/.system/skill-creator/scripts/quick_validate.py .agents/skills/operating-alice-brain-hermes
 find .agents/skills/operating-alice-brain-hermes -type f -print | sort
 wc -w .agents/skills/operating-alice-brain-hermes/SKILL.md
 rg -n 'TO[D]O|TB[D]|consciousness theory|personality|trust|policy|release workflow' .agents/skills/operating-alice-brain-hermes || true
