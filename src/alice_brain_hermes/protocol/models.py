@@ -1050,20 +1050,18 @@ class LoopbackEndpointV1(_StrictModel):
     port: int = Field(ge=1, le=65_535)
 
 
-class DaemonDiscoveryV1(_StrictModel):
-    schema_version: Literal[1] = 1
+class DaemonDiscoveryV2(_StrictModel):
+    schema_version: Literal[2] = 2
     pid: int = Field(ge=1)
     process_marker: str = Field(
-        min_length=43,
-        max_length=128,
-        pattern=(
-            r"^linux:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
-            r"[0-9a-f]{4}-[0-9a-f]{12}:[1-9][0-9]{0,31}$"
-        ),
+        min_length=24,
+        max_length=64,
+        pattern=r"^psutil-create-time-us:[1-9][0-9]{0,31}$",
     )
     instance_nonce: str = Field(
         min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"
     )
+    launch_nonce: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     endpoint: LoopbackEndpointV1
     protocol_version: Literal[PROTOCOL_VERSION] = PROTOCOL_VERSION
     package_version: str = Field(default="0.1.0", min_length=1, max_length=64)
@@ -1072,7 +1070,7 @@ class DaemonDiscoveryV1(_StrictModel):
     )
 
     @model_validator(mode="after")
-    def _credential_matches_nonce(self) -> DaemonDiscoveryV1:
+    def _credential_matches_nonce(self) -> DaemonDiscoveryV2:
         if self.credential_ref != f"credential-{self.instance_nonce}.key":
             raise ValueError("credential reference must be nonce-specific")
         return self
@@ -1225,7 +1223,7 @@ __all__ = [
     "ConsciousnessFrameV2",
     "ConsciousnessFrameV3",
     "CoverageV1",
-    "DaemonDiscoveryV1",
+    "DaemonDiscoveryV2",
     "FrameFreshnessV1",
     "FrameSemanticEvidenceV1",
     "HermesHook",

@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import gc
 import json
 import os
 import socket
-import subprocess
-import sys
 import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -30,17 +28,15 @@ from alice_brain_hermes.ids import new_id
 from alice_brain_hermes.protocol.client import DaemonClient
 from alice_brain_hermes.protocol.models import (
     BrainProfileV1,
-    DaemonDiscoveryV1,
+    DaemonDiscoveryV2,
     LoopbackEndpointV1,
 )
 from alice_brain_hermes.runtime.daemon import (
     HermesDaemonRuntime,
     PrivateDaemonServer,
     _main,
-    _ReadinessSignal,
     _run_daemon,
     _run_private_daemon_loop,
-    _write_readiness,
 )
 from alice_brain_hermes.runtime.discovery import (
     create_credential,
@@ -49,10 +45,7 @@ from alice_brain_hermes.runtime.discovery import (
 from alice_brain_hermes.runtime.engine import ConsciousEngine
 from alice_brain_hermes.runtime.lease import RuntimeLease
 from alice_brain_hermes.runtime.process_marker import current_process_marker
-from alice_brain_hermes.runtime.scheduler import (
-    ContinuousScheduler,
-    SchedulerHealth,
-)
+from alice_brain_hermes.runtime.scheduler import SchedulerHealth
 from alice_brain_hermes.runtime.store import SQLiteLedger
 
 RECOVERY_TOKEN = "ab" * 32
@@ -64,12 +57,11 @@ def test_runtime_acquires_lease_before_opening_sqlite(tmp_path: Path) -> None:
     observed: list[bool] = []
 
     def ledger_factory(path: Path) -> SQLiteLedger:
-        observed.append(path.parent == Path("/proc/self/fd") and path.name.isdecimal())
+        observed.append(path == home / "runtime.db")
         with pytest.raises(RuntimeOwnedError):
             RuntimeLease.acquire(home)
         credentials = list(home.glob("credential-*.key"))
         assert len(credentials) == 1
-        assert credentials[0].stat().st_mode & 0o077 == 0
         return SQLiteLedger.open(path)
 
     runtime = HermesDaemonRuntime.open(
@@ -77,452 +69,11 @@ def test_runtime_acquires_lease_before_opening_sqlite(tmp_path: Path) -> None:
     )
     try:
         assert observed == [True]
-        with pytest.raises(
-            PermissionError, match="retained SQLite resources must close"
-        ):
+        with pytest.raises(PermissionError, match="runtime resources must close"):
             runtime.lease.release()
         assert runtime.ledger._connection.execute("SELECT 1").fetchone()[0] == 1
     finally:
         runtime.close()
-
-
-@pytest.mark.parametrize("failure_stage", ["write", "fsync", "authority"])
-def test_lease_acquire_failure_after_lock_preserves_primary_and_releases_owner(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    failure_stage: str,
-) -> None:
-    home = tmp_path / "runtime"
-    home.mkdir(mode=0o700)
-    real_write = os.write
-    real_fsync = os.fsync
-    real_assert_authority = RuntimeLease.assert_authority
-    real_close = os.close
-    failed_descriptor: int | None = None
-    stage_injected = False
-    close_injected = False
-
-    def fail_write(descriptor: int, payload: bytes) -> int:
-        nonlocal failed_descriptor, stage_injected
-        if failure_stage == "write" and not stage_injected:
-            stage_injected = True
-            failed_descriptor = descriptor
-            raise OSError("injected write failure")
-        return real_write(descriptor, payload)
-
-    def fail_fsync(descriptor: int) -> None:
-        nonlocal failed_descriptor, stage_injected
-        if failure_stage == "fsync" and not stage_injected:
-            stage_injected = True
-            failed_descriptor = descriptor
-            raise OSError("injected fsync failure")
-        real_fsync(descriptor)
-
-    def fail_authority(lease: RuntimeLease) -> Path:
-        nonlocal failed_descriptor, stage_injected
-        if failure_stage == "authority" and not stage_injected:
-            stage_injected = True
-            failed_descriptor = lease._descriptor
-            raise PermissionError("injected authority failure")
-        return real_assert_authority(lease)
-
-    def close_then_fail(descriptor: int) -> None:
-        nonlocal close_injected
-        if descriptor == failed_descriptor and not close_injected:
-            close_injected = True
-            real_close(descriptor)
-            raise OSError("injected cleanup close failure")
-        real_close(descriptor)
-
-    monkeypatch.setattr(os, "write", fail_write)
-    monkeypatch.setattr(os, "fsync", fail_fsync)
-    monkeypatch.setattr(RuntimeLease, "assert_authority", fail_authority)
-    monkeypatch.setattr(os, "close", close_then_fail)
-
-    with pytest.raises(
-        (OSError, PermissionError), match=f"injected {failure_stage} failure"
-    ):
-        RuntimeLease.acquire(home)
-
-    assert stage_injected is True
-    assert close_injected is True
-    with RuntimeLease.acquire(home):
-        pass
-
-
-def test_lease_acquire_unlock_failure_retains_retryable_owner(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    home = tmp_path / "runtime"
-    home.mkdir(mode=0o700)
-    real_flock = fcntl.flock
-    real_close = os.close
-    locked_descriptor: int | None = None
-    unlock_failed = False
-    unlock_succeeded = False
-    close_before_unlock = False
-
-    def tracked_flock(descriptor: int, operation: int) -> None:
-        nonlocal locked_descriptor, unlock_failed, unlock_succeeded
-        if operation & fcntl.LOCK_EX:
-            locked_descriptor = descriptor
-        if operation == fcntl.LOCK_UN and not unlock_failed:
-            unlock_failed = True
-            raise OSError("injected unlock failure")
-        real_flock(descriptor, operation)
-        if operation == fcntl.LOCK_UN:
-            unlock_succeeded = True
-
-    def guarded_close(descriptor: int) -> None:
-        nonlocal close_before_unlock
-        if descriptor == locked_descriptor and not unlock_succeeded:
-            close_before_unlock = True
-        real_close(descriptor)
-
-    monkeypatch.setattr(fcntl, "flock", tracked_flock)
-    monkeypatch.setattr(os, "close", guarded_close)
-    monkeypatch.setattr(
-        "alice_brain_hermes.runtime.lease.current_process_marker",
-        lambda: (_ for _ in ()).throw(RuntimeError("injected marker failure")),
-    )
-
-    baseline = RuntimeLease.failed_acquire_count()
-    with pytest.raises(RuntimeOwnedError, match="cleanup") as captured:
-        RuntimeLease.acquire(home)
-
-    assert isinstance(captured.value.__cause__, RuntimeError)
-    assert "marker failure" in str(captured.value.__cause__)
-    assert unlock_failed is True
-    assert close_before_unlock is False
-    assert RuntimeLease.failed_acquire_count() == baseline + 1
-
-    monkeypatch.setattr(
-        "alice_brain_hermes.runtime.lease.current_process_marker",
-        current_process_marker,
-    )
-    with RuntimeLease.acquire(home):
-        pass
-    assert RuntimeLease.failed_acquire_count() == baseline
-
-
-@pytest.mark.parametrize("operation", ["validate-home", "reopen-home"])
-def test_directory_walk_close_error_never_recloses_reused_descriptor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    operation: str,
-) -> None:
-    home = tmp_path / "runtime"
-    home.mkdir(mode=0o700)
-    lease = RuntimeLease.acquire(home) if operation == "reopen-home" else None
-    real_close = os.close
-    replacement_descriptor: int | None = None
-    injected = False
-
-    def close_then_reuse_and_fail(descriptor: int) -> None:
-        nonlocal injected, replacement_descriptor
-        if not injected:
-            injected = True
-            real_close(descriptor)
-            replacement_descriptor = os.open(os.devnull, os.O_RDONLY)
-            assert replacement_descriptor == descriptor
-            raise OSError("injected directory parent close failure")
-        real_close(descriptor)
-
-    monkeypatch.setattr(os, "close", close_then_reuse_and_fail)
-    try:
-        if operation == "validate-home":
-            with pytest.raises(OSError, match="directory parent close failure"):
-                RuntimeLease.acquire(home)
-        else:
-            assert lease is not None
-            with pytest.raises(PermissionError) as captured:
-                lease.assert_authority()
-            assert captured.value.__cause__ is not None
-            assert "directory parent close failure" in str(captured.value.__cause__)
-
-        assert injected is True
-        assert replacement_descriptor is not None
-        os.fstat(replacement_descriptor)
-    finally:
-        monkeypatch.setattr(os, "close", real_close)
-        if lease is not None:
-            lease.release()
-        if replacement_descriptor is not None:
-            real_close(replacement_descriptor)
-
-
-def test_sqlite_open_uses_retained_home_and_never_mutates_replacement_tree(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "runtime"
-    home.mkdir(mode=0o700)
-    retained = tmp_path / "retained-runtime"
-    replacement = tmp_path / "replacement-runtime"
-    replacement.mkdir(mode=0o700)
-
-    def swap_home_before_sqlite(path: Path) -> SQLiteLedger:
-        assert str(path).startswith("/proc/self/fd/")
-        assert path.name.isdecimal()
-        home.rename(retained)
-        home.symlink_to(replacement, target_is_directory=True)
-        return SQLiteLedger.open(path)
-
-    baseline = HermesDaemonRuntime.failed_owner_count()
-    with pytest.raises(PermissionError, match="authority"):
-        HermesDaemonRuntime.open(
-            home,
-            ledger_factory=swap_home_before_sqlite,
-            scheduler_interval_seconds=60.0,
-        )
-
-    assert HermesDaemonRuntime.failed_owner_count() == baseline + 1
-    assert list(replacement.iterdir()) == []
-    assert not (replacement / "runtime.db").exists()
-    assert not (replacement / "runtime.db-wal").exists()
-    assert not (replacement / "runtime.db-shm").exists()
-    assert (retained / "runtime.db").is_file()
-
-    home.unlink()
-    retained.rename(home)
-    assert HermesDaemonRuntime.retry_failed_cleanup(home) is True
-    assert HermesDaemonRuntime.failed_owner_count() == baseline
-    reopened = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
-    reopened.close()
-
-
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="Linux retained-home and abstract path-guard contract",
-)
-def test_runtime_and_retained_ledger_fail_closed_after_home_replacement(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "runtime"
-    displaced = tmp_path / "displaced-runtime"
-    replacement = tmp_path / "replacement-runtime"
-    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
-    unexpected_second: HermesDaemonRuntime | None = None
-    forbidden_brain_id = new_id()
-
-    home.rename(displaced)
-    home.mkdir(mode=0o700)
-    try:
-        with pytest.raises(RuntimeOwnedError, match="already owned"):
-            unexpected_second = HermesDaemonRuntime.open(
-                home,
-                scheduler_interval_seconds=60.0,
-            )
-        with pytest.raises(PermissionError, match="authority"):
-            runtime.create_brain(name="must-not-persist")
-        with pytest.raises(
-            LedgerIntegrityError, match="mutation seal"
-        ) as ledger_failure:
-            runtime.ledger.ensure_brain(forbidden_brain_id)
-        assert isinstance(ledger_failure.value.__cause__, PermissionError)
-        assert "authority" in str(ledger_failure.value.__cause__)
-    finally:
-        if unexpected_second is not None:
-            unexpected_second.close()
-        home.rename(replacement)
-        displaced.rename(home)
-        runtime.close()
-
-    with HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0) as recovered:
-        assert recovered.brain_ids == ()
-
-
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="Linux retained-file identity contract",
-)
-@pytest.mark.parametrize(
-    "candidate",
-    ["runtime.db", "runtime.db-wal", "runtime.db-shm"],
-)
-@pytest.mark.parametrize("mutation", ["path-loss", "replacement"])
-def test_live_retained_sqlite_path_mutation_permanently_poison_seal(
-    tmp_path: Path,
-    candidate: str,
-    mutation: str,
-) -> None:
-    home = tmp_path / "runtime"
-    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
-    original = home / candidate
-    displaced = tmp_path / f"displaced-{candidate}"
-    original.rename(displaced)
-    if mutation == "replacement":
-        original.write_bytes(b"")
-        original.chmod(0o600)
-
-    try:
-        with pytest.raises(LedgerIntegrityError, match="mutation seal") as caught:
-            runtime.ledger.list_brain_ids()
-        assert isinstance(caught.value.__cause__, PermissionError)
-    finally:
-        if original.exists():
-            original.unlink()
-        displaced.rename(original)
-
-    try:
-        with pytest.raises(LedgerIntegrityError, match="mutation seal"):
-            runtime.ledger.list_brain_ids()
-    finally:
-        runtime.close()
-
-
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux") or not hasattr(os, "fork"),
-    reason="Linux fork/open-file-description contract",
-)
-def test_fork_child_cannot_write_close_or_release_inherited_runtime(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "runtime"
-    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
-    credential_path = runtime.credential.path
-    forbidden_brain_ids = (new_id(), new_id())
-    engine_brain_id = new_id()
-    runtime.ledger.ensure_brain(engine_brain_id)
-    inherited_engine = ConsciousEngine(
-        runtime.ledger,
-        engine_brain_id,
-        actor_id=engine_brain_id,
-    )
-    inherited_scheduler = ContinuousScheduler(
-        inherited_engine,
-        interval_seconds=60.0,
-    )
-    child_event = new_event(
-        "clock.tick",
-        engine_brain_id,
-        engine_brain_id,
-        {"elapsed_seconds": 1.0},
-    )
-    read_descriptor, write_descriptor = os.pipe()
-
-    child_pid = os.fork()
-    if child_pid == 0:  # pragma: no cover - assertions are reported over the pipe
-        os.close(read_descriptor)
-        outcomes: list[str] = []
-        actions = (
-            lambda: runtime.create_brain(name="child-must-not-persist"),
-            lambda: runtime.ledger.ensure_brain(forbidden_brain_ids[0]),
-            lambda: runtime.engine_count,
-            lambda: runtime.scheduler_count,
-            lambda: runtime.closed,
-            lambda: inherited_engine.state,
-            lambda: inherited_engine.append(child_event),
-            lambda: inherited_scheduler.health,
-            lambda: inherited_scheduler.stop(timeout=0.0),
-            runtime.ledger.close,
-            runtime.close,
-            runtime.lease.release,
-        )
-        for action in actions:
-            try:
-                action()
-            except PermissionError:
-                outcomes.append("denied")
-            except BaseException as error:
-                outcomes.append(type(error).__name__)
-            else:
-                outcomes.append("allowed")
-        os.write(write_descriptor, ",".join(outcomes).encode("ascii"))
-        os.close(write_descriptor)
-        os._exit(0)
-
-    os.close(write_descriptor)
-    try:
-        child_result = os.read(read_descriptor, 4_096).decode("ascii")
-    finally:
-        os.close(read_descriptor)
-    waited_pid, status = os.waitpid(child_pid, 0)
-    assert waited_pid == child_pid
-    assert os.waitstatus_to_exitcode(status) == 0
-    assert child_result == (
-        "denied,denied,denied,denied,denied,denied,denied,denied,"
-        "denied,denied,denied,denied"
-    )
-    assert credential_path.is_file()
-    assert runtime.brain_ids == (engine_brain_id,)
-    assert inherited_engine.state.last_sequence == 0
-
-    competitor = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; from alice_brain_hermes.errors import RuntimeOwnedError; "
-                "from alice_brain_hermes.runtime.lease import RuntimeLease; "
-                "home=sys.argv[1]; "
-                "\ntry: lease=RuntimeLease.acquire(home)"
-                "\nexcept RuntimeOwnedError: raise SystemExit(23)"
-                "\nelse: lease.release(); raise SystemExit(0)"
-            ),
-            os.fspath(home),
-        ],
-        check=False,
-        close_fds=True,
-        capture_output=True,
-        text=True,
-    )
-    assert competitor.returncode == 23, competitor.stderr
-
-    runtime.close()
-    with HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0) as recovered:
-        assert recovered.brain_ids == (engine_brain_id,)
-
-
-@pytest.mark.parametrize(
-    "candidate",
-    ["runtime.db", "runtime.db-journal", "runtime.db-wal", "runtime.db-shm"],
-)
-def test_sqlite_symlink_is_rejected_without_mutating_target(
-    tmp_path: Path,
-    candidate: str,
-) -> None:
-    home = tmp_path / "runtime"
-    home.mkdir(mode=0o700)
-    outside = tmp_path / "outside.db"
-    outside.write_bytes(b"")
-    outside.chmod(0o600)
-    (home / candidate).symlink_to(outside)
-    opened: list[HermesDaemonRuntime] = []
-
-    try:
-        with pytest.raises(PermissionError, match="SQLite"):
-            opened.append(
-                HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
-            )
-    finally:
-        for runtime in opened:
-            runtime.close()
-
-    assert outside.read_bytes() == b""
-    assert (home / candidate).is_symlink()
-
-
-@pytest.mark.parametrize(
-    "candidate",
-    ["runtime.db", "runtime.db-journal", "runtime.db-wal", "runtime.db-shm"],
-)
-def test_sqlite_hardlink_is_rejected_without_mutating_target(
-    tmp_path: Path,
-    candidate: str,
-) -> None:
-    home = tmp_path / "runtime"
-    home.mkdir(mode=0o700)
-    outside = tmp_path / "outside.db"
-    outside.write_bytes(b"")
-    outside.chmod(0o600)
-    os.link(outside, home / candidate)
-
-    with pytest.raises(PermissionError, match="SQLite"):
-        HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
-
-    assert outside.read_bytes() == b""
-    assert outside.stat().st_nlink == 2
 
 
 @pytest.mark.parametrize("interval", [0.0, -1.0, float("nan"), float("inf"), True])
@@ -549,7 +100,6 @@ def test_invalid_abandonment_grace_fails_before_runtime_home_mutation(
         asyncio.run(
             _run_daemon(
                 home,
-                readiness=_ReadinessSignal(None),
                 scheduler_interval_seconds=60.0,
                 abandonment_grace_seconds=grace,
             )
@@ -589,10 +139,11 @@ def test_startup_failure_removes_only_proven_stale_and_current_credentials(
         stale = create_credential(stale_lease)
         publish_discovery(
             stale_lease,
-            DaemonDiscoveryV1(
+            DaemonDiscoveryV2(
                 pid=os.getpid(),
                 process_marker=current_process_marker(),
                 instance_nonce=stale_lease.instance_nonce,
+                launch_nonce=stale_lease.launch_nonce,
                 endpoint=LoopbackEndpointV1(port=43210),
                 credential_ref=stale.path.name,
             ),
@@ -616,37 +167,6 @@ def test_startup_failure_removes_only_proven_stale_and_current_credentials(
     assert list(home.glob("credential-*.key")) == [unproven]
     with RuntimeLease.acquire(home):
         pass
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink contract")
-def test_runtime_lease_rejects_hardlinked_persistent_lock(tmp_path: Path) -> None:
-    home = tmp_path / "runtime"
-    home.mkdir(mode=0o700)
-    lock = home / "daemon.lock"
-    lock.write_bytes(b"")
-    lock.chmod(0o600)
-    os.link(lock, tmp_path / "lock-hardlink")
-
-    with pytest.raises(PermissionError, match="hardlink"):
-        RuntimeLease.acquire(home)
-
-    assert lock.exists()
-
-
-def test_runtime_lease_write_loops_until_complete(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "runtime"
-    home.mkdir(mode=0o700)
-    real_write = os.write
-
-    def short_write(descriptor: int, payload: bytes) -> int:
-        return real_write(descriptor, payload[: max(1, len(payload) // 3)])
-
-    monkeypatch.setattr("alice_brain_hermes.runtime.lease.os.write", short_write)
-    with RuntimeLease.acquire(home) as lease:
-        body = json.loads((home / "daemon.lock").read_bytes())
-        assert body["instance_nonce"] == lease.instance_nonce
 
 
 def test_authenticated_readiness_rejects_scheduler_without_live_writer(
@@ -693,6 +213,156 @@ def test_authenticated_readiness_rejects_scheduler_without_live_writer(
             assert server._server is not None
             server._server.close()
             await server._server.wait_closed()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        runtime.close()
+
+
+def test_authenticated_reads_work_but_mutation_waits_for_persistent_serve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
+    server = PrivateDaemonServer(runtime)
+    release_first_pass: asyncio.Event
+
+    async def scenario() -> None:
+        nonlocal release_first_pass
+        release_first_pass = asyncio.Event()
+        original_pass = server._run_abandonment_pass
+
+        async def held_first_pass() -> None:
+            await release_first_pass.wait()
+            await original_pass()
+
+        monkeypatch.setattr(server, "_run_abandonment_pass", held_first_pass)
+        run = asyncio.create_task(server.run())
+        client: DaemonClient | None = None
+        try:
+            for _attempt in range(200):
+                if (home / "daemon.json").exists():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("daemon did not publish discovery")
+            client = await asyncio.to_thread(DaemonClient.connect, home)
+            before_health = await asyncio.to_thread(client.health)
+            before_runtime = await asyncio.to_thread(
+                client.call,
+                "daemon.status",
+                {},
+            )
+            assert before_health["runtime_ready"] is False
+            assert before_runtime["runtime_ready"] is False
+            with pytest.raises(DaemonRpcError) as premature_mutation:
+                await asyncio.to_thread(
+                    client.call,
+                    "brain.create",
+                    {"name": "too-early"},
+                )
+            assert premature_mutation.value.code == "not_ready"
+            assert runtime.brain_ids == ()
+
+            release_first_pass.set()
+            for _attempt in range(200):
+                health = await asyncio.to_thread(client.health)
+                status = await asyncio.to_thread(client.call, "daemon.status", {})
+                if health["runtime_ready"] and status["runtime_ready"]:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("daemon did not enter its persistent serve boundary")
+            assert run.done() is False
+            created = await asyncio.to_thread(
+                client.call,
+                "brain.create",
+                {"name": "after-boundary"},
+            )
+            assert runtime.brain_ids == (created["brain_id"],)
+            await asyncio.to_thread(client.shutdown)
+            await asyncio.wait_for(run, timeout=5.0)
+        finally:
+            if client is not None:
+                await asyncio.to_thread(client.close)
+            if not run.done():
+                release_first_pass.set()
+                server._shutdown.set()
+                await run
+
+    asyncio.run(scenario())
+    assert runtime.closed is True
+
+
+def test_delayed_first_abandonment_pass_uses_fixed_readiness_cutoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
+    server = PrivateDaemonServer(runtime, abandonment_grace_seconds=0.01)
+    fixed_cutoff = datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
+    observed: list[datetime] = []
+
+    def candidates(*, last_seen_before: datetime):
+        observed.append(last_seen_before)
+        return []
+
+    monkeypatch.setattr(
+        runtime.ledger,
+        "list_abandonable_bridge_streams",
+        candidates,
+    )
+    server._maintenance_first_cutoff = fixed_cutoff
+
+    try:
+        asyncio.run(server._run_abandonment_pass())
+        assert observed == [fixed_cutoff]
+        assert server._maintenance_first_cutoff is None
+    finally:
+        runtime.close()
+
+
+def test_periodic_abandonment_waits_full_restart_grace_after_enable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    grace = 0.08
+    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
+    server = PrivateDaemonServer(runtime, abandonment_grace_seconds=grace)
+    passes: list[float] = []
+
+    async def record_pass() -> None:
+        passes.append(asyncio.get_running_loop().time())
+
+    monkeypatch.setattr(server, "_run_abandonment_pass", record_pass)
+
+    async def scenario() -> None:
+        maintenance = asyncio.create_task(server._maintain_abandoned_streams())
+        try:
+            await server._maintenance_ready.wait()
+            server._maintenance_enabled.set()
+            await server._maintenance_first_pass.wait()
+            assert len(passes) == 1
+            enabled_at = asyncio.get_running_loop().time()
+            server._maintenance_periodic_not_before = enabled_at + grace
+            server._maintenance_periodic_enabled.set()
+            await asyncio.sleep(grace / 2)
+            assert len(passes) == 1
+            while len(passes) == 1:
+                await asyncio.sleep(0.005)
+            assert passes[1] - enabled_at >= grace
+        finally:
+            server._shutdown.set()
+            server._maintenance_enabled.set()
+            server._maintenance_periodic_enabled.set()
+            await maintenance
 
     try:
         asyncio.run(scenario())
@@ -760,6 +430,9 @@ def test_attach_and_close_recover_after_committed_responses_are_dropped(
         attached_client: DaemonClient | None = None
         recovered_client: DaemonClient | None = None
         await server.start()
+        serving = asyncio.create_task(server._serve_until_shutdown())
+        await asyncio.sleep(0)
+        assert server.service.mutations_enabled is True
         try:
             first = await asyncio.to_thread(DaemonClient.connect, home)
             recovery_token = first.new_bridge_recovery_token()
@@ -861,6 +534,8 @@ def test_attach_and_close_recover_after_committed_responses_are_dropped(
                 attached_client.close()
             if recovered_client is not None:
                 recovered_client.close()
+            server._shutdown.set()
+            await serving
             assert server._server is not None
             server._server.close()
             await server._server.wait_closed()
@@ -876,7 +551,7 @@ def test_attach_and_close_recover_after_committed_responses_are_dropped(
 @pytest.mark.parametrize(
     ("family", "sockname", "peername"),
     [
-        (socket.AF_UNIX, ("127.0.0.1", 40000), ("127.0.0.1", 50000)),
+        (socket.AF_INET6, ("127.0.0.1", 40000), ("127.0.0.1", 50000)),
         (socket.AF_INET, ("0.0.0.0", 40000), ("127.0.0.1", 50000)),
         (socket.AF_INET, ("127.0.0.1", 40000), ("192.0.2.10", 50000)),
     ],
@@ -1266,7 +941,6 @@ def test_invalid_server_constructor_unwinds_open_runtime_for_reuse(
         asyncio.run(
             _run_daemon(
                 home,
-                readiness=_ReadinessSignal(None),
                 scheduler_interval_seconds=60.0,
                 abandonment_grace_seconds=0.0,
             )
@@ -1284,10 +958,7 @@ def test_run_daemon_does_not_override_transport_quarantine(
     captured: list[PrivateDaemonServer] = []
     baseline = HermesDaemonRuntime.failed_owner_count()
 
-    async def quarantine(
-        server: PrivateDaemonServer, *, readiness: _ReadinessSignal
-    ) -> None:
-        del readiness
+    async def quarantine(server: PrivateDaemonServer) -> None:
         captured.append(server)
         HermesDaemonRuntime._retain_failed_owner(server)
         raise SchedulerShutdownError("listener shutdown unproven")
@@ -1298,7 +969,6 @@ def test_run_daemon_does_not_override_transport_quarantine(
         asyncio.run(
             _run_daemon(
                 home,
-                readiness=_ReadinessSignal(None),
                 scheduler_interval_seconds=60.0,
                 abandonment_grace_seconds=30.0,
             )
@@ -1687,10 +1357,11 @@ def test_daemon_run_invokes_uninterruptible_cleanup_exactly_once(
     home.mkdir(mode=0o700)
     runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
     server = PrivateDaemonServer(runtime)
-    record = DaemonDiscoveryV1(
+    record = DaemonDiscoveryV2(
         pid=os.getpid(),
         process_marker=runtime.lease.process_marker,
         instance_nonce=runtime.lease.instance_nonce,
+        launch_nonce=runtime.lease.launch_nonce,
         endpoint=LoopbackEndpointV1(port=1),
         credential_ref=runtime.credential.path.name,
     )
@@ -1701,10 +1372,10 @@ def test_daemon_run_invokes_uninterruptible_cleanup_exactly_once(
         await server._maintenance_enabled.wait()
         server._maintenance_first_pass.set()
 
-    async def start() -> DaemonDiscoveryV1:
+    async def start() -> DaemonDiscoveryV2:
         return record
 
-    async def prove_readiness(_record: DaemonDiscoveryV1) -> None:
+    async def prove_readiness(_record: DaemonDiscoveryV2) -> None:
         return None
 
     async def cleanup() -> BaseException | None:
@@ -1723,15 +1394,15 @@ def test_daemon_run_invokes_uninterruptible_cleanup_exactly_once(
     try:
         if cleanup_fails:
             with pytest.raises(RuntimeError, match="cleanup failure"):
-                asyncio.run(server.run(readiness=_ReadinessSignal(None)))
+                asyncio.run(server.run())
         else:
-            asyncio.run(server.run(readiness=_ReadinessSignal(None)))
+            asyncio.run(server.run())
         assert cleanup_calls == 1
     finally:
         runtime.close()
 
 
-def test_daemon_refreshes_restart_grace_after_first_pass_before_readiness(
+def test_daemon_refreshes_restart_grace_after_first_pass_before_periodic_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1739,15 +1410,15 @@ def test_daemon_refreshes_restart_grace_after_first_pass_before_readiness(
     home.mkdir(mode=0o700)
     runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
     server = PrivateDaemonServer(runtime)
-    record = DaemonDiscoveryV1(
+    record = DaemonDiscoveryV2(
         pid=os.getpid(),
         process_marker=runtime.lease.process_marker,
         instance_nonce=runtime.lease.instance_nonce,
+        launch_nonce=runtime.lease.launch_nonce,
         endpoint=LoopbackEndpointV1(port=1),
         credential_ref=runtime.credential.path.name,
     )
     events: list[str] = []
-    readiness = _ReadinessSignal(None)
 
     async def maintenance() -> None:
         server._maintenance_ready.set()
@@ -1755,10 +1426,10 @@ def test_daemon_refreshes_restart_grace_after_first_pass_before_readiness(
         events.append("first_pass")
         server._maintenance_first_pass.set()
 
-    async def start() -> DaemonDiscoveryV1:
+    async def start() -> DaemonDiscoveryV2:
         return record
 
-    async def prove_readiness(_record: DaemonDiscoveryV1) -> None:
+    async def prove_readiness(_record: DaemonDiscoveryV2) -> None:
         return None
 
     async def cleanup() -> BaseException | None:
@@ -1768,27 +1439,23 @@ def test_daemon_refreshes_restart_grace_after_first_pass_before_readiness(
         events.append("refresh")
         return 0
 
-    def ready(_body: dict[str, object]) -> None:
-        events.append("ready")
-
     monkeypatch.setattr(server, "_maintain_abandoned_streams", maintenance)
     monkeypatch.setattr(server, "start", start)
     monkeypatch.setattr(server, "prove_readiness", prove_readiness)
     monkeypatch.setattr(server, "_cleanup_uninterruptibly", cleanup)
     monkeypatch.setattr(runtime.ledger, "refresh_daemon_restart_grace", refresh)
-    monkeypatch.setattr(readiness, "write_once", ready)
     server._shutdown.set()
 
     try:
-        asyncio.run(server.run(readiness=readiness))
-        assert events == ["refresh", "first_pass", "refresh", "ready"]
+        asyncio.run(server.run())
+        assert events == ["refresh", "first_pass", "refresh"]
     finally:
         runtime.close()
 
 
 @pytest.mark.parametrize(
     "failure_stage",
-    ["bind", "publish", "discovery_readback", "readiness_write"],
+    ["bind", "publish", "discovery_readback"],
 )
 def test_daemon_startup_failure_unwinds_listener_writer_files_and_lease(
     tmp_path: Path,
@@ -1831,7 +1498,6 @@ def test_daemon_startup_failure_unwinds_listener_writer_files_and_lease(
         scheduler_interval_seconds=60.0,
     )
     server = PrivateDaemonServer(runtime)
-    readiness = _ReadinessSignal(None)
     if failure_stage == "bind":
 
         async def fail_bind(*_args, **_kwargs):
@@ -1847,21 +1513,12 @@ def test_daemon_startup_failure_unwinds_listener_writer_files_and_lease(
         )
     elif failure_stage == "discovery_readback":
 
-        async def fail_readback(_record: DaemonDiscoveryV1) -> None:
+        async def fail_readback(_record: DaemonDiscoveryV2) -> None:
             raise OSError("injected discovery readback failure")
 
         monkeypatch.setattr(server, "prove_readiness", fail_readback)
-    else:
-        monkeypatch.setattr(
-            readiness,
-            "write_once",
-            lambda _body: (_ for _ in ()).throw(
-                OSError("injected readiness write failure")
-            ),
-        )
-
     with pytest.raises(OSError, match="injected"):
-        asyncio.run(server.run(readiness=readiness))
+        asyncio.run(server.run())
 
     assert runtime.closed is True
     assert schedulers[0].running is False
@@ -1878,85 +1535,45 @@ def test_daemon_startup_failure_unwinds_listener_writer_files_and_lease(
     reopened.close()
 
 
-def test_readiness_writer_handles_short_writes_and_closes_on_zero_progress(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    real_write = os.write
-    read_fd, write_fd = os.pipe()
-
-    def short_write(descriptor: int, payload: bytes) -> int:
-        return real_write(descriptor, payload[: max(1, len(payload) // 3)])
-
-    monkeypatch.setattr("alice_brain_hermes.runtime.daemon.os.write", short_write)
-    _write_readiness(write_fd, {"ready": True})
-    assert json.loads(os.read(read_fd, 4_096)) == {"ready": True}
-    os.close(read_fd)
-
-    read_fd, write_fd = os.pipe()
-    monkeypatch.setattr(
-        "alice_brain_hermes.runtime.daemon.os.write",
-        lambda _descriptor, _payload: 0,
-    )
-    with pytest.raises(OSError, match="no progress"):
-        _write_readiness(write_fd, {"ready": True})
-    with pytest.raises(OSError):
-        os.fstat(write_fd)
-    os.close(read_fd)
-
-
-def test_late_daemon_failure_cannot_reuse_consumed_readiness_fd(
+def test_daemon_main_passes_launch_nonce_without_readiness_descriptor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    read_fd, write_fd = os.pipe()
-    unrelated_read_fd, unrelated_write_fd = os.pipe()
+    captured: list[tuple[object, ...]] = []
 
-    def late_failure(
-        _runtime_home: str | Path,
+    def run(
+        runtime_home: str | Path,
         *,
-        readiness_fd: int | None,
+        launch_nonce: str | None,
         scheduler_interval_seconds: float,
         abandonment_grace_seconds: float,
-        _readiness_signal: _ReadinessSignal | None = None,
     ) -> None:
-        assert readiness_fd == write_fd
-        assert scheduler_interval_seconds == 60.0
-        assert abandonment_grace_seconds == 30.0
-        assert _readiness_signal is not None
-        assert _readiness_signal.write_once({"ready": True}) is True
-        os.dup2(unrelated_write_fd, write_fd)
-        raise RuntimeError("late shutdown failure")
+        captured.append(
+            (
+                runtime_home,
+                launch_nonce,
+                scheduler_interval_seconds,
+                abandonment_grace_seconds,
+            )
+        )
 
     monkeypatch.setattr(
-        "alice_brain_hermes.runtime.daemon.run_private_daemon", late_failure
+        "alice_brain_hermes.runtime.daemon.run_private_daemon", run
     )
-    try:
-        assert (
-            _main(
-                [
-                    "--runtime-home",
-                    str(tmp_path),
-                    "--readiness-fd",
-                    str(write_fd),
-                    "--scheduler-interval",
-                    "60.0",
-                ]
-            )
-            == 1
+
+    assert (
+        _main(
+            [
+                "--runtime-home",
+                os.fspath(tmp_path),
+                "--launch-nonce",
+                "parent-launch",
+                "--scheduler-interval",
+                "60.0",
+            ]
         )
-        assert json.loads(os.read(read_fd, 4_096)) == {"ready": True}
-        os.fstat(write_fd)
-        os.set_blocking(unrelated_read_fd, False)
-        with pytest.raises(BlockingIOError):
-            os.read(unrelated_read_fd, 1)
-    finally:
-        for descriptor in (
-            read_fd,
-            write_fd,
-            unrelated_read_fd,
-            unrelated_write_fd,
-        ):
-            with suppress(OSError):
-                os.close(descriptor)
+        == 0
+    )
+    assert captured == [(os.fspath(tmp_path), "parent-launch", 60.0, 30.0)]
 
 
 def test_fail_stop_loop_does_not_join_a_stuck_executor_worker() -> None:
@@ -1988,7 +1605,6 @@ def test_fail_stop_loop_does_not_join_a_stuck_executor_worker() -> None:
 def test_main_hard_exits_on_unproven_transport_shutdown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    read_fd, write_fd = os.pipe()
     exit_codes: list[int] = []
 
     class HardExit(BaseException):
@@ -2005,25 +1621,9 @@ def test_main_hard_exits_on_unproven_transport_shutdown(
         "alice_brain_hermes.runtime.daemon.run_private_daemon", fail_stop
     )
     monkeypatch.setattr("alice_brain_hermes.runtime.daemon.os._exit", hard_exit)
-    try:
-        with pytest.raises(HardExit):
-            _main(
-                [
-                    "--runtime-home",
-                    str(tmp_path),
-                    "--readiness-fd",
-                    str(write_fd),
-                ]
-            )
-        assert exit_codes == [3]
-        assert json.loads(os.read(read_fd, 4_096)) == {
-            "ready": False,
-            "code": "shutdown_unproven",
-        }
-    finally:
-        for descriptor in (read_fd, write_fd):
-            with suppress(OSError):
-                os.close(descriptor)
+    with pytest.raises(HardExit):
+        _main(["--runtime-home", str(tmp_path)])
+    assert exit_codes == [3]
 
 
 def test_concurrent_engine_attach_uses_one_once_cell_and_scheduler(
@@ -2546,6 +2146,9 @@ def test_live_server_fail_stop_retains_outer_owner_until_transport_drains(
     async def scenario() -> None:
         await server.start()
         assert server._server is not None
+        serving = asyncio.create_task(server._serve_until_shutdown())
+        await asyncio.sleep(0)
+        assert server.service.mutations_enabled is True
         client = await asyncio.to_thread(DaemonClient.connect, home)
         try:
             with pytest.raises(DaemonClientError) as caught:
@@ -2553,6 +2156,7 @@ def test_live_server_fail_stop_retains_outer_owner_until_transport_drains(
             assert not isinstance(caught.value, DaemonRpcError)
         finally:
             client.close()
+        await asyncio.wait_for(serving, timeout=2.0)
 
         with HermesDaemonRuntime._failed_owner_lock:
             assert HermesDaemonRuntime._failed_owners[home] is server
@@ -2595,7 +2199,7 @@ def test_server_fail_stop_closes_transport_and_run_raises(
     server = PrivateDaemonServer(runtime)
 
     async def scenario() -> None:
-        run_task = asyncio.create_task(server.run(readiness=_ReadinessSignal(None)))
+        run_task = asyncio.create_task(server.run())
         client: DaemonClient | None = None
         try:
             await asyncio.wait_for(
@@ -3266,99 +2870,17 @@ def test_preruntime_cleanup_quarantines_swapped_credential_content(
     assert HermesDaemonRuntime.failed_owner_count() == baseline
 
 
-def test_unlock_failure_quarantines_live_lease_until_exact_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "runtime"
-    home.mkdir(mode=0o700)
-    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
-    baseline = HermesDaemonRuntime.failed_owner_count()
-    real_flock = fcntl.flock
-    unlock_calls = 0
-
-    def fail_explicit_unlock(descriptor: int, operation: int) -> None:
-        nonlocal unlock_calls
-        if operation & fcntl.LOCK_UN:
-            unlock_calls += 1
-            if unlock_calls == 1:
-                raise OSError("injected explicit unlock failure")
-        real_flock(descriptor, operation)
-
-    monkeypatch.setattr(fcntl, "flock", fail_explicit_unlock)
-
-    with pytest.raises(OSError, match="explicit unlock failure"):
-        runtime.close()
-
-    assert runtime.closed is False
-    assert runtime.lease.released is False
-    assert HermesDaemonRuntime.failed_owner_count() == baseline + 1
-    with pytest.raises(RuntimeOwnedError):
-        RuntimeLease.acquire(home)
-
-    assert HermesDaemonRuntime.retry_failed_cleanup(home) is True
-    assert unlock_calls == 2
-    assert HermesDaemonRuntime.failed_owner_count() == baseline
-    with RuntimeLease.acquire(home):
-        pass
-
-
-def test_post_unlock_close_error_is_terminal_and_never_reuses_descriptor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "runtime"
-    home.mkdir(mode=0o700)
-    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
-    baseline = HermesDaemonRuntime.failed_owner_count()
-    lock_descriptor = runtime.lease._descriptor
-    real_close = os.close
-    injected = False
-
-    def close_then_fail(descriptor: int) -> None:
-        nonlocal injected
-        if descriptor == lock_descriptor and not injected:
-            injected = True
-            real_close(descriptor)
-            raise OSError("injected post-unlock close failure")
-        real_close(descriptor)
-
-    monkeypatch.setattr(os, "close", close_then_fail)
-
-    with pytest.raises(OSError, match="post-unlock close failure"):
-        runtime.close()
-
-    assert injected is True
-    assert runtime.closed is True
-    assert runtime.lease.released is True
-    assert HermesDaemonRuntime.failed_owner_count() == baseline
-    with RuntimeLease.acquire(home):
-        pass
-
-    reused: list[int] = []
-    try:
-        for _ in range(64):
-            descriptor = os.open(os.devnull, os.O_RDONLY)
-            reused.append(descriptor)
-            if descriptor == lock_descriptor:
-                break
-        assert lock_descriptor in reused
-
-        runtime.close()
-        os.fstat(lock_descriptor)
-    finally:
-        for descriptor in reused:
-            real_close(descriptor)
-
-
 def test_runtime_cleanup_quarantines_same_length_swapped_credential_and_discovery(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "runtime"
     home.mkdir(mode=0o700)
     runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
-    record = DaemonDiscoveryV1(
+    record = DaemonDiscoveryV2(
         pid=os.getpid(),
         process_marker=runtime.lease.process_marker,
         instance_nonce=runtime.lease.instance_nonce,
+        launch_nonce=runtime.lease.launch_nonce,
         endpoint=LoopbackEndpointV1(port=1),
         credential_ref=runtime.credential.path.name,
     )

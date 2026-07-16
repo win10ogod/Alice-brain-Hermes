@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import math
+import os
 import sqlite3
 import threading
 from collections.abc import Mapping
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 
 from pydantic import TypeAdapter, ValidationError
 
+from alice_brain_hermes import __version__
 from alice_brain_hermes.errors import (
     BridgeAbandonedError,
     BridgeBindingError,
@@ -49,6 +51,9 @@ from alice_brain_hermes.runtime.daemon import HermesDaemonRuntime
 
 _BRIDGE_RECORD_ADAPTER = TypeAdapter(BridgeRecordV1)
 _ALLOWED_REQUEST_KEYS = {"jsonrpc", "id", "method", "params", "auth"}
+_PRE_SERVE_READ_METHODS = frozenset(
+    {"daemon.status", "identity.get", "trace.list", "state.get"}
+)
 
 
 class _DuplicateKey(ValueError):
@@ -181,6 +186,10 @@ class ProtocolService:
 
     def begin_shutdown(self) -> None:
         self._shutting_down = True
+
+    @property
+    def mutations_enabled(self) -> bool:
+        return self.runtime.daemon_serving_active
 
     def authenticated(self, candidate: object) -> bool:
         if (
@@ -473,10 +482,13 @@ class ProtocolConnection:
             self._only(params, set())
             readiness = self.service.runtime.readiness_snapshot()
             return {
+                "pid": os.getpid(),
                 "instance_nonce": self.service.instance_nonce,
+                "launch_nonce": self.service.runtime.lease.launch_nonce,
                 "process_marker": self.service.runtime.lease.process_marker,
                 "shutting_down": self.service.shutting_down,
                 "protocol_version": PROTOCOL_VERSION,
+                "package_version": __version__,
                 **readiness,
             }
         if method == "initialize":
@@ -519,6 +531,8 @@ class ProtocolConnection:
             raise ProtocolFault("not_initialized", "connection must initialize first")
         if self.service.shutting_down:
             raise ProtocolFault("shutting_down", "daemon is shutting down")
+        if not self.service.mutations_enabled and method not in _PRE_SERVE_READ_METHODS:
+            raise ProtocolFault("not_ready", "daemon is not ready for mutation")
         if method == "daemon.status":
             self._only(params, set())
             return self.service.runtime.status_snapshot().model_dump(mode="json")

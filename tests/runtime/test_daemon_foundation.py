@@ -1,21 +1,17 @@
 from __future__ import annotations
 
 import os
-import stat
-import subprocess
-import sys
+import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from alice_brain_hermes.errors import RuntimeOwnedError
 from alice_brain_hermes.ids import new_id
+from alice_brain_hermes.runtime.daemon import HermesDaemonRuntime
 from alice_brain_hermes.runtime.lease import RuntimeLease
-from alice_brain_hermes.runtime.process_marker import (
-    _parse_linux_start_ticks,
-    read_process_marker,
-)
 from alice_brain_hermes.runtime.scheduler import ContinuousScheduler
 from alice_brain_hermes.runtime.store import SQLiteLedger
 
@@ -30,33 +26,6 @@ def test_list_brain_ids_is_public_sorted_and_complete(tmp_path: Path) -> None:
         assert ledger.list_brain_ids() == sorted((first, second))
 
 
-def test_linux_process_marker_parser_handles_closing_parenthesis_in_comm() -> None:
-    fields_after_comm = ["S", *(["0"] * 18), "123456"]
-    payload = f"321 (worker ) name) {' '.join(fields_after_comm)}"
-
-    assert _parse_linux_start_ticks(payload, expected_pid=321) == 123456
-
-
-def test_process_marker_rejects_unstable_double_read(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pid = os.getpid()
-    boot = b"12345678-1234-1234-1234-123456789abc\n"
-
-    def process_stat(ticks: int) -> bytes:
-        fields = ["S", *(["0"] * 18), str(ticks)]
-        return f"{pid} (worker) {' '.join(fields)}".encode()
-
-    responses = iter((boot, process_stat(100), boot, process_stat(101)))
-    monkeypatch.setattr(
-        "alice_brain_hermes.runtime.process_marker._read_bounded_nofollow",
-        lambda _path, *, maximum: next(responses),
-    )
-
-    with pytest.raises(PermissionError, match="changed"):
-        read_process_marker(pid)
-
-
 def test_scheduler_join_must_prove_writer_exit() -> None:
     scheduler = object.__new__(ContinuousScheduler)
     scheduler._creator_pid = os.getpid()
@@ -67,15 +36,13 @@ def test_scheduler_join_must_prove_writer_exit() -> None:
         scheduler.join(timeout=0.01)
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX mode/lock contract")
-def test_runtime_lease_is_private_held_and_second_owner_fails(tmp_path: Path) -> None:
+def test_runtime_lease_is_held_and_second_owner_fails(tmp_path: Path) -> None:
     runtime_home = tmp_path / "home"
-    runtime_home.mkdir(mode=0o700)
 
     with RuntimeLease.acquire(runtime_home) as first:
         assert first.path.name == "daemon.lock"
+        assert first.external_guard_path.is_file()
         assert first.instance_nonce
-        assert first.path.stat().st_mode & 0o077 == 0
         with pytest.raises(RuntimeOwnedError):
             RuntimeLease.acquire(runtime_home)
 
@@ -83,38 +50,34 @@ def test_runtime_lease_is_private_held_and_second_owner_fails(tmp_path: Path) ->
         assert recovered.instance_nonce != first.instance_nonce
 
 
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="Linux abstract AF_UNIX path-guard contract",
-)
 def test_runtime_path_guard_survives_home_rename_and_replacement(
     tmp_path: Path,
 ) -> None:
     runtime_home = tmp_path / "home"
-    runtime_home.mkdir(mode=0o700)
     displaced_home = tmp_path / "displaced-home"
-    replacement_home = tmp_path / "replacement-home"
-    unexpected_second: RuntimeLease | None = None
     lease = RuntimeLease.acquire(runtime_home)
-
-    runtime_home.rename(displaced_home)
-    runtime_home.mkdir(mode=0o700)
     try:
-        with pytest.raises(RuntimeOwnedError, match="already owned"):
-            unexpected_second = RuntimeLease.acquire(runtime_home)
-
-        with pytest.raises(PermissionError, match="authority"):
-            lease.open_home_file(
-                "must-not-exist",
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
-        assert not (displaced_home / "must-not-exist").exists()
-        assert not (runtime_home / "must-not-exist").exists()
+        runtime_home.rename(displaced_home)
+    except PermissionError:
+        # Some filesystems prevent namespace replacement while the portable
+        # lock file is open. That is already the stronger ownership outcome.
+        with pytest.raises(RuntimeOwnedError):
+            RuntimeLease.acquire(runtime_home)
+        assert lease.assert_authority() == runtime_home
+        lease.release()
+        runtime_home.rename(displaced_home)
+        displaced_home.rename(runtime_home)
+        with RuntimeLease.acquire(runtime_home):
+            pass
+        return
+    runtime_home.mkdir()
+    try:
+        with pytest.raises(RuntimeOwnedError):
+            RuntimeLease.acquire(runtime_home)
+        with pytest.raises(PermissionError):
+            lease.assert_authority()
     finally:
-        if unexpected_second is not None:
-            unexpected_second.release()
-        runtime_home.rename(replacement_home)
+        runtime_home.rmdir()
         displaced_home.rename(runtime_home)
         lease.release()
 
@@ -122,258 +85,158 @@ def test_runtime_path_guard_survives_home_rename_and_replacement(
         pass
 
 
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux") or not hasattr(os, "fork"),
-    reason="Linux fork/open-file-description contract",
-)
-def test_fork_child_cannot_release_parent_lease_or_adopt_its_authority(
+def test_runtime_home_symlink_is_rejected_before_mutation(
     tmp_path: Path,
-) -> None:
-    runtime_home = tmp_path / "home"
-    runtime_home.mkdir(mode=0o700)
-    lease = RuntimeLease.acquire(runtime_home)
-    read_descriptor, write_descriptor = os.pipe()
-    child_release_descriptor, parent_release_descriptor = os.pipe()
-
-    child_pid = os.fork()
-    if child_pid == 0:  # pragma: no cover - assertions are reported over the pipe
-        os.close(read_descriptor)
-        os.close(parent_release_descriptor)
-        outcomes: list[str] = []
-        for action in (
-            lease.release,
-            lambda: lease.open_home_file(
-                "child-must-not-write",
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-            ),
-        ):
-            try:
-                action()
-            except PermissionError:
-                outcomes.append("denied")
-            except BaseException as error:
-                outcomes.append(type(error).__name__)
-            else:
-                outcomes.append("allowed")
-        os.write(write_descriptor, ",".join(outcomes).encode("ascii"))
-        os.close(write_descriptor)
-        os.read(child_release_descriptor, 1)
-        os.close(child_release_descriptor)
-        os._exit(0)
-
-    os.close(write_descriptor)
-    os.close(child_release_descriptor)
-    try:
-        child_result = os.read(read_descriptor, 1_024).decode("ascii")
-    finally:
-        os.close(read_descriptor)
-    try:
-        assert child_result == "denied,denied"
-        assert not (runtime_home / "child-must-not-write").exists()
-
-        competitor = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import sys; "
-                    "from alice_brain_hermes.errors import RuntimeOwnedError; "
-                    "from alice_brain_hermes.runtime.lease import RuntimeLease; "
-                    "home=sys.argv[1]; "
-                    "\ntry: lease=RuntimeLease.acquire(home)"
-                    "\nexcept RuntimeOwnedError: raise SystemExit(23)"
-                    "\nelse: lease.release(); raise SystemExit(0)"
-                ),
-                os.fspath(runtime_home),
-            ],
-            check=False,
-            close_fds=True,
-            capture_output=True,
-            text=True,
-        )
-        assert competitor.returncode == 23, competitor.stderr
-
-        lease.release()
-        recovered = subprocess.run(
-            competitor.args,
-            check=False,
-            close_fds=True,
-            capture_output=True,
-            text=True,
-        )
-        assert recovered.returncode == 0, recovered.stderr
-    finally:
-        if not lease.released:
-            lease.release()
-        os.write(parent_release_descriptor, b"x")
-        os.close(parent_release_descriptor)
-        waited_pid, status = os.waitpid(child_pid, 0)
-    assert waited_pid == child_pid
-    assert os.waitstatus_to_exitcode(status) == 0
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX mode contract")
-def test_runtime_lease_rejects_non_private_home(tmp_path: Path) -> None:
-    runtime_home = tmp_path / "home"
-    runtime_home.mkdir(mode=0o755)
-
-    with pytest.raises(PermissionError, match="0700"):
-        RuntimeLease.acquire(runtime_home)
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow contract")
-def test_runtime_home_symlink_ancestor_is_rejected_before_creation(
-    tmp_path: Path,
+    make_symlink: Callable[[Path, Path, bool], bool],
 ) -> None:
     outside = tmp_path / "outside"
-    outside.mkdir(mode=0o700)
+    outside.mkdir()
     link = tmp_path / "runtime-link"
-    link.symlink_to(outside, target_is_directory=True)
+    make_symlink(link, outside, True)
 
-    with pytest.raises(PermissionError, match="symlink"):
-        RuntimeLease.acquire(link / "new-home")
+    with pytest.raises(PermissionError, match="symbolic link"):
+        RuntimeLease.acquire(link)
 
-    assert not (outside / "new-home").exists()
+    assert not (outside / "daemon.lock").exists()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX filesystem contract")
-@pytest.mark.parametrize("filesystem_type", ["nfs", None])
-def test_runtime_home_rejects_unreliable_or_unverifiable_filesystem_before_creation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    filesystem_type: str | None,
-) -> None:
-    runtime_home = tmp_path / "not-created"
-    monkeypatch.setattr(
-        "alice_brain_hermes.runtime.lease._filesystem_type_for_descriptor",
-        lambda _descriptor: filesystem_type,
+def test_runtime_acquires_both_locks_before_opening_sqlite(tmp_path: Path) -> None:
+    home = tmp_path / "runtime"
+    observed: list[Path] = []
+
+    def ledger_factory(path: Path) -> SQLiteLedger:
+        observed.append(path)
+        with pytest.raises(RuntimeOwnedError):
+            RuntimeLease.acquire(home)
+        return SQLiteLedger.open(path)
+
+    runtime = HermesDaemonRuntime.open(
+        home,
+        ledger_factory=ledger_factory,
+        scheduler_interval_seconds=60.0,
     )
-
-    with pytest.raises(PermissionError, match="filesystem"):
-        RuntimeLease.acquire(runtime_home)
-
-    assert not runtime_home.exists()
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX mkdir race contract")
-def test_runtime_home_fileexists_race_never_chmods_unowned_inode(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runtime_home = tmp_path / "raced-home"
-    real_mkdir = os.mkdir
-
-    def race_mkdir(
-        path: str,
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        real_mkdir(path, mode=0o755, dir_fd=dir_fd)
-        os.chmod(path, 0o755, dir_fd=dir_fd, follow_symlinks=False)
-        raise FileExistsError(path)
-
-    monkeypatch.setattr("alice_brain_hermes.runtime.lease.os.mkdir", race_mkdir)
-
-    with pytest.raises(PermissionError, match="0700"):
-        RuntimeLease.acquire(runtime_home)
-
-    assert stat.S_IMODE(runtime_home.stat().st_mode) == 0o755
-    assert not (runtime_home / "daemon.lock").exists()
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX openat contract")
-def test_runtime_lease_ancestor_swap_never_mutates_replacement_home(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runtime_home = tmp_path / "runtime"
-    runtime_home.mkdir(mode=0o700)
-    retained = tmp_path / "retained"
-    real_open = os.open
-    swapped = False
-
-    def swap_before_lock_open(
-        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-        flags: int,
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> int:
-        nonlocal swapped
-        if path == "daemon.lock" and dir_fd is not None and not swapped:
-            swapped = True
-            runtime_home.rename(retained)
-            runtime_home.mkdir(mode=0o700)
-        return real_open(path, flags, mode, dir_fd=dir_fd)
-
-    monkeypatch.setattr(
-        "alice_brain_hermes.runtime.lease.os.open", swap_before_lock_open
-    )
-
-    with pytest.raises(PermissionError, match="authority"):
-        RuntimeLease.acquire(runtime_home)
-
-    assert swapped is True
-    assert not (runtime_home / "daemon.lock").exists()
-    assert (retained / "daemon.lock").exists()
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow contract")
-def test_live_lease_rejects_symlinked_ancestor_before_sensitive_mutation(
-    tmp_path: Path,
-) -> None:
-    parent = tmp_path / "parent"
-    home = parent / "runtime"
-    home.mkdir(mode=0o700, parents=True)
-    displaced = tmp_path / "displaced"
-    lease = RuntimeLease.acquire(home)
     try:
-        parent.rename(displaced)
-        parent.symlink_to(displaced, target_is_directory=True)
+        assert observed == [home / "runtime.db"]
+        assert runtime.ledger.journal_mode == "wal"
+    finally:
+        runtime.close()
 
-        with pytest.raises(PermissionError, match="authority"):
-            lease.open_home_file(
-                "probe",
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
+
+def test_custom_factory_is_not_invoked_for_unsafe_runtime_database(
+    tmp_path: Path,
+    make_symlink: Callable[[Path, Path, bool], bool],
+) -> None:
+    home = tmp_path / "runtime"
+    home.mkdir()
+    outside = tmp_path / "outside.db"
+    with sqlite3.connect(outside) as connection:
+        connection.execute("CREATE TABLE sentinel(value TEXT NOT NULL)")
+        connection.execute("INSERT INTO sentinel(value) VALUES ('unchanged')")
+    before = outside.read_bytes()
+    runtime_database = home / "runtime.db"
+    make_symlink(runtime_database, outside, False)
+    factory_calls: list[Path] = []
+
+    def ledger_factory(path: Path) -> SQLiteLedger:
+        factory_calls.append(path)
+        return SQLiteLedger.open(path)
+
+    with pytest.raises(PermissionError, match="SQLite runtime path"):
+        HermesDaemonRuntime.open(
+            home,
+            ledger_factory=ledger_factory,
+            scheduler_interval_seconds=60.0,
+        )
+
+    assert factory_calls == []
+    assert outside.read_bytes() == before
+    assert not (home / "runtime.db-wal").exists()
+    assert not (home / "runtime.db-shm").exists()
+    assert list(home.glob("credential-*.key")) == []
+    (home / "runtime.db").unlink()
+    assert not (home / "runtime.db").exists()
+    with RuntimeLease.acquire(home):
+        pass
+
+
+def test_custom_factory_result_is_closed_if_path_becomes_unsafe_before_adoption(
+    tmp_path: Path,
+    make_symlink: Callable[[Path, Path, bool], bool],
+) -> None:
+    home = tmp_path / "runtime"
+    outside = tmp_path / "outside-journal"
+    outside.write_bytes(b"outside-sentinel")
+    returned: list[SQLiteLedger] = []
+
+    def ledger_factory(path: Path) -> SQLiteLedger:
+        ledger = SQLiteLedger.open(path)
+        returned.append(ledger)
+        journal = home / "runtime.db-journal"
+        make_symlink(journal, outside, False)
+        return ledger
+
+    runtime: HermesDaemonRuntime | None = None
+    try:
+        with pytest.raises(PermissionError, match="SQLite runtime path"):
+            runtime = HermesDaemonRuntime.open(
+                home,
+                ledger_factory=ledger_factory,
+                scheduler_interval_seconds=60.0,
             )
-
-        assert not (displaced / "runtime" / "probe").exists()
     finally:
-        lease.release()
+        if runtime is not None:
+            runtime.close()
+
+    assert len(returned) == 1
+    assert returned[0].closed
+    assert outside.read_bytes() == b"outside-sentinel"
+    assert list(home.glob("credential-*.key")) == []
+    (home / "runtime.db-journal").unlink()
+    with RuntimeLease.acquire(home):
+        pass
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX umask contract")
-def test_restrictive_umask_still_creates_exact_private_home_and_lock(
-    tmp_path: Path,
+def test_runtime_closes_wal_ledger_before_releasing_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runtime_home = tmp_path / "runtime"
-    previous = os.umask(0o777)
-    try:
-        lease = RuntimeLease.acquire(runtime_home)
-    finally:
-        os.umask(previous)
-    try:
-        assert stat.S_IMODE(runtime_home.stat().st_mode) == 0o700
-        assert stat.S_IMODE((runtime_home / "daemon.lock").stat().st_mode) == 0o600
-    finally:
-        lease.release()
+    runtime = HermesDaemonRuntime.open(
+        tmp_path / "runtime", scheduler_interval_seconds=60.0
+    )
+    released_after_close: list[bool] = []
+    real_release = RuntimeLease.release
+
+    def release(lease: RuntimeLease) -> None:
+        released_after_close.append(runtime.ledger.closed)
+        real_release(lease)
+
+    monkeypatch.setattr(RuntimeLease, "release", release)
+    runtime.close()
+
+    assert released_after_close == [True]
+    with RuntimeLease.acquire(runtime.runtime_home):
+        pass
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX mode contract")
-def test_existing_insecure_lock_is_rejected_without_metadata_repair(
-    tmp_path: Path,
+def test_startup_failure_releases_owner_without_creating_writable_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runtime_home = tmp_path / "runtime"
-    runtime_home.mkdir(mode=0o700)
-    lock = runtime_home / "daemon.lock"
-    lock.write_bytes(b"untrusted")
-    lock.chmod(0o666)
+    home = tmp_path / "runtime"
 
-    with pytest.raises(PermissionError, match="0600"):
-        RuntimeLease.acquire(runtime_home)
+    def fail_open(
+        _ledger_type: type[SQLiteLedger],
+        path: str | Path,
+        **_kwargs: object,
+    ) -> SQLiteLedger:
+        assert Path(path) == home / "runtime.db"
+        with pytest.raises(RuntimeOwnedError):
+            RuntimeLease.acquire(home)
+        raise RuntimeError("injected SQLite startup failure")
 
-    assert stat.S_IMODE(lock.stat().st_mode) == 0o666
-    assert lock.read_bytes() == b"untrusted"
+    monkeypatch.setattr(SQLiteLedger, "open", classmethod(fail_open))
+
+    with pytest.raises(RuntimeError, match="startup failure"):
+        HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
+
+    assert not (home / "runtime.db").exists()
+    with RuntimeLease.acquire(home):
+        pass

@@ -161,7 +161,7 @@ class DaemonRuntimeStatusV1(_StrictStatusModel):
             and scheduler.scheduler_count == scheduler.brain_count
             and scheduler.running_scheduler_count == scheduler.brain_count
         )
-        if self.runtime_ready is not writers_ready:
+        if self.runtime_ready and not writers_ready:
             raise ValueError("runtime readiness conflicts with writer counts")
         if self.semantic_complete and not self.trace_complete:
             raise ValueError("semantic completeness requires trace completeness")

@@ -14,18 +14,19 @@ from alice_brain_hermes.protocol.models import (
     PROTOCOL_VERSION,
     SERVER_ADAPTER_ID,
     CapabilityProfileV1,
-    DaemonDiscoveryV1,
+    DaemonDiscoveryV2,
     LoopbackEndpointV1,
     ProtocolLimitsV1,
 )
 from alice_brain_hermes.runtime.process_marker import current_process_marker
 
 
-def discovery() -> DaemonDiscoveryV1:
-    return DaemonDiscoveryV1(
+def discovery() -> DaemonDiscoveryV2:
+    return DaemonDiscoveryV2(
         pid=os.getpid(),
         process_marker=current_process_marker(),
         instance_nonce="test-nonce",
+        launch_nonce="test-launch",
         endpoint=LoopbackEndpointV1(port=1),
         credential_ref="credential-test-nonce.key",
     )
@@ -85,14 +86,26 @@ class CleanupFaultSocket(FakeSocket):
             raise OSError("injected socket close failure")
 
 
-def rotated_discovery(nonce: str, port: int) -> DaemonDiscoveryV1:
-    return DaemonDiscoveryV1(
+def rotated_discovery(nonce: str, port: int) -> DaemonDiscoveryV2:
+    return DaemonDiscoveryV2(
         pid=os.getpid(),
         process_marker=current_process_marker(),
         instance_nonce=nonce,
+        launch_nonce="test-launch",
         endpoint=LoopbackEndpointV1(port=port),
         credential_ref=f"credential-{nonce}.key",
     )
+
+
+def discovery_health(record: DaemonDiscoveryV2) -> dict[str, object]:
+    return {
+        "pid": record.pid,
+        "instance_nonce": record.instance_nonce,
+        "launch_nonce": record.launch_nonce,
+        "process_marker": record.process_marker,
+        "protocol_version": record.protocol_version,
+        "package_version": record.package_version,
+    }
 
 
 @pytest.mark.parametrize(
@@ -679,10 +692,7 @@ def test_connect_retries_once_only_after_nonce_credential_rotation(
         health_tokens.append(client._credential)
         if client._credential == "a" * 64:
             raise DaemonRpcError("unauthorized", "authentication failed", {})
-        return {
-            "instance_nonce": client.discovery.instance_nonce,
-            "process_marker": client.discovery.process_marker,
-        }
+        return discovery_health(client.discovery)
 
     monkeypatch.setattr(DaemonClient, "health", health)
 
@@ -721,10 +731,7 @@ def test_connect_cleanup_fault_cannot_bypass_one_rotation_retry(
         health_tokens.append(client._credential)
         if client._credential == "a" * 64:
             raise DaemonRpcError("unauthorized", "authentication failed", {})
-        return {
-            "instance_nonce": client.discovery.instance_nonce,
-            "process_marker": client.discovery.process_marker,
-        }
+        return discovery_health(client.discovery)
 
     monkeypatch.setattr(DaemonClient, "health", health)
 
@@ -834,10 +841,7 @@ def test_connect_capability_mismatch_is_not_retried_or_erased(
     monkeypatch.setattr(
         DaemonClient,
         "health",
-        lambda client: {
-            "instance_nonce": client.discovery.instance_nonce,
-            "process_marker": client.discovery.process_marker,
-        },
+        lambda client: discovery_health(client.discovery),
     )
 
     def mismatch(_client: DaemonClient, _method: str, _params=None):
@@ -920,10 +924,7 @@ def test_connect_rejects_non_exact_initialize_result(
     monkeypatch.setattr(
         DaemonClient,
         "health",
-        lambda client: {
-            "instance_nonce": client.discovery.instance_nonce,
-            "process_marker": client.discovery.process_marker,
-        },
+        lambda client: discovery_health(client.discovery),
     )
     monkeypatch.setattr(
         DaemonClient,
@@ -940,7 +941,7 @@ def test_connect_rejects_non_exact_initialize_result(
 @pytest.mark.parametrize(
     "connection",
     [
-        FakeSocket(family=socket.AF_UNIX),
+        FakeSocket(family=socket.AF_INET6),
         FakeSocket(local=("0.0.0.0", 43210)),
         FakeSocket(peer=("192.0.2.10", 1)),
         FakeSocket(peer=("127.0.0.1", 2)),
@@ -967,10 +968,7 @@ def test_connect_rejects_unproven_socket_endpoints_before_protocol(
     def health(_client: DaemonClient) -> dict[str, object]:
         nonlocal health_calls
         health_calls += 1
-        return {
-            "instance_nonce": record.instance_nonce,
-            "process_marker": record.process_marker,
-        }
+        return discovery_health(record)
 
     monkeypatch.setattr(DaemonClient, "health", health)
 

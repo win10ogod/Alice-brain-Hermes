@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import math
 import os
 import socket
@@ -33,7 +32,7 @@ from alice_brain_hermes.ids import new_id, validate_id
 from alice_brain_hermes.protocol.identity import IdentityChoiceV1, IdentityNamingLeaseV1
 from alice_brain_hermes.protocol.models import (
     BrainProfileV1,
-    DaemonDiscoveryV1,
+    DaemonDiscoveryV2,
     LoopbackEndpointV1,
 )
 from alice_brain_hermes.protocol.status import (
@@ -52,7 +51,7 @@ from alice_brain_hermes.runtime.discovery import (
     publish_discovery,
 )
 from alice_brain_hermes.runtime.engine import ConsciousEngine
-from alice_brain_hermes.runtime.lease import RetainedSQLiteFiles, RuntimeLease
+from alice_brain_hermes.runtime.lease import RuntimeLease
 from alice_brain_hermes.runtime.scheduler import ContinuousScheduler
 from alice_brain_hermes.runtime.store import SQLiteLedger
 
@@ -154,7 +153,6 @@ class _PreRuntimeOwner:
         self.runtime_home = runtime_home
         self.lease = lease
         self.credential: CredentialFile | None = None
-        self.retained_files: RetainedSQLiteFiles | None = None
         self.ledger: SQLiteLedger | None = None
         self._sqlite_closed = False
         self._credential_cleaned = False
@@ -167,15 +165,6 @@ class _PreRuntimeOwner:
         self.lease.assert_creator_process()
         with self._close_lock:
             return self._closed
-
-    def adopt_retained_files(self, owner: RetainedSQLiteFiles) -> None:
-        self.lease.assert_creator_process()
-        with self._close_lock:
-            if self._closed or self._lease_released:
-                raise RuntimeError("SQLite startup owner is already closed")
-            if self.retained_files is not None or self.ledger is not None:
-                raise RuntimeError("SQLite startup owner was already adopted")
-            self.retained_files = owner
 
     def adopt_ledger(self, ledger: SQLiteLedger) -> None:
         self.lease.assert_creator_process()
@@ -203,7 +192,6 @@ class _PreRuntimeOwner:
             if self.ledger is not ledger:
                 raise RuntimeError("SQLite runtime transfer does not match its owner")
             self.ledger = None
-            self.retained_files = None
             self._sqlite_closed = True
 
     def close(self) -> None:
@@ -215,16 +203,15 @@ class _PreRuntimeOwner:
         if self._closed:
             return
         if not self._sqlite_closed:
-            sqlite_owner = self.ledger or self.retained_files
-            if sqlite_owner is not None:
+            if self.ledger is not None:
                 try:
-                    sqlite_owner.close()
+                    self.ledger.close()
                 except BaseException:
-                    if sqlite_owner.closed:
+                    if self.ledger.closed:
                         self._sqlite_closed = True
                     raise
             self._sqlite_closed = True
-        self.lease.close_registered_retained_files()
+        self.lease.close_registered_resources()
         if self.credential is not None and not self._credential_cleaned:
             cleanup_credential(self.lease, self.credential)
             self._credential_cleaned = True
@@ -276,6 +263,8 @@ class HermesDaemonRuntime:
         self._engines: dict[str, ConsciousEngine] = {}
         self._schedulers: dict[str, ContinuousScheduler] = {}
         self._active_operations = 0
+        self._daemon_serving_required = False
+        self._daemon_serving_active = True
         self._closing = False
         self._fatal_error: BaseException | None = None
         self._closed = False
@@ -294,6 +283,7 @@ class HermesDaemonRuntime:
         ledger_factory: LedgerFactory | None = None,
         scheduler_factory: SchedulerFactory = ContinuousScheduler,
         scheduler_interval_seconds: float = 1.0,
+        launch_nonce: str | None = None,
     ) -> Self:
         """Acquire the process lease before constructing any SQLite handle."""
         scheduler_interval_seconds = _positive_seconds(
@@ -301,7 +291,7 @@ class HermesDaemonRuntime:
             name="scheduler_interval_seconds",
         )
         home = Path(runtime_home).expanduser().absolute()
-        lease = RuntimeLease.acquire(home)
+        lease = RuntimeLease.acquire(home, launch_nonce=launch_nonce)
         startup_owner = _PreRuntimeOwner(home, lease)
         credential: CredentialFile | None = None
         ledger: SQLiteLedger | None = None
@@ -312,26 +302,24 @@ class HermesDaemonRuntime:
             credential = create_credential(lease)
             startup_owner.credential = credential
             lease.assert_authority()
-            retained_files = lease.retain_sqlite_files("runtime.db")
-            startup_owner.adopt_retained_files(retained_files)
+            database = lease.home_path("runtime.db")
+            database = SQLiteLedger._validate_runtime_paths(database, lease)
             if ledger_factory is None:
-                ledger = SQLiteLedger.open_retained(
-                    retained_files,
+                ledger = SQLiteLedger.open(
+                    database,
+                    authority=lease,
                     owner_sink=startup_owner.adopt_ledger,
                 )
             else:
-                with retained_files.startup_operation():
-                    ledger = ledger_factory(retained_files.connection_path)
-                    if not isinstance(ledger, SQLiteLedger):
-                        raise TypeError("ledger_factory must return SQLiteLedger")
-                    # The factory result becomes a strong pre-runtime owner
-                    # before any validation or registry-transfer step can fail.
-                    try:
-                        startup_owner.adopt_ledger(ledger)
-                    except BaseException:
-                        startup_owner.quarantine_unadopted_ledger(ledger)
-                        raise
-                    ledger._adopt_retained_lifetime(retained_files)
+                ledger = ledger_factory(database)
+                if not isinstance(ledger, SQLiteLedger):
+                    raise TypeError("ledger_factory must return SQLiteLedger")
+                try:
+                    startup_owner.adopt_ledger(ledger)
+                except BaseException:
+                    startup_owner.quarantine_unadopted_ledger(ledger)
+                    raise
+                ledger._adopt_runtime_authority(lease)
             runtime = cls(
                 home,
                 lease,
@@ -502,11 +490,6 @@ class HermesDaemonRuntime:
     def failed_owner_count(cls) -> int:
         with cls._failed_owner_lock:
             return len(cls._failed_owners)
-
-    @classmethod
-    def _after_fork_child(cls) -> None:
-        cls._failed_owner_lock = threading.Lock()
-        cls._failed_owners = {}
 
     def _assert_creator_process(self) -> None:
         if os.getpid() != self._creator_pid:
@@ -915,6 +898,33 @@ class HermesDaemonRuntime:
         with self._registry_lock:
             return len(self._schedulers)
 
+    def _require_daemon_serving_boundary(self) -> None:
+        self._assert_creator_process()
+        with self._registry_lock:
+            self._daemon_serving_required = True
+            self._daemon_serving_active = False
+
+    def _enter_daemon_serving_boundary(self) -> None:
+        self._assert_creator_process()
+        with self._registry_lock:
+            if not self._daemon_serving_required:
+                raise RuntimeError("daemon serving boundary was not required")
+            self._daemon_serving_active = True
+
+    def _leave_daemon_serving_boundary(self) -> None:
+        self._assert_creator_process()
+        with self._registry_lock:
+            self._daemon_serving_active = False
+
+    @property
+    def daemon_serving_active(self) -> bool:
+        self._assert_creator_process()
+        with self._registry_lock:
+            return (
+                not self._daemon_serving_required
+                or self._daemon_serving_active
+            )
+
     def readiness_snapshot(self) -> dict[str, object]:
         """Return one exact proof of continuous-writer readiness."""
         self._begin_operation()
@@ -923,6 +933,10 @@ class HermesDaemonRuntime:
             with self._registry_lock:
                 engines = dict(self._engines)
                 schedulers = dict(self._schedulers)
+                serving = (
+                    not self._daemon_serving_required
+                    or self._daemon_serving_active
+                )
             running = {
                 brain_id
                 for brain_id, scheduler in schedulers.items()
@@ -937,6 +951,7 @@ class HermesDaemonRuntime:
                 set(engines) == persisted
                 and set(schedulers) == persisted
                 and running == persisted
+                and serving
             )
             return {
                 "runtime_ready": ready,
@@ -964,6 +979,10 @@ class HermesDaemonRuntime:
                 with self._registry_lock:
                     engines = dict(self._engines)
                     schedulers = dict(self._schedulers)
+                    serving = (
+                        not self._daemon_serving_required
+                        or self._daemon_serving_active
+                    )
                     fail_stopped = self._fatal_error is not None
             if observability.brain_count != len(persisted):
                 raise LedgerIntegrityError(
@@ -1013,7 +1032,7 @@ class HermesDaemonRuntime:
                 brain_ids=persisted,
                 engine_count=len(engines),
                 scheduler_count=len(schedulers),
-                runtime_ready=writers_ready,
+                runtime_ready=writers_ready and serving,
                 scheduler_health=scheduler_summary,
                 bridge_connection=bridge_summary,
                 trace_complete=observability.trace_complete,
@@ -1116,58 +1135,7 @@ class HermesDaemonRuntime:
         self.close()
 
 
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=HermesDaemonRuntime._after_fork_child)
-
-
 __all__ = ["HermesDaemonRuntime"]
-
-
-def _write_readiness(descriptor: int | None, body: dict[str, object]) -> None:
-    if descriptor is None:
-        return
-    payload = (
-        json.dumps(body, allow_nan=False, separators=(",", ":"), sort_keys=True).encode(
-            "utf-8"
-        )
-        + b"\n"
-    )
-    try:
-        offset = 0
-        while offset < len(payload):
-            written = os.write(descriptor, payload[offset:])
-            if written <= 0:
-                raise OSError("readiness write made no progress")
-            offset += written
-    finally:
-        os.close(descriptor)
-
-
-class _ReadinessSignal:
-    """Own one readiness descriptor and make its consumption globally terminal."""
-
-    def __init__(self, descriptor: int | None) -> None:
-        self._descriptor = descriptor
-        self._lock = threading.Lock()
-
-    def write_once(self, body: dict[str, object]) -> bool:
-        with self._lock:
-            descriptor = self._descriptor
-            self._descriptor = None
-        if descriptor is None:
-            return False
-        _write_readiness(descriptor, body)
-        return True
-
-    def close_once(self) -> bool:
-        """Consume and close an unwritten descriptor exactly once."""
-        with self._lock:
-            descriptor = self._descriptor
-            self._descriptor = None
-        if descriptor is None:
-            return False
-        os.close(descriptor)
-        return True
 
 
 def _ipv4_loopback_endpoint(value: object) -> bool:
@@ -1234,12 +1202,15 @@ class PrivateDaemonServer:
         self._maintenance_enabled = asyncio.Event()
         self._maintenance_first_pass = asyncio.Event()
         self._maintenance_periodic_enabled = asyncio.Event()
+        self._maintenance_first_cutoff: datetime | None = None
+        self._maintenance_periodic_not_before: float | None = None
         self._maintenance_task: asyncio.Task[None] | None = None
         self._maintenance_error: BaseException | None = None
         self._fatal_error: BaseException | None = None
         self._transport_quiesced = False
         self._cleanup_lock = asyncio.Lock()
         runtime._install_transport_cleanup_owner(self)
+        runtime._require_daemon_serving_boundary()
 
     def _consume_listener_wait(self, task: asyncio.Task[None]) -> None:
         if self._listener_wait_task is task:
@@ -1349,7 +1320,13 @@ class PrivateDaemonServer:
         HermesDaemonRuntime._discard_exact_closed_owner(self)
 
     async def _run_abandonment_pass(self) -> None:
-        cutoff = datetime.now(UTC) - timedelta(seconds=self.abandonment_grace_seconds)
+        cutoff = self._maintenance_first_cutoff
+        if cutoff is None:
+            cutoff = datetime.now(UTC) - timedelta(
+                seconds=self.abandonment_grace_seconds
+            )
+        else:
+            self._maintenance_first_cutoff = None
         candidates = await asyncio.to_thread(
             self.runtime.ledger.list_abandonable_bridge_streams,
             last_seen_before=cutoff,
@@ -1394,6 +1371,25 @@ class PrivateDaemonServer:
             # The startup task refreshes restart grace at the exact readiness
             # boundary before periodic abandonment is allowed to resume.
             await self._maintenance_periodic_enabled.wait()
+            if self._shutdown.is_set():
+                return
+            not_before = self._maintenance_periodic_not_before
+            if not_before is None:
+                raise RuntimeError(
+                    "periodic abandonment boundary is not initialized"
+                )
+            loop = asyncio.get_running_loop()
+            while (remaining := not_before - loop.time()) > 0:
+                try:
+                    await asyncio.wait_for(self._shutdown.wait(), timeout=remaining)
+                except TimeoutError:
+                    continue
+                else:
+                    return
+            self._maintenance_periodic_not_before = None
+            await self._run_abandonment_pass()
+            if self._observe_runtime_fail_stop():
+                return
             while not self._shutdown.is_set():
                 try:
                     await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
@@ -1598,7 +1594,7 @@ class PrivateDaemonServer:
                     if task is not None:
                         self._handlers.discard(task)
 
-    async def start(self) -> DaemonDiscoveryV1:
+    async def start(self) -> DaemonDiscoveryV2:
         self._server = await asyncio.start_server(
             self._handle_client,
             host="127.0.0.1",
@@ -1613,10 +1609,11 @@ class PrivateDaemonServer:
         host, port = sockets[0].getsockname()[:2]
         if host != "127.0.0.1":
             raise RuntimeError("daemon socket is not numeric IPv4 loopback")
-        record = DaemonDiscoveryV1(
+        record = DaemonDiscoveryV2(
             pid=os.getpid(),
             process_marker=self.runtime.lease.process_marker,
             instance_nonce=self.runtime.lease.instance_nonce,
+            launch_nonce=self.runtime.lease.launch_nonce,
             endpoint=LoopbackEndpointV1(host="127.0.0.1", port=port),
             package_version=__version__,
             credential_ref=self.runtime.credential.path.name,
@@ -1626,7 +1623,7 @@ class PrivateDaemonServer:
         self.runtime.lease.assert_authority()
         return record
 
-    async def prove_readiness(self, record: DaemonDiscoveryV1) -> None:
+    async def prove_readiness(self, record: DaemonDiscoveryV2) -> None:
         from alice_brain_hermes.protocol.client import DaemonClient
 
         client = await asyncio.to_thread(
@@ -1638,8 +1635,18 @@ class PrivateDaemonServer:
             health = await asyncio.to_thread(client.health)
             if health.get("instance_nonce") != record.instance_nonce:
                 raise RuntimeError("authenticated health nonce mismatch")
-            if health.get("runtime_ready") is not True:
-                raise RuntimeError("authenticated health did not prove readiness")
+            if health.get("launch_nonce") != record.launch_nonce:
+                raise RuntimeError("authenticated health launch nonce mismatch")
+            writers_ready = (
+                health.get("brain_count") == health.get("engine_count")
+                and health.get("brain_count") == health.get("scheduler_count")
+                and health.get("brain_count")
+                == health.get("running_scheduler_count")
+            )
+            if not writers_ready or health.get("runtime_ready") is not False:
+                raise RuntimeError(
+                    "authenticated health did not prove pre-serve readiness"
+                )
         finally:
             await asyncio.to_thread(client.close)
 
@@ -1651,6 +1658,7 @@ class PrivateDaemonServer:
         HermesDaemonRuntime._claim_failed_owner(self)
         failure: BaseException | None = None
         deadline = asyncio.get_running_loop().time() + _SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+        self.runtime._leave_daemon_serving_boundary()
         self.service.begin_shutdown()
         self._shutdown.set()
         self._maintenance_enabled.set()
@@ -1787,7 +1795,16 @@ class PrivateDaemonServer:
             return shutdown_failure
         return failure
 
-    async def run(self, *, readiness: _ReadinessSignal) -> None:
+    async def _serve_until_shutdown(self) -> None:
+        if self._shutdown.is_set():
+            return
+        self.runtime._enter_daemon_serving_boundary()
+        try:
+            await self._shutdown.wait()
+        finally:
+            self.runtime._leave_daemon_serving_boundary()
+
+    async def run(self) -> None:
         failure: BaseException | None = None
         try:
             self._maintenance_task = asyncio.create_task(
@@ -1802,6 +1819,7 @@ class PrivateDaemonServer:
             record = await self.start()
             await self.prove_readiness(record)
             await asyncio.to_thread(self.runtime.ledger.refresh_daemon_restart_grace)
+            self._maintenance_first_cutoff = datetime.min.replace(tzinfo=UTC)
             self._maintenance_enabled.set()
             await self._maintenance_first_pass.wait()
             if self._fatal_error is not None:
@@ -1813,11 +1831,11 @@ class PrivateDaemonServer:
             # once more at the final readiness boundary so the advertised
             # daemon always grants the complete configured grace interval.
             await asyncio.to_thread(self.runtime.ledger.refresh_daemon_restart_grace)
-            readiness.write_once(
-                {"ready": True, "instance_nonce": record.instance_nonce},
+            self._maintenance_periodic_not_before = (
+                asyncio.get_running_loop().time() + self.abandonment_grace_seconds
             )
             self._maintenance_periodic_enabled.set()
-            await self._shutdown.wait()
+            await self._serve_until_shutdown()
             if self._fatal_error is not None:
                 raise self._fatal_error
             if self._maintenance_error is not None:
@@ -1840,7 +1858,7 @@ class PrivateDaemonServer:
 async def _run_daemon(
     runtime_home: Path,
     *,
-    readiness: _ReadinessSignal,
+    launch_nonce: str | None = None,
     scheduler_interval_seconds: float,
     abandonment_grace_seconds: float,
 ) -> None:
@@ -1857,6 +1875,7 @@ async def _run_daemon(
         HermesDaemonRuntime.open,
         runtime_home,
         scheduler_interval_seconds=scheduler_interval_seconds,
+        launch_nonce=launch_nonce,
     )
     try:
         daemon = PrivateDaemonServer(
@@ -1869,7 +1888,7 @@ async def _run_daemon(
     # From this point the daemon owns transport quiescence and the runtime.
     # Its fail-stop cleanup may intentionally retain both; an outer close would
     # invalidate that authority boundary.
-    await daemon.run(readiness=readiness)
+    await daemon.run()
 
 
 def _run_private_daemon_loop(
@@ -1920,63 +1939,45 @@ def _run_private_daemon_loop(
 def run_private_daemon(
     runtime_home: str | Path,
     *,
-    readiness_fd: int | None = None,
+    launch_nonce: str | None = None,
     scheduler_interval_seconds: float = 1.0,
     abandonment_grace_seconds: float = 30.0,
-    _readiness_signal: _ReadinessSignal | None = None,
 ) -> None:
-    readiness = _readiness_signal or _ReadinessSignal(readiness_fd)
-    owns_readiness = _readiness_signal is None
-    try:
-        _run_private_daemon_loop(
-            _run_daemon(
-                Path(runtime_home),
-                readiness=readiness,
-                scheduler_interval_seconds=scheduler_interval_seconds,
-                abandonment_grace_seconds=abandonment_grace_seconds,
-            )
+    _run_private_daemon_loop(
+        _run_daemon(
+            Path(runtime_home),
+            launch_nonce=launch_nonce,
+            scheduler_interval_seconds=scheduler_interval_seconds,
+            abandonment_grace_seconds=abandonment_grace_seconds,
         )
-    finally:
-        if owns_readiness:
-            readiness.close_once()
+    )
 
 
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--runtime-home", required=True)
-    parser.add_argument("--readiness-fd", type=int)
+    parser.add_argument("--launch-nonce")
     parser.add_argument("--scheduler-interval", type=float, default=1.0)
     parser.add_argument("--abandonment-grace", type=float, default=30.0)
     arguments = parser.parse_args(argv)
-    readiness = _ReadinessSignal(arguments.readiness_fd)
     try:
         run_private_daemon(
             arguments.runtime_home,
-            readiness_fd=arguments.readiness_fd,
+            launch_nonce=arguments.launch_nonce,
             scheduler_interval_seconds=arguments.scheduler_interval,
             abandonment_grace_seconds=arguments.abandonment_grace,
-            _readiness_signal=readiness,
         )
         return 0
     except RuntimeOwnedError:
-        with suppress(OSError):
-            readiness.write_once({"ready": False, "code": "runtime_owned"})
         return 2
     except SchedulerShutdownError:
-        with suppress(OSError):
-            readiness.write_once({"ready": False, "code": "shutdown_unproven"})
         # The event loop deliberately did not join executor workers whose
         # termination could not be proven.  Returning to Python would allow
         # those workers to retain runtime authority, and interpreter shutdown
         # could wait forever.  The daemon CLI therefore fails closed here.
         os._exit(3)
     except Exception:
-        with suppress(OSError):
-            readiness.write_once({"ready": False, "code": "startup_failed"})
         return 1
-    finally:
-        with suppress(OSError):
-            readiness.close_once()
 
 
 if __name__ == "__main__":

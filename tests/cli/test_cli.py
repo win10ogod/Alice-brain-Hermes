@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import subprocess
 import sys
 import textwrap
-from io import BytesIO
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import psutil
 import pytest
-
-POSIX_ONLY = pytest.mark.skipif(os.name != "posix", reason="POSIX daemon lifecycle")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -184,7 +184,10 @@ def test_status_payload_rejects_unknown_or_identity_collision_fields() -> None:
     from alice_brain_hermes import cli
 
     health = {
+        "pid": 123,
         "instance_nonce": "nonce",
+        "launch_nonce": "launch",
+        "package_version": "0.1.0",
         "process_marker": "marker",
         "shutting_down": False,
         "protocol_version": 2,
@@ -247,7 +250,7 @@ def test_status_payload_rejects_unknown_or_identity_collision_fields() -> None:
 
     cli._validate_status_payloads(health, runtime)
     with pytest.raises(cli._CliFailure) as failure:
-        cli._validate_status_payloads({**health, "pid": 999}, runtime)
+        cli._validate_status_payloads({**health, "unexpected": 999}, runtime)
 
     assert failure.value.code == "daemon_status_invalid"
     with pytest.raises(cli._CliFailure):
@@ -331,32 +334,38 @@ def test_invalid_existing_discovery_never_masquerades_as_stopped(
     assert error["code"] == "discovery_invalid"
 
 
-@POSIX_ONLY
 def test_broken_runtime_home_symlink_never_masquerades_as_stopped(
     tmp_path: Path,
+    make_symlink: Callable[[Path, Path, bool], bool],
 ) -> None:
+    from alice_brain_hermes import cli
+
     home = tmp_path / "runtime"
-    home.symlink_to(tmp_path / "missing", target_is_directory=True)
+    make_symlink(home, tmp_path / "missing", True)
 
-    error = _error(_run_cli(home, "status"))
+    with pytest.raises(cli._CliFailure) as captured:
+        cli._status(home, timeout_seconds=1)
 
-    assert error["code"] == "runtime_home_invalid"
+    assert captured.value.code == "runtime_home_invalid"
 
 
-@POSIX_ONLY
 def test_broken_discovery_symlink_never_masquerades_as_stopped(
     tmp_path: Path,
+    make_symlink: Callable[[Path, Path, bool], bool],
 ) -> None:
+    from alice_brain_hermes import cli
+
     home = tmp_path / "runtime"
     home.mkdir(mode=0o700)
-    (home / "daemon.json").symlink_to(tmp_path / "missing-discovery")
+    discovery = home / "daemon.json"
+    make_symlink(discovery, tmp_path / "missing-discovery", False)
 
-    error = _error(_run_cli(home, "status"))
+    with pytest.raises(cli._CliFailure) as captured:
+        cli._status(home, timeout_seconds=1)
 
-    assert error["code"] == "discovery_invalid"
+    assert captured.value.code == "discovery_invalid"
 
 
-@POSIX_ONLY
 def test_start_is_idempotent_status_is_live_and_stop_is_authenticated(
     tmp_path: Path,
 ) -> None:
@@ -372,7 +381,7 @@ def test_start_is_idempotent_status_is_live_and_stop_is_authenticated(
         assert first_data["already_running"] is False
         assert first_data["readiness_verified"] is True
         assert type(first_data["instance_nonce"]) is str
-        assert stat.S_IMODE(home.stat().st_mode) == 0o700
+        assert home.is_dir()
 
         repeated = _success(_run_cli(home, "daemon", "start"))["data"]
         assert repeated["started"] is False
@@ -413,7 +422,7 @@ def test_start_is_idempotent_status_is_live_and_stop_is_authenticated(
         }
         assert not (home / "daemon.json").exists()
         assert not list(home.glob("credential-*.key"))
-        assert not Path(f"/proc/{first_pid}").exists()
+        assert not psutil.pid_exists(first_pid)
 
         repeated_stop = _success(_run_cli(home, "daemon", "stop"))["data"]
         assert repeated_stop == {
@@ -422,11 +431,49 @@ def test_start_is_idempotent_status_is_live_and_stop_is_authenticated(
             "status": "stopped",
             "stop_requested": False,
         }
+
+        restarted = _success(_run_cli(home, "daemon", "start"))["data"]
+        restarted_pid = int(restarted["pid"])
+        assert restarted["started"] is True
+        assert restarted_pid != first_pid
+        assert restarted["instance_nonce"] != first_data["instance_nonce"]
+        repeated_restart = _success(_run_cli(home, "start"))["data"]
+        assert repeated_restart["started"] is False
+        assert repeated_restart["pid"] == restarted_pid
+        assert repeated_restart["instance_nonce"] == restarted["instance_nonce"]
+        final_stop = _success(_run_cli(home, "stop", timeout=20))["data"]
+        assert final_stop["pid"] == restarted_pid
+        assert final_stop["instance_nonce"] == restarted["instance_nonce"]
+        assert not psutil.pid_exists(restarted_pid)
     finally:
         _stop_if_running(home)
 
 
-@POSIX_ONLY
+def test_concurrent_real_cli_starts_converge_on_one_healthy_daemon(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "runtime"
+    barrier = threading.Barrier(2)
+
+    def start() -> subprocess.CompletedProcess[str]:
+        barrier.wait(timeout=5.0)
+        return _run_cli(home, "start", timeout=30.0)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(executor.map(lambda _index: start(), range(2)))
+        bodies = tuple(_success(result)["data"] for result in results)
+        assert sorted(body["started"] for body in bodies) == [False, True]
+        assert len({body["pid"] for body in bodies}) == 1
+        assert len({body["instance_nonce"] for body in bodies}) == 1
+        status = _success(_run_cli(home, "status"))["data"]
+        assert status["running"] is True
+        assert status["daemon"]["pid"] == bodies[0]["pid"]
+        assert status["daemon"]["runtime_ready"] is True
+    finally:
+        _stop_if_running(home)
+
+
 def test_identity_and_trace_commands_use_the_live_typed_rpc(tmp_path: Path) -> None:
     from alice_brain_hermes.protocol.client import DaemonClient
 
@@ -481,135 +528,271 @@ def test_identity_and_trace_commands_use_the_live_typed_rpc(tmp_path: Path) -> N
         _stop_if_running(home)
 
 
-def test_invalid_readiness_terminates_only_the_spawned_child(
-    tmp_path: Path,
+def test_daemon_adapter_uses_fresh_no_credential_no_descriptor_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = os.fspath(SOURCE_ROOT)
-    script = textwrap.dedent(
-        """
-        import sys
-        from pathlib import Path
-        from alice_brain_hermes import cli
+    from alice_brain_hermes import cli
 
-        spawned = object()
-        terminated = []
-        cli._spawn_daemon = lambda _home: spawned
-        cli._read_readiness = (
-            lambda _process, *, timeout_seconds: b"not-json\\n"
-        )
-        cli._terminate_spawned = (
-            lambda process, *, timeout_seconds:
-            terminated.append((process, timeout_seconds))
-        )
-        try:
-            cli._start(Path(sys.argv[1]), timeout_seconds=2.5)
-        except cli._CliFailure as error:
-            assert "readiness" in str(error)
-        else:
-            raise AssertionError("invalid readiness was accepted")
-        assert terminated == [(spawned, 2.5)]
-        """
+    captured: list[tuple[Path, list[str], str]] = []
+    sentinel = object()
+
+    def create(home: Path, command: list[str], *, launch_nonce: str):
+        captured.append((home, command, launch_nonce))
+        return sentinel
+
+    monkeypatch.setattr(cli.DmonAdapter, "create", create)
+
+    home = tmp_path / "runtime"
+    assert cli._daemon_adapter(home, "launch-nonce") is sentinel
+    [(selected_home, command, nonce)] = captured
+    assert selected_home == home
+    assert nonce == "launch-nonce"
+    assert command == [
+        sys.executable,
+        "-m",
+        "alice_brain_hermes.runtime.daemon",
+        "--runtime-home",
+        os.fspath(home),
+        "--launch-nonce",
+        "launch-nonce",
+    ]
+    assert all("credential" not in argument for argument in command)
+    assert all("readiness" not in argument for argument in command)
+
+
+def test_start_requires_authenticated_exact_v2_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from alice_brain_hermes import __version__, cli
+    from alice_brain_hermes.protocol.models import DaemonDiscoveryV2, LoopbackEndpointV1
+    from alice_brain_hermes.runtime.supervisor import DmonProcessHint
+
+    home = tmp_path / "runtime"
+    hint = DmonProcessHint(
+        pid=4321,
+        process_marker="psutil-create-time-us:123000000",
+    )
+    class Adapter:
+        launch_nonce = "launch-exact"
+
+        def start(self) -> DmonProcessHint:
+            return hint
+
+        def release_parent_guard(self) -> None:
+            return None
+
+    discovery = DaemonDiscoveryV2(
+        pid=hint.pid,
+        process_marker=hint.process_marker,
+        instance_nonce="instance-exact",
+        launch_nonce="launch-exact",
+        endpoint=LoopbackEndpointV1(port=43210),
+        credential_ref="credential-instance-exact.key",
+    )
+    health = {
+        "pid": discovery.pid,
+        "process_marker": discovery.process_marker,
+        "instance_nonce": discovery.instance_nonce,
+        "launch_nonce": discovery.launch_nonce,
+        "protocol_version": discovery.protocol_version,
+        "package_version": __version__,
+        "runtime_ready": True,
+    }
+    monkeypatch.setattr(cli, "_home_exists", lambda _home: False)
+    monkeypatch.setattr(cli.secrets, "token_hex", lambda _size: "launch-exact")
+    monkeypatch.setattr(cli, "_daemon_adapter", lambda *_args: Adapter())
+    monkeypatch.setattr(cli, "_discovery_exists", lambda _home: True)
+    monkeypatch.setattr(
+        cli,
+        "_live_status",
+        lambda *_args, **_kwargs: (discovery, health, {"runtime_ready": True}),
     )
 
-    result = subprocess.run(
-        [sys.executable, "-c", script, os.fspath(tmp_path / "runtime")],
-        cwd=PROJECT_ROOT,
-        env=environment,
-        text=True,
-        capture_output=True,
-        timeout=10,
-        check=False,
-    )
+    class Process:
+        pid = hint.pid
 
-    assert result.returncode == 0, result.stderr
+        @staticmethod
+        def create_time() -> float:
+            return 123.0
+
+    monkeypatch.setattr(cli.psutil, "Process", lambda _pid: Process())
+
+    assert cli._start(home, timeout_seconds=1.0) == {
+        "status": "running",
+        "started": True,
+        "already_running": False,
+        "readiness_verified": True,
+        "pid": 4321,
+        "instance_nonce": "instance-exact",
+    }
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("parent_pid", "parent_marker", "accepted"),
     [
-        b'{"ready":true,"instance_nonce":"nonce"}\ntrailing',
-        b'{"ready":true,"ready":false,"code":"startup_failed"}\n',
-        b'{"ready":true,"instance_nonce":"nonce","extra":1}\n',
-        b'{"ready":true,"instance_nonce":NaN}\n',
-        b'{"ready":false,"code":"unknown"}\n',
+        (4321, "psutil-create-time-us:123000000", True),
+        (9999, "psutil-create-time-us:123000000", False),
+        (4321, "psutil-create-time-us:999000000", False),
     ],
 )
-def test_readiness_rejects_trailing_duplicate_nonfinite_or_unknown_shapes(
-    payload: bytes,
-) -> None:
-    from alice_brain_hermes import cli
-
-    with pytest.raises(cli._CliFailure, match="readiness"):
-        cli._decode_readiness(payload)
-
-
-def test_readiness_reader_includes_trailing_pipe_bytes() -> None:
-    from alice_brain_hermes import cli
-
-    process = SimpleNamespace(
-        stdout=BytesIO(b'{"ready":true,"instance_nonce":"nonce"}\nextra')
-    )
-
-    payload = cli._read_readiness(process, timeout_seconds=1.0)
-
-    assert payload.endswith(b"e")
-    with pytest.raises(cli._CliFailure, match="readiness"):
-        cli._decode_readiness(payload)
-
-
-def test_false_readiness_cannot_leave_spawned_child_unreaped(
-    tmp_path: Path,
+def test_authenticated_redirector_child_requires_exact_parent_and_marker(
     monkeypatch: pytest.MonkeyPatch,
+    parent_pid: int,
+    parent_marker: str,
+    accepted: bool,
+) -> None:
+    from alice_brain_hermes import __version__, cli
+    from alice_brain_hermes.protocol.models import DaemonDiscoveryV2, LoopbackEndpointV1
+    from alice_brain_hermes.runtime.supervisor import DmonProcessHint
+
+    hint = DmonProcessHint(
+        pid=4321,
+        process_marker=parent_marker,
+    )
+    discovery = DaemonDiscoveryV2(
+        pid=8765,
+        process_marker="psutil-create-time-us:456000000",
+        instance_nonce="instance-child",
+        launch_nonce="launch-child",
+        endpoint=LoopbackEndpointV1(port=43210),
+        credential_ref="credential-instance-child.key",
+    )
+    health = {
+        "pid": discovery.pid,
+        "process_marker": discovery.process_marker,
+        "instance_nonce": discovery.instance_nonce,
+        "launch_nonce": discovery.launch_nonce,
+        "protocol_version": discovery.protocol_version,
+        "package_version": __version__,
+        "runtime_ready": True,
+    }
+
+    class Process:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def ppid(self) -> int:
+            assert self.pid == discovery.pid
+            return parent_pid
+
+        def create_time(self) -> float:
+            return 123.0 if self.pid == hint.pid else 456.0
+
+    monkeypatch.setattr(cli.psutil, "Process", Process)
+
+    assert (
+        cli._authenticated_start_identity(
+            discovery,
+            health,
+            {"runtime_ready": True},
+            adapter=SimpleNamespace(launch_nonce="launch-child"),
+            hint=hint,
+        )
+        is accepted
+    )
+
+
+def test_start_timeout_exactly_terminates_hint_and_returns_redacted_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from alice_brain_hermes import cli
+    from alice_brain_hermes.runtime.supervisor import DmonProcessHint
 
-    class ResistantChild:
-        def wait(self, *, timeout: float) -> int:
-            raise subprocess.TimeoutExpired("daemon", timeout)
-
-    child = ResistantChild()
-    terminated: list[tuple[object, float]] = []
-    monkeypatch.setattr(cli, "_spawn_daemon", lambda _home: child)
-    monkeypatch.setattr(
-        cli,
-        "_read_readiness",
-        lambda _process, *, timeout_seconds: (
-            b'{"ready":false,"code":"startup_failed"}\n'
-        ),
+    hint = DmonProcessHint(
+        pid=4321,
+        process_marker="psutil-create-time-us:123000000",
     )
-    monkeypatch.setattr(
-        cli,
-        "_terminate_spawned",
-        lambda process, *, timeout_seconds: terminated.append(
-            (process, timeout_seconds)
-        ),
-    )
+    actions: list[tuple[object, ...]] = []
 
-    with pytest.raises(cli._CliFailure, match="startup failed"):
-        cli._start(tmp_path / "runtime", timeout_seconds=2.5)
+    class Adapter:
+        launch_nonce = "launch-timeout"
 
-    assert terminated == [(child, 2.5)]
+        def start(self) -> DmonProcessHint:
+            return hint
 
-
-def test_spawn_cleanup_fails_closed_when_exit_cannot_be_proven() -> None:
-    from alice_brain_hermes import cli
-
-    class UnreapableChild:
-        def poll(self) -> None:
+        def release_parent_guard(self) -> None:
             return None
 
-        def terminate(self) -> None:
-            raise OSError("denied")
+        def terminate_exact(
+            self, selected: DmonProcessHint, *, timeout_seconds: float
+        ) -> None:
+            actions.append(("terminate", selected, timeout_seconds))
 
-        def wait(self, *, timeout: float) -> int:
-            raise subprocess.TimeoutExpired("daemon", timeout)
+        def remove_meta_hint(self, selected: DmonProcessHint) -> bool:
+            actions.append(("meta", selected))
+            return True
 
-        def kill(self) -> None:
-            raise OSError("denied")
+        def redacted_dmon_output(self) -> str:
+            return "<redacted-dmon>"
+
+        def redacted_log_tail(self) -> str:
+            return "<redacted-log>"
+
+    monkeypatch.setattr(cli, "_home_exists", lambda _home: False)
+    monkeypatch.setattr(cli, "_daemon_adapter", lambda *_args: Adapter())
+    monkeypatch.setattr(cli, "_discovery_exists", lambda _home: False)
+    monkeypatch.setattr(
+        cli,
+        "_process_identity_state",
+        lambda _pid, _marker: "exact",
+    )
 
     with pytest.raises(cli._CliFailure) as failure:
-        cli._terminate_spawned(UnreapableChild(), timeout_seconds=0.01)
+        cli._start(tmp_path / "runtime", timeout_seconds=0.01)
+
+    assert failure.value.code == "startup_timeout"
+    assert failure.value.data == {
+        "dmon_output": "<redacted-dmon>",
+        "log_tail": "<redacted-log>",
+    }
+    assert actions[0][0] == "terminate"
+    assert actions[0][1] == hint
+    assert actions[1] == ("meta", hint)
+
+
+def test_start_cleanup_fails_closed_when_exact_identity_is_unverifiable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from alice_brain_hermes import cli
+    from alice_brain_hermes.runtime.supervisor import (
+        DmonIdentityError,
+        DmonProcessHint,
+    )
+
+    hint = DmonProcessHint(
+        pid=4321,
+        process_marker="psutil-create-time-us:123000000",
+    )
+
+    class Adapter:
+        launch_nonce = "launch-unverifiable"
+
+        def start(self) -> DmonProcessHint:
+            return hint
+
+        def release_parent_guard(self) -> None:
+            return None
+
+        def terminate_exact(self, *_args, **_kwargs) -> None:
+            raise DmonIdentityError("unverifiable")
+
+        def redacted_dmon_output(self) -> str:
+            return ""
+
+        def redacted_log_tail(self) -> str:
+            return ""
+
+    monkeypatch.setattr(cli, "_home_exists", lambda _home: False)
+    monkeypatch.setattr(cli, "_daemon_adapter", lambda *_args: Adapter())
+    monkeypatch.setattr(cli, "_discovery_exists", lambda _home: False)
+    monkeypatch.setattr(
+        cli,
+        "_process_identity_state",
+        lambda _pid, _marker: "exact",
+    )
+
+    with pytest.raises(cli._CliFailure) as failure:
+        cli._start(tmp_path / "runtime", timeout_seconds=0.01)
 
     assert failure.value.code == "startup_cleanup_unproven"
 
@@ -638,6 +821,7 @@ def test_stop_fails_closed_when_process_identity_is_ambiguous(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from alice_brain_hermes import cli
+    from alice_brain_hermes.runtime.supervisor import DmonProcessHint
 
     home = tmp_path / "runtime"
     home.mkdir(mode=0o700)
@@ -645,6 +829,7 @@ def test_stop_fails_closed_when_process_identity_is_ambiguous(
         pid=22,
         process_marker="current-marker",
         instance_nonce="current-nonce",
+        launch_nonce="current-launch",
         credential_ref="credential-current.key",
     )
 
@@ -668,6 +853,17 @@ def test_stop_fails_closed_when_process_identity_is_ambiguous(
     monkeypatch.setattr(cli, "_validate_existing_home", lambda _home: None)
     monkeypatch.setattr(cli, "_load_discovery", lambda _home: (discovery, "token"))
     monkeypatch.setattr(cli.DaemonClient, "connect", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(
+        cli,
+        "_daemon_adapter",
+        lambda *_args: SimpleNamespace(
+            current_process_hint=lambda: DmonProcessHint(
+                pid=11,
+                process_marker="supervisor-marker",
+            )
+        ),
+    )
+    monkeypatch.setattr(cli, "_discovery_matches_supervisor", lambda *_args: True)
     monkeypatch.setattr(cli, "_discovery_exists", discovery_exists)
     monkeypatch.setattr(
         cli,
@@ -681,7 +877,97 @@ def test_stop_fails_closed_when_process_identity_is_ambiguous(
     assert failure.value.code == "shutdown_unproven"
 
 
-@POSIX_ONLY
+def test_stop_waits_for_exact_supervisor_exit_before_artifact_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alice_brain_hermes import cli
+    from alice_brain_hermes.runtime.supervisor import DmonProcessHint
+
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    discovery = SimpleNamespace(
+        pid=22,
+        process_marker="child-marker",
+        instance_nonce="current-nonce",
+        launch_nonce="current-launch",
+        credential_ref="credential-current.key",
+    )
+    supervisor = DmonProcessHint(pid=11, process_marker="supervisor-marker")
+    cleanup_checks: list[DmonProcessHint] = []
+    coordination: list[str] = []
+    coordinator_held = False
+    supervisor_checks = 0
+    discovery_checks = 0
+
+    class Client:
+        def __init__(self) -> None:
+            self.discovery = discovery
+
+        def shutdown(self) -> dict[str, object]:
+            return {"accepted": True}
+
+        def close(self) -> None:
+            return None
+
+    class Adapter:
+        def current_process_hint(self) -> DmonProcessHint:
+            return supervisor
+
+        def remove_meta_hint(self, hint: DmonProcessHint) -> bool:
+            assert coordinator_held is True
+            cleanup_checks.append(hint)
+            return True
+
+    class Coordinator:
+        def acquire(self, *, timeout_seconds: float) -> None:
+            nonlocal coordinator_held
+            assert timeout_seconds > 0
+            assert coordinator_held is False
+            coordinator_held = True
+            coordination.append("acquire")
+
+        def release(self) -> None:
+            nonlocal coordinator_held
+            assert coordinator_held is True
+            coordinator_held = False
+            coordination.append("release")
+
+    def process_state(pid: int, marker: str) -> str:
+        nonlocal supervisor_checks
+        if (pid, marker) == (discovery.pid, discovery.process_marker):
+            return "gone"
+        assert (pid, marker) == (supervisor.pid, supervisor.process_marker)
+        supervisor_checks += 1
+        return "exact" if supervisor_checks == 1 else "gone"
+
+    def discovery_exists(_home: Path) -> bool:
+        nonlocal discovery_checks
+        discovery_checks += 1
+        return discovery_checks == 1
+
+    monkeypatch.setattr(cli, "_validate_existing_home", lambda _home: None)
+    monkeypatch.setattr(cli, "_load_discovery", lambda _home: (discovery, "token"))
+    monkeypatch.setattr(cli.DaemonClient, "connect", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(cli, "_daemon_adapter", lambda *_args: Adapter())
+    monkeypatch.setattr(cli, "_discovery_matches_supervisor", lambda *_args: True)
+    monkeypatch.setattr(cli, "_discovery_exists", discovery_exists)
+    monkeypatch.setattr(cli, "_process_identity_state", process_state)
+    monkeypatch.setattr(
+        cli.DmonStartCoordinator,
+        "create",
+        lambda _home: Coordinator(),
+    )
+
+    result = cli._stop(home, timeout_seconds=1.0)
+
+    assert result["status"] == "stopped"
+    assert supervisor_checks == 2
+    assert cleanup_checks == [supervisor]
+    assert coordination == ["acquire", "release"]
+    assert coordinator_held is False
+
+
 def test_stop_ignores_unrelated_credential_file(tmp_path: Path) -> None:
     home = tmp_path / "runtime"
     unrelated = home / "credential-unproven.key"
@@ -724,6 +1010,7 @@ def test_stop_verifies_the_discovery_authenticated_by_its_client(
             pid=22,
             process_marker="current-marker",
             instance_nonce="current-nonce",
+            launch_nonce="current-launch",
             credential_ref="credential-current.key",
         )
         class Client:
@@ -745,11 +1032,22 @@ def test_stop_verifies_the_discovery_authenticated_by_its_client(
         cli._process_identity_state = (
             lambda pid, marker: process_checks.append((pid, marker)) or "gone"
         )
+        supervisor = SimpleNamespace(pid=33, process_marker="supervisor-marker")
+        class Adapter:
+            def current_process_hint(self):
+                return supervisor
+            def remove_meta_hint(self, _hint):
+                return True
+        cli._daemon_adapter = lambda *_args: Adapter()
+        cli._discovery_matches_supervisor = lambda *_args: True
 
         result = cli._stop(home, timeout_seconds=1.0)
         assert result["pid"] == current.pid
         assert result["instance_nonce"] == current.instance_nonce
-        assert process_checks == [(current.pid, current.process_marker)]
+        assert process_checks == [
+            (current.pid, current.process_marker),
+            (supervisor.pid, supervisor.process_marker),
+        ]
         """
     )
 

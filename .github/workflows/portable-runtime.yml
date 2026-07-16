@@ -1,0 +1,29 @@
+name: portable-runtime
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.3"
+          enable-cache: true
+      - run: uv sync --frozen --extra dev
+      - run: uv lock --check
+      - run: uv run --frozen --extra dev pytest -q tests/test_portable_runtime_policy.py
+      - run: uv run --frozen --extra dev ruff check .
+      - run: uv run --frozen --extra dev pytest -q

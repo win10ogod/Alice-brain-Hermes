@@ -263,6 +263,27 @@ def test_restart_grace_refresh_never_regresses_persisted_time(
         assert refreshed.disconnected_at == baseline
 
 
+def test_restart_grace_timestamp_is_generated_inside_write_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _engine, _instance = make_engine(tmp_path)
+    assert ledger.recover_stale_bridge_connections() == 1
+    original = ledger._bridge_timestamp
+    transaction_states: list[bool] = []
+
+    def timestamp(last_seen=None):
+        transaction_states.append(ledger._connection.in_transaction)
+        return original(last_seen)
+
+    monkeypatch.setattr(ledger, "_bridge_timestamp", timestamp)
+
+    with ledger:
+        assert ledger.refresh_daemon_restart_grace() == 1
+
+    assert transaction_states == [True]
+
+
 @pytest.mark.parametrize(
     "updates",
     [

@@ -256,9 +256,6 @@ def test_ledger_connection_is_not_a_sqlite_backup_deserialize_or_extension_targe
         )
         assert ledger.list_brain_ids() == []
 
-        retained = ledger._retained_files
-        assert retained is None or retained._opening_connection is None
-
 
 class _RollbackFaultConnection:
     def __init__(

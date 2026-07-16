@@ -1493,13 +1493,10 @@ def test_real_hermes_0182_context_exposes_expected_lazy_contract(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    host = pytest.importorskip(
-        "hermes_cli.plugins",
-        reason="real Hermes contract requires the local 0.18.2 checkout",
-    )
-    hermes = pytest.importorskip("hermes_cli")
-    if getattr(hermes, "__version__", None) != "0.18.2":
-        pytest.skip("real contract is pinned to Hermes Agent 0.18.2")
+    import hermes_cli as hermes
+    from hermes_cli import plugins as host
+
+    assert hermes.__version__ == "0.18.2"
 
     from alice_brain_hermes.hermes import registration
 

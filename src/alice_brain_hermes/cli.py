@@ -6,10 +6,8 @@ import argparse
 import json
 import math
 import os
-import queue
-import subprocess
+import secrets
 import sys
-import threading
 import time
 from collections.abc import Sequence
 from contextlib import suppress
@@ -27,20 +25,24 @@ from alice_brain_hermes.protocol.diagnostics import (
     IdentitySnapshotV1,
     TracePageV1,
 )
+from alice_brain_hermes.protocol.models import PROTOCOL_VERSION, DaemonDiscoveryV2
 from alice_brain_hermes.protocol.status import DaemonRuntimeStatusV1
 from alice_brain_hermes.runtime.discovery import (
     _private_home,
     load_discovery_and_credential,
 )
 from alice_brain_hermes.runtime.process_marker import read_process_marker
+from alice_brain_hermes.runtime.supervisor import (
+    DmonAdapter,
+    DmonCoordinationTimeout,
+    DmonIdentityError,
+    DmonProcessHint,
+    DmonStartCoordinator,
+)
 
 _CLI_SCHEMA_VERSION = 1
 _DEFAULT_TIMEOUT_SECONDS = 10.0
 _MAX_TIMEOUT_SECONDS = 300.0
-_MAX_READINESS_BYTES = 4_096
-_READINESS_FAILURE_CODES = frozenset(
-    {"runtime_owned", "shutdown_unproven", "startup_failed"}
-)
 
 
 class _UsageError(Exception):
@@ -289,7 +291,10 @@ def _validate_status_payloads(
     runtime: dict[str, object],
 ) -> None:
     health_fields = {
+        "pid",
         "instance_nonce",
+        "launch_nonce",
+        "package_version",
         "process_marker",
         "shutting_down",
         "protocol_version",
@@ -301,9 +306,15 @@ def _validate_status_payloads(
         "degraded_brain_count",
     }
     valid = set(health) == health_fields
+    valid = valid and type(health.get("pid")) is int and int(health["pid"]) > 0
     valid = valid and all(
         isinstance(health.get(field), str) and bool(health[field])
-        for field in ("instance_nonce", "process_marker")
+        for field in (
+            "instance_nonce",
+            "launch_nonce",
+            "package_version",
+            "process_marker",
+        )
     )
     valid = valid and all(
         type(health.get(field)) is bool for field in ("shutting_down", "runtime_ready")
@@ -356,7 +367,7 @@ def _live_status(
     home: Path,
     *,
     timeout_seconds: float,
-) -> tuple[object, dict[str, object], dict[str, object]]:
+) -> tuple[DaemonDiscoveryV2, dict[str, object], dict[str, object]]:
     _load_discovery(home)
     try:
         client = DaemonClient.connect(home, timeout_seconds=timeout_seconds)
@@ -488,9 +499,12 @@ def _status(home: Path, *, timeout_seconds: float) -> dict[str, object]:
         timeout_seconds=timeout_seconds,
     )
     if (
-        health["instance_nonce"] != discovery.instance_nonce
+        health["pid"] != discovery.pid
+        or health["instance_nonce"] != discovery.instance_nonce
+        or health["launch_nonce"] != discovery.launch_nonce
         or health["process_marker"] != discovery.process_marker
         or health["protocol_version"] != discovery.protocol_version
+        or health["package_version"] != discovery.package_version
     ):
         raise _CliFailure(
             "daemon_status_invalid",
@@ -501,6 +515,7 @@ def _status(home: Path, *, timeout_seconds: float) -> dict[str, object]:
         "pid": discovery.pid,
         "process_marker": discovery.process_marker,
         "instance_nonce": discovery.instance_nonce,
+        "launch_nonce": discovery.launch_nonce,
         "endpoint": discovery.endpoint.model_dump(mode="json"),
         "protocol_version": discovery.protocol_version,
         "package_version": discovery.package_version,
@@ -536,181 +551,154 @@ def _status(home: Path, *, timeout_seconds: float) -> dict[str, object]:
     }
 
 
-def _read_readiness(
-    process: subprocess.Popen[bytes],
-    *,
-    timeout_seconds: float,
-) -> bytes:
-    if process.stdout is None:
-        raise _CliFailure("startup_failed", "daemon readiness pipe is unavailable")
-    results: queue.Queue[bytes | BaseException] = queue.Queue(maxsize=1)
-
-    def read_once() -> None:
-        try:
-            first = process.stdout.readline(_MAX_READINESS_BYTES + 1)
-            if len(first) <= _MAX_READINESS_BYTES and first.endswith(b"\n"):
-                # The daemon consumes and closes its one-shot readiness
-                # descriptor after the line.  Reading one more byte proves
-                # there is no second record or trailing garbage.
-                first += process.stdout.read(1)
-            results.put(first)
-        except BaseException as error:
-            results.put(error)
-
-    reader = threading.Thread(
-        target=read_once,
-        name="alice-brain-hermes-readiness",
-        daemon=True,
-    )
-    reader.start()
-    try:
-        result = results.get(timeout=timeout_seconds)
-    except queue.Empty as error:
-        _terminate_spawned(process, timeout_seconds=timeout_seconds)
-        raise _CliFailure(
-            "startup_timeout",
-            "daemon did not report readiness before the timeout",
-            exit_code=5,
-        ) from error
-    finally:
-        with suppress(BaseException):
-            process.stdout.close()
-        reader.join(timeout=min(timeout_seconds, 1.0))
-    if reader.is_alive():
-        _terminate_spawned(process, timeout_seconds=timeout_seconds)
-        raise _CliFailure(
-            "startup_cleanup_unproven",
-            "daemon readiness reader did not terminate",
-            exit_code=5,
-        )
-    if isinstance(result, BaseException):
-        _terminate_spawned(process, timeout_seconds=timeout_seconds)
-        raise _CliFailure(
-            "startup_failed",
-            "daemon readiness could not be read",
-            exit_code=5,
-        ) from result
-    return result
-
-
-def _decode_readiness(payload: bytes) -> dict[str, object]:
-    invalid = (
-        not payload
-        or len(payload) > _MAX_READINESS_BYTES
-        or not payload.endswith(b"\n")
-        or payload.count(b"\n") != 1
-    )
-    if invalid:
-        raise _CliFailure(
-            "startup_failed",
-            "daemon returned an invalid readiness signal",
-            exit_code=5,
-        )
-
-    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, item in pairs:
-            if key in result:
-                raise ValueError("duplicate readiness key")
-            result[key] = item
-        return result
-
-    def reject_constant(_value: str) -> None:
-        raise ValueError("non-finite readiness value")
-
-    try:
-        value = json.loads(
-            payload[:-1].decode("utf-8", errors="strict"),
-            object_pairs_hook=unique_object,
-            parse_constant=reject_constant,
-        )
-    except (UnicodeError, ValueError, json.JSONDecodeError) as error:
-        raise _CliFailure(
-            "startup_failed",
-            "daemon returned an invalid readiness signal",
-            exit_code=5,
-        ) from error
-    if not isinstance(value, dict) or type(value.get("ready")) is not bool:
-        raise _CliFailure(
-            "startup_failed",
-            "daemon returned an invalid readiness signal",
-            exit_code=5,
-        )
-    if value["ready"] is True:
-        nonce = value.get("instance_nonce")
-        valid = (
-            set(value) == {"ready", "instance_nonce"}
-            and isinstance(nonce, str)
-            and 1 <= len(nonce) <= 128
-            and all(
-                character.isascii() and (character.isalnum() or character in "_-")
-                for character in nonce
-            )
-        )
-    else:
-        code = value.get("code")
-        valid = set(value) == {"ready", "code"} and code in _READINESS_FAILURE_CODES
-    if not valid:
-        raise _CliFailure(
-            "startup_failed",
-            "daemon returned an invalid readiness signal",
-            exit_code=5,
-        )
-    return value
-
-
-def _terminate_spawned(
-    process: subprocess.Popen[bytes],
-    *,
-    timeout_seconds: float,
-) -> None:
-    if process.poll() is not None:
-        return
-    deadline = time.monotonic() + timeout_seconds
-    with suppress(OSError):
-        process.terminate()
-    try:
-        process.wait(timeout=max(0.0, deadline - time.monotonic()))
-    except (OSError, subprocess.TimeoutExpired):
-        with suppress(OSError):
-            process.kill()
-        with suppress(OSError, subprocess.TimeoutExpired):
-            process.wait(timeout=max(0.0, deadline - time.monotonic()))
-    if process.poll() is None:
-        raise _CliFailure(
-            "startup_cleanup_unproven",
-            "spawned daemon termination could not be proven",
-            exit_code=5,
-        )
-
-
-def _spawn_daemon(home: Path) -> subprocess.Popen[bytes]:
-    creationflags = 0
-    start_new_session = os.name == "posix"
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
-            subprocess, "DETACHED_PROCESS", 0
-        )
-    return subprocess.Popen(
+def _daemon_adapter(home: Path, launch_nonce: str) -> DmonAdapter:
+    return DmonAdapter.create(
+        home,
         [
             sys.executable,
             "-m",
             "alice_brain_hermes.runtime.daemon",
             "--runtime-home",
             os.fspath(home),
-            "--readiness-fd",
-            "1",
+            "--launch-nonce",
+            launch_nonce,
         ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        start_new_session=start_new_session,
-        creationflags=creationflags,
+        launch_nonce=launch_nonce,
     )
 
 
-def _start(home: Path, *, timeout_seconds: float) -> dict[str, object]:
+def _failure_diagnostics(adapter: DmonAdapter) -> dict[str, object] | None:
+    data: dict[str, object] = {}
+    dmon_output = adapter.redacted_dmon_output()
+    log_tail = adapter.redacted_log_tail()
+    if dmon_output:
+        data["dmon_output"] = dmon_output
+    if log_tail:
+        data["log_tail"] = log_tail
+    return data or None
+
+
+def _start_failure_diagnostics(
+    adapter: DmonAdapter,
+    error: DmonIdentityError,
+) -> dict[str, object] | None:
+    data = _failure_diagnostics(adapter) or {}
+    if error.meta_hint is not None:
+        data["process_hint"] = {
+            "pid": error.meta_hint.pid,
+            "create_time": error.meta_hint.create_time,
+        }
+    return data or None
+
+
+def _cleanup_failed_launch(
+    adapter: DmonAdapter,
+    hint: DmonProcessHint,
+    *,
+    timeout_seconds: float,
+) -> None:
+    try:
+        adapter.terminate_exact(hint, timeout_seconds=timeout_seconds)
+    except DmonIdentityError as error:
+        raise _CliFailure(
+            "startup_cleanup_unproven",
+            "daemon startup cleanup could not prove exact child termination",
+            data=_failure_diagnostics(adapter),
+            exit_code=5,
+        ) from error
+    if not adapter.remove_meta_hint(hint):
+        raise _CliFailure(
+            "startup_cleanup_unproven",
+            "daemon startup artifacts could not be cleaned exactly",
+            data=_failure_diagnostics(adapter),
+            exit_code=5,
+        )
+
+
+def _authenticated_start_identity(
+    discovery: DaemonDiscoveryV2,
+    health: dict[str, object],
+    runtime: dict[str, object],
+    *,
+    adapter: DmonAdapter,
+    hint: DmonProcessHint,
+) -> bool:
+    return (
+        _discovery_matches_supervisor(discovery, hint)
+        and discovery.launch_nonce == adapter.launch_nonce
+        and discovery.protocol_version == PROTOCOL_VERSION
+        and discovery.package_version == __version__
+        and health.get("pid") == discovery.pid
+        and health.get("process_marker") == discovery.process_marker
+        and health.get("instance_nonce") == discovery.instance_nonce
+        and health.get("launch_nonce") == discovery.launch_nonce
+        and health.get("protocol_version") == discovery.protocol_version
+        and health.get("package_version") == discovery.package_version
+        and health.get("runtime_ready") is True
+        and runtime.get("runtime_ready") is True
+    )
+
+
+def _exact_process_for_hint(hint: DmonProcessHint) -> psutil.Process | None:
+    try:
+        process = psutil.Process(hint.pid)
+        created = process.create_time()
+    except (OSError, psutil.Error):
+        return None
+    if (
+        isinstance(created, bool)
+        or not isinstance(created, (int, float))
+        or not math.isfinite(float(created))
+        or created <= 0
+    ):
+        return None
+    marker = f"psutil-create-time-us:{round(float(created) * 1_000_000)}"
+    return process if marker == hint.process_marker else None
+
+
+def _discovery_matches_supervisor(
+    discovery: DaemonDiscoveryV2,
+    hint: DmonProcessHint,
+) -> bool:
+    parent = _exact_process_for_hint(hint)
+    if parent is None:
+        return False
+    if discovery.pid == hint.pid:
+        return discovery.process_marker == hint.process_marker
+    child_hint = DmonProcessHint(
+        pid=discovery.pid,
+        process_marker=discovery.process_marker,
+    )
+    child = _exact_process_for_hint(child_hint)
+    if child is None:
+        return False
+    try:
+        parent_pid = child.ppid()
+    except (OSError, psutil.Error):
+        return False
+    return (
+        parent_pid == parent.pid
+        and _exact_process_for_hint(hint) is not None
+        and _exact_process_for_hint(child_hint) is not None
+    )
+
+
+def _running_start_result(
+    discovery: DaemonDiscoveryV2,
+    *,
+    started: bool,
+) -> dict[str, object]:
+    return {
+        "status": "running",
+        "started": started,
+        "already_running": not started,
+        "readiness_verified": True,
+        "pid": discovery.pid,
+        "instance_nonce": discovery.instance_nonce,
+    }
+
+
+def _start_coordinated(home: Path, *, timeout_seconds: float) -> dict[str, object]:
     if _home_exists(home):
         _validate_existing_home(home)
         if _discovery_exists(home):
@@ -723,86 +711,135 @@ def _start(home: Path, *, timeout_seconds: float) -> dict[str, object]:
                 if error.code not in {"daemon_unreachable"}:
                     raise
             else:
-                return {
-                    "status": "running",
-                    "started": False,
-                    "already_running": True,
-                    "readiness_verified": True,
-                    "pid": discovery.pid,
-                    "instance_nonce": discovery.instance_nonce,
-                }
+                return _running_start_result(discovery, started=False)
 
-    process = _spawn_daemon(home)
-    readiness_payload = _read_readiness(process, timeout_seconds=timeout_seconds)
+    launch_nonce = secrets.token_hex(32)
+    adapter = _daemon_adapter(home, launch_nonce)
     try:
-        readiness = _decode_readiness(readiness_payload)
-    except _CliFailure:
-        _terminate_spawned(process, timeout_seconds=timeout_seconds)
-        raise
-    if readiness["ready"] is not True:
-        code = readiness.get("code")
-        try:
-            process.wait(timeout=timeout_seconds)
-        except (OSError, subprocess.TimeoutExpired):
-            _terminate_spawned(process, timeout_seconds=timeout_seconds)
-        if code == "runtime_owned":
+        hint = adapter.start()
+    except DmonIdentityError as error:
+        if error.cleanup_unproven:
+            raise _CliFailure(
+                "startup_cleanup_unproven",
+                "daemon launch state remains quarantined pending exact cleanup",
+                data=_start_failure_diagnostics(adapter, error),
+                exit_code=5,
+            ) from error
+        raise _CliFailure(
+            "startup_failed",
+            "python-dmon could not establish the daemon child identity",
+            data=_start_failure_diagnostics(adapter, error),
+            exit_code=5,
+        ) from error
+
+    try:
+        return _await_started_daemon(
+            home,
+            timeout_seconds=timeout_seconds,
+            adapter=adapter,
+            hint=hint,
+        )
+    finally:
+        adapter.release_parent_guard()
+
+
+def _await_started_daemon(
+    home: Path,
+    *,
+    timeout_seconds: float,
+    adapter: DmonAdapter,
+    hint: DmonProcessHint,
+) -> dict[str, object]:
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if _discovery_exists(home):
             try:
-                discovery, _health, _runtime = _live_status(
+                discovery, health, runtime = _live_status(
                     home,
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=max(0.01, min(remaining, 0.25)),
                 )
             except _CliFailure:
                 pass
             else:
-                return {
-                    "status": "running",
-                    "started": False,
-                    "already_running": True,
-                    "readiness_verified": True,
-                    "pid": discovery.pid,
-                    "instance_nonce": discovery.instance_nonce,
-                }
-        raise _CliFailure(
-            str(code) if isinstance(code, str) and code else "startup_failed",
-            "daemon startup failed",
-            exit_code=5,
-        )
+                if _authenticated_start_identity(
+                    discovery,
+                    health,
+                    runtime,
+                    adapter=adapter,
+                    hint=hint,
+                ):
+                    return _running_start_result(discovery, started=True)
+                if discovery.launch_nonce == adapter.launch_nonce:
+                    _cleanup_failed_launch(
+                        adapter,
+                        hint,
+                        timeout_seconds=max(0.01, remaining),
+                    )
+                    raise _CliFailure(
+                        "startup_failed",
+                        "daemon authenticated readiness identity did not match",
+                        data=_failure_diagnostics(adapter),
+                        exit_code=5,
+                    )
 
-    instance_nonce = readiness.get("instance_nonce")
-    if not isinstance(instance_nonce, str) or not instance_nonce:
-        _terminate_spawned(process, timeout_seconds=timeout_seconds)
-        raise _CliFailure(
-            "startup_failed",
-            "daemon readiness omitted its instance identity",
-            exit_code=5,
-        )
+        process_state = _process_identity_state(hint.pid, hint.process_marker)
+        if process_state in {"gone", "reused"}:
+            adapter.remove_meta_hint(hint)
+            if _discovery_exists(home):
+                try:
+                    discovery, _health, _runtime = _live_status(
+                        home,
+                        timeout_seconds=max(0.01, min(remaining, 0.25)),
+                    )
+                except _CliFailure:
+                    pass
+                else:
+                    return _running_start_result(discovery, started=False)
+            raise _CliFailure(
+                "startup_failed",
+                "daemon exited before authenticated readiness",
+                data=_failure_diagnostics(adapter),
+                exit_code=5,
+            )
+        if remaining <= 0:
+            _cleanup_failed_launch(
+                adapter,
+                hint,
+                timeout_seconds=max(0.01, timeout_seconds),
+            )
+            raise _CliFailure(
+                "startup_timeout",
+                "daemon did not prove authenticated readiness before the timeout",
+                data=_failure_diagnostics(adapter),
+                exit_code=5,
+            )
+        time.sleep(min(0.02, remaining))
+
+
+def _start(home: Path, *, timeout_seconds: float) -> dict[str, object]:
+    started = time.monotonic()
+    coordinator = DmonStartCoordinator.create(home)
     try:
-        discovery, health, _runtime = _live_status(
-            home,
-            timeout_seconds=timeout_seconds,
-        )
-    except _CliFailure:
-        _terminate_spawned(process, timeout_seconds=timeout_seconds)
-        raise
-    if (
-        discovery.pid != process.pid
-        or discovery.instance_nonce != instance_nonce
-        or health.get("runtime_ready") is not True
-    ):
-        _terminate_spawned(process, timeout_seconds=timeout_seconds)
+        coordinator.acquire(timeout_seconds=timeout_seconds)
+    except DmonCoordinationTimeout as error:
         raise _CliFailure(
-            "startup_failed",
-            "daemon readiness identity could not be verified",
+            "startup_coordination_timeout",
+            "another parent still owns daemon launch coordination",
             exit_code=5,
-        )
-    return {
-        "status": "running",
-        "started": True,
-        "already_running": False,
-        "readiness_verified": True,
-        "pid": discovery.pid,
-        "instance_nonce": discovery.instance_nonce,
-    }
+        ) from error
+    try:
+        remaining = timeout_seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            raise _CliFailure(
+                "startup_coordination_timeout",
+                "daemon launch coordination exhausted the startup timeout",
+                exit_code=5,
+            )
+        return _start_coordinated(home, timeout_seconds=remaining)
+    finally:
+        coordinator.release()
 
 
 def _process_identity_state(
@@ -820,7 +857,7 @@ def _process_identity_state(
     return "exact" if current == process_marker else "reused"
 
 
-def _stop(home: Path, *, timeout_seconds: float) -> dict[str, object]:
+def _stop_coordinated(home: Path, *, timeout_seconds: float) -> dict[str, object]:
     if not _home_exists(home):
         return {
             "already_stopped": True,
@@ -846,6 +883,25 @@ def _stop(home: Path, *, timeout_seconds: float) -> dict[str, object]:
             exit_code=3,
         ) from error
     discovery = client.discovery
+    adapter = _daemon_adapter(home, discovery.launch_nonce)
+    try:
+        supervisor_hint = adapter.current_process_hint()
+    except DmonIdentityError as error:
+        with suppress(BaseException):
+            client.close()
+        raise _CliFailure(
+            "shutdown_cleanup_unproven",
+            "daemon supervisor identity is not verifiable",
+            exit_code=5,
+        ) from error
+    if not _discovery_matches_supervisor(discovery, supervisor_hint):
+        with suppress(BaseException):
+            client.close()
+        raise _CliFailure(
+            "shutdown_cleanup_unproven",
+            "daemon supervisor identity does not match discovery",
+            exit_code=5,
+        )
     try:
         client.shutdown()
     except DaemonRpcError as error:
@@ -868,18 +924,37 @@ def _stop(home: Path, *, timeout_seconds: float) -> dict[str, object]:
     deadline = time.monotonic() + timeout_seconds
     credential_path = home / discovery.credential_ref
     last_process_state = "exact"
+    last_supervisor_state = "exact"
     while time.monotonic() < deadline:
         last_process_state = _process_identity_state(
             discovery.pid,
             discovery.process_marker,
         )
+        if (
+            supervisor_hint.pid == discovery.pid
+            and supervisor_hint.process_marker == discovery.process_marker
+        ):
+            last_supervisor_state = last_process_state
+        else:
+            last_supervisor_state = _process_identity_state(
+                supervisor_hint.pid,
+                supervisor_hint.process_marker,
+            )
         discovery_present = _discovery_exists(home)
         credential_present = credential_path.exists() or credential_path.is_symlink()
         if (
             last_process_state in {"gone", "reused"}
+            and last_supervisor_state in {"gone", "reused"}
             and not discovery_present
             and not credential_present
         ):
+            cleaned = adapter.remove_meta_hint(supervisor_hint)
+            if not cleaned:
+                raise _CliFailure(
+                    "shutdown_cleanup_unproven",
+                    "daemon stopped but supervisor artifacts remain quarantined",
+                    exit_code=5,
+                )
             return {
                 "already_stopped": False,
                 "instance_nonce": discovery.instance_nonce,
@@ -888,10 +963,10 @@ def _stop(home: Path, *, timeout_seconds: float) -> dict[str, object]:
                 "stop_requested": True,
             }
         time.sleep(0.02)
-    if last_process_state == "ambiguous":
+    if "ambiguous" in {last_process_state, last_supervisor_state}:
         raise _CliFailure(
             "shutdown_unproven",
-            "daemon process identity became unverifiable during shutdown",
+            "daemon process tree identity became unverifiable during shutdown",
             data={"instance_nonce": discovery.instance_nonce, "pid": discovery.pid},
             exit_code=5,
         )
@@ -901,6 +976,30 @@ def _stop(home: Path, *, timeout_seconds: float) -> dict[str, object]:
         data={"instance_nonce": discovery.instance_nonce, "pid": discovery.pid},
         exit_code=5,
     )
+
+
+def _stop(home: Path, *, timeout_seconds: float) -> dict[str, object]:
+    started = time.monotonic()
+    coordinator = DmonStartCoordinator.create(home)
+    try:
+        coordinator.acquire(timeout_seconds=timeout_seconds)
+    except DmonCoordinationTimeout as error:
+        raise _CliFailure(
+            "shutdown_coordination_timeout",
+            "another parent owns daemon lifecycle coordination",
+            exit_code=5,
+        ) from error
+    try:
+        remaining = timeout_seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            raise _CliFailure(
+                "shutdown_coordination_timeout",
+                "daemon lifecycle coordination exhausted the shutdown timeout",
+                exit_code=5,
+            )
+        return _stop_coordinated(home, timeout_seconds=remaining)
+    finally:
+        coordinator.release()
 
 
 def _doctor(home: Path, *, timeout_seconds: float) -> tuple[dict[str, object], int]:

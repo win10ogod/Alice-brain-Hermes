@@ -142,13 +142,13 @@ def test_runtime_status_rejects_false_completeness_and_count_collisions() -> Non
                 "brain_ids": ("00000000-0000-4000-8000-000000000001",),
             }
         )
-    with pytest.raises(ValidationError):
-        DaemonRuntimeStatusV1(
-            **{
-                **base,
-                "runtime_ready": False,
-            }
-        )
+    gated = DaemonRuntimeStatusV1(
+        **{
+            **base,
+            "runtime_ready": False,
+        }
+    )
+    assert gated.runtime_ready is False
 
 
 def test_running_but_degraded_scheduler_is_ready_without_claiming_health() -> None:

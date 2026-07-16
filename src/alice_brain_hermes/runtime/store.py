@@ -71,7 +71,7 @@ from alice_brain_hermes.protocol.models import (
     validate_observation,
     validate_observation_json,
 )
-from alice_brain_hermes.runtime.lease import RetainedSQLiteFiles, RuntimeLease
+from alice_brain_hermes.runtime.lease import RuntimeLease
 from alice_brain_hermes.runtime.semantic_ingest import (
     HermesSpan,
     SemanticPlan,
@@ -90,6 +90,12 @@ DEFAULT_MAX_FRAME_BYTES = 65_536
 DEFAULT_MAX_ACK_BYTES = 4_194_304
 _LEGACY_STATE_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 _SQLITE_BRIDGE_SCHEMA_VERSIONS = frozenset({3, 4, 5, SQLITE_SCHEMA_VERSION})
+_SQLITE_RUNTIME_NAMES = (
+    "runtime.db",
+    "runtime.db-wal",
+    "runtime.db-shm",
+    "runtime.db-journal",
+)
 
 _SQLITE_MUTATION_ACTIONS = frozenset(
     {
@@ -131,6 +137,28 @@ _IDENTITY_WORKER_FAILURE_CODE = re.compile(
 )
 _IDENTITY_ADAPTER_ID = "alice-brain-hermes-identity-v1"
 _IDENTITY_PURPOSE = "identity_self_naming"
+
+
+def _assert_safe_runtime_sqlite_paths(
+    database: Path,
+    authority: RuntimeLease,
+) -> None:
+    """Reject paths SQLite could follow or replace outside the owned home."""
+    authority.assert_authority()
+    for name in _SQLITE_RUNTIME_NAMES:
+        candidate = database.parent / name
+        try:
+            candidate.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise PermissionError(
+                f"SQLite runtime path is not verifiable: {name}"
+            ) from error
+        unsafe = candidate.is_symlink() or not candidate.is_file()
+        if unsafe:
+            raise PermissionError(f"SQLite runtime path is unsafe: {name}")
+    authority.assert_authority()
 
 
 _CREATE_BASE_SCHEMA = """
@@ -498,17 +526,15 @@ class SQLiteLedger:
         path: Path,
         connection: _RestrictedSQLiteConnection,
         *,
-        retained_files: RetainedSQLiteFiles | None = None,
+        authority: RuntimeLease | None = None,
     ) -> None:
         self.path = path
         self._connection = connection
-        self._retained_files = retained_files
-        self._lease_registry: RuntimeLease | None = None
+        self._lease_registry = authority
         self._creator_pid = os.getpid()
         self._lock = threading.RLock()
         self._closed = False
         self._connection_closed = False
-        self._retained_files_closed = retained_files is None
         self._startup_audited_final_states: dict[str, BrainState] = {}
         self._mutation_seal_installed = False
         self._mutation_seal_poisoned = False
@@ -516,90 +542,71 @@ class SQLiteLedger:
         self._authorized_transaction_thread: int | None = None
 
     @classmethod
-    def open(cls, path: str | Path) -> SQLiteLedger:
-        """Open or initialize a WAL ledger, rejecting unknown schemas."""
-        database = Path(path)
-        database.parent.mkdir(parents=True, exist_ok=True)
-        return cls._open_database(database, logical_path=database)
-
-    @classmethod
-    def open_retained(
+    def open(
         cls,
-        retained_files: RetainedSQLiteFiles,
+        path: str | Path,
         *,
+        authority: RuntimeLease | None = None,
         owner_sink: Callable[[SQLiteLedger], None] | None = None,
     ) -> SQLiteLedger:
-        """Open SQLite through one pinned main-file descriptor."""
+        """Open or initialize a WAL ledger, rejecting unknown schemas."""
+        database = Path(path)
+        if authority is None:
+            database.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            database = cls._validate_runtime_paths(database, authority)
+        return cls._open_database(
+            database,
+            authority=authority,
+            owner_sink=owner_sink,
+        )
 
-        if not isinstance(retained_files, RetainedSQLiteFiles):
-            raise TypeError("retained_files must be RetainedSQLiteFiles")
-        with retained_files.startup_operation():
-            try:
-                retained_files.verify()
-            except BaseException as primary_error:
-                traceback = primary_error.__traceback__
-                try:
-                    retained_files.close()
-                except BaseException as cleanup_error:
-                    raise primary_error.with_traceback(traceback) from cleanup_error
-                raise
-            return cls._open_database(
-                retained_files.connection_path,
-                logical_path=retained_files.logical_path,
-                retained_files=retained_files,
-                owner_sink=owner_sink,
-            )
+    @classmethod
+    def _validate_runtime_paths(
+        cls,
+        path: str | Path,
+        authority: RuntimeLease,
+    ) -> Path:
+        if not isinstance(authority, RuntimeLease):
+            raise TypeError("authority must be RuntimeLease")
+        database = Path(path)
+        home = authority.assert_authority()
+        if (
+            database.name != "runtime.db"
+            or database.parent.resolve(strict=True) != home
+        ):
+            raise PermissionError("SQLite path does not match runtime authority")
+        database = home / "runtime.db"
+        _assert_safe_runtime_sqlite_paths(database, authority)
+        return database
 
-    def _adopt_retained_lifetime(
-        self,
-        retained_files: RetainedSQLiteFiles,
-        *,
-        owner_sink: Callable[[SQLiteLedger], None] | None = None,
-    ) -> None:
-        """Attach a factory-opened ledger to the same lease ownership graph."""
+    def _adopt_runtime_authority(self, authority: RuntimeLease) -> None:
+        """Bind a custom factory ledger to the already-held runtime lease."""
         self._assert_creator_process()
-        if not isinstance(retained_files, RetainedSQLiteFiles):
-            raise TypeError("retained_files must be RetainedSQLiteFiles")
-        with retained_files.startup_operation(), self._lock:
-            if (
-                self._closed
-                or self._retained_files is not None
-                or self._lease_registry is not None
-            ):
-                raise RuntimeError("SQLite ledger ownership is already established")
-            retained_files.verify(allow_missing_transient=True)
-            try:
-                retained_files.adopt_opening_connection(self._connection)
-            except BaseException:
-                retained_files.quarantine_unadopted_connection(self._connection)
-                raise
-            self._retained_files = retained_files
-            self._retained_files_closed = False
-            database_rows = self._connection.execute("PRAGMA database_list").fetchall()
-            main_rows = [row for row in database_rows if row[1] == "main"]
-            if len(main_rows) != 1:
-                raise PermissionError("SQLite main connection is not unique")
-            retained_files.verify_connection_path(main_rows[0][2])
-            retained_files.verify(allow_missing_transient=True)
-            if owner_sink is not None:
-                owner_sink(self)
-            self._lease_registry = retained_files._lease
-            retained_files._lease._replace_retained_files(retained_files, self)
-            retained_files.transfer_opening_connection(self._connection)
+        if not isinstance(authority, RuntimeLease):
+            raise TypeError("authority must be RuntimeLease")
+        with self._lock:
+            if self._closed or self._lease_registry is not None:
+                raise RuntimeError("SQLite ledger authority is already established")
+            self._validate_runtime_paths(self.path, authority)
+            authority.register_resource(self)
+            self._lease_registry = authority
+            authority.assert_authority()
 
     @classmethod
     def _open_database(
         cls,
         database: Path,
         *,
-        logical_path: Path,
-        retained_files: RetainedSQLiteFiles | None = None,
+        authority: RuntimeLease | None = None,
         owner_sink: Callable[[SQLiteLedger], None] | None = None,
     ) -> SQLiteLedger:
         connection: Any | None = None
         restricted_connection: _RestrictedSQLiteConnection | None = None
         ledger: SQLiteLedger | None = None
         try:
+            if authority is not None:
+                _assert_safe_runtime_sqlite_paths(database, authority)
             connection = sqlite3.connect(
                 database,
                 timeout=30.0,
@@ -608,51 +615,41 @@ class SQLiteLedger:
                 cached_statements=0,
             )
             restricted_connection = _RestrictedSQLiteConnection(connection)
-            if retained_files is not None:
-                try:
-                    retained_files.adopt_opening_connection(restricted_connection)
-                except BaseException:
-                    retained_files.quarantine_unadopted_connection(
-                        restricted_connection
-                    )
-                    raise
             connection.row_factory = sqlite3.Row
             ledger = cls(
-                logical_path,
+                database,
                 restricted_connection,
-                retained_files=retained_files,
+                authority=authority,
             )
+            if authority is not None:
+                authority.register_resource(ledger)
+            if owner_sink is not None:
+                owner_sink(ledger)
             connection.execute("PRAGMA busy_timeout = 30000")
             connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA journal_mode = WAL")
+            if authority is not None:
+                authority.assert_authority()
+            journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+            if (
+                journal_mode is None
+                or not isinstance(journal_mode[0], str)
+                or journal_mode[0].casefold() != "wal"
+            ):
+                raise LedgerIntegrityError("SQLite journal mode is not WAL")
+            if authority is not None:
+                authority.assert_authority()
             connection.execute("PRAGMA synchronous = FULL")
             startup_data_version = ledger._read_mutation_data_version()
             ledger._initialize_schema()
             connection.set_authorizer(ledger._sqlite_authorizer)
             ledger._install_mutation_seal(expected_data_version=startup_data_version)
-            if retained_files is not None:
-                database_rows = connection.execute("PRAGMA database_list").fetchall()
-                main_rows = [row for row in database_rows if row[1] == "main"]
-                if len(main_rows) != 1:
-                    raise PermissionError("SQLite main connection is not unique")
-                retained_files.verify_connection_path(main_rows[0][2])
-                retained_files.verify(allow_missing_transient=True)
-            # Publish the fully initialized ledger only at the final handoff.
-            # From this point onward no startup path reacquires ledger._lock
-            # while the retained lifecycle fence is held.
-            if owner_sink is not None:
-                owner_sink(ledger)
-            if retained_files is not None:
-                ledger._lease_registry = retained_files._lease
-                retained_files._lease._replace_retained_files(retained_files, ledger)
-                retained_files.transfer_opening_connection(restricted_connection)
+            if authority is not None:
+                authority.assert_authority()
         except BaseException as primary_error:
             traceback = primary_error.__traceback__
             try:
                 if ledger is not None:
                     ledger.close()
-                elif retained_files is not None:
-                    retained_files.close()
                 elif restricted_connection is not None:
                     restricted_connection.close()
                 elif connection is not None:
@@ -1703,19 +1700,23 @@ class SQLiteLedger:
             self._ensure_open()
             return bool(self._connection.execute("PRAGMA foreign_keys").fetchone()[0])
 
+    @property
+    def journal_mode(self) -> str:
+        self._assert_creator_process()
+        with self._lock:
+            self._ensure_open()
+            row = self._connection.execute("PRAGMA journal_mode").fetchone()
+            if row is None or not isinstance(row[0], str):
+                raise LedgerIntegrityError("SQLite journal mode is unreadable")
+            return row[0].casefold()
+
     def _ensure_open(self) -> None:
         self._assert_creator_process()
         with self._lock:
             if self._closed:
                 raise LedgerClosedError("ledger is closed")
-            if self._retained_files is not None:
-                try:
-                    self._retained_files.verify(allow_missing_transient=True)
-                except Exception as error:
-                    self._mutation_seal_poisoned = True
-                    raise LedgerIntegrityError(
-                        "SQLite mutation seal detected a retained-file identity change"
-                    ) from error
+            if self._lease_registry is not None:
+                self._lease_registry.assert_authority()
             self._refresh_mutation_seal()
 
     @property
@@ -1807,6 +1808,8 @@ class SQLiteLedger:
                     self._connection.execute(begin)
                     self._refresh_mutation_seal()
                     yield
+                    if self._lease_registry is not None:
+                        self._lease_registry.assert_authority()
                     self._connection.commit()
                     if self._connection.in_transaction:
                         self._mutation_seal_poisoned = True
@@ -1815,6 +1818,8 @@ class SQLiteLedger:
                             "SQLite mutation seal detected a transaction "
                             "remaining open after commit"
                         )
+                    if self._lease_registry is not None:
+                        self._lease_registry.assert_authority()
                 except BaseException as error:
                     primary_error = error
                     primary_traceback = error.__traceback__
@@ -4148,8 +4153,8 @@ class SQLiteLedger:
 
     def recover_stale_bridge_connections(self) -> int:
         """Give every prior-process open stream one fresh restart grace."""
-        now = self._bridge_timestamp()
         with self._transaction(immediate=True):
+            now = self._bridge_timestamp()
             updated = self._connection.execute(
                 "UPDATE bridge_stream SET connected_nonce = NULL, "
                 "disconnected_reason = 'daemon_restart', "
@@ -4162,8 +4167,8 @@ class SQLiteLedger:
 
     def refresh_daemon_restart_grace(self) -> int:
         """Refresh only still-disconnected restart streams before readiness."""
-        now = self._bridge_timestamp()
         with self._transaction(immediate=True):
+            now = self._bridge_timestamp()
             updated = self._connection.execute(
                 "UPDATE bridge_stream SET "
                 "disconnected_at = CASE WHEN last_seen > ? THEN last_seen ELSE ? END, "
@@ -6356,51 +6361,27 @@ class SQLiteLedger:
         with self._lock:
             if self._closed:
                 if self._lease_registry is not None:
-                    self._lease_registry._discard_retained_files(self)
+                    self._lease_registry.discard_resource(self)
                     self._lease_registry = None
                 return
             if not self._connection_closed:
                 try:
                     self._connection.close()
-                except BaseException as primary_error:
+                except BaseException:
                     try:
                         _ = self._connection.in_transaction
                     except sqlite3.ProgrammingError:
                         self._connection_closed = True
-                        if self._retained_files is not None:
-                            try:
-                                self._retained_files.confirm_connection_closed(
-                                    self._connection
-                                )
-                            except BaseException as cleanup_error:
-                                raise primary_error from cleanup_error
-                    self._closed = (
-                        self._connection_closed and self._retained_files_closed
-                    )
-                    raise
-                else:
-                    self._connection_closed = True
-                    if self._retained_files is not None:
-                        self._retained_files.confirm_connection_closed(self._connection)
-            if not self._retained_files_closed:
-                if self._retained_files is None:
-                    raise AssertionError("retained SQLite owner is missing")
-                try:
-                    self._retained_files.close()
-                except BaseException:
-                    self._retained_files_closed = self._retained_files.closed
-                    self._closed = (
-                        self._connection_closed and self._retained_files_closed
-                    )
+                    self._closed = self._connection_closed
                     if self._closed and self._lease_registry is not None:
-                        self._lease_registry._discard_retained_files(self)
+                        self._lease_registry.discard_resource(self)
                         self._lease_registry = None
                     raise
                 else:
-                    self._retained_files_closed = True
-            self._closed = self._connection_closed and self._retained_files_closed
+                    self._connection_closed = True
+            self._closed = self._connection_closed
             if self._closed and self._lease_registry is not None:
-                self._lease_registry._discard_retained_files(self)
+                self._lease_registry.discard_resource(self)
                 self._lease_registry = None
 
     def __enter__(self) -> Self:

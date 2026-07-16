@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import select
 import socket
 import sqlite3
 import subprocess
@@ -14,6 +12,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+import psutil
 import pytest
 
 from alice_brain_hermes.errors import DaemonClientError, DaemonRpcError
@@ -49,6 +48,24 @@ def _wait_until(predicate: Any, timeout: float = 2.0) -> None:
             return
         time.sleep(0.005)
     raise AssertionError("condition did not become true")
+
+
+def _matches_launched_process(
+    *,
+    pid: int,
+    process_marker: str,
+    launched_pid: int,
+) -> bool:
+    if pid == launched_pid:
+        return True
+    try:
+        process = psutil.Process(pid)
+        created = process.create_time()
+        parent_pid = process.ppid()
+    except (OSError, psutil.Error):
+        return False
+    marker = f"psutil-create-time-us:{round(created * 1_000_000)}"
+    return parent_pid == launched_pid and marker == process_marker
 
 
 class _FaultingEvent:
@@ -2338,11 +2355,10 @@ def test_lost_close_ack_uses_authenticated_recovery_without_daemon_stop(
     bridge.stop_worker_for_test()
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="uses a POSIX readiness fd")
 def test_real_daemon_commit_projection_and_clean_close(tmp_path: Path) -> None:
     home = tmp_path / "real-daemon-runtime"
     home.mkdir(mode=0o700)
-    read_fd, write_fd = os.pipe()
+    launch_nonce = new_id()
     process = subprocess.Popen(
         [
             sys.executable,
@@ -2350,29 +2366,50 @@ def test_real_daemon_commit_projection_and_clean_close(tmp_path: Path) -> None:
             "alice_brain_hermes.runtime.daemon",
             "--runtime-home",
             str(home),
-            "--readiness-fd",
-            str(write_fd),
+            "--launch-nonce",
+            launch_nonce,
             "--scheduler-interval",
             "0.02",
             "--abandonment-grace",
             "30",
         ],
-        pass_fds=(write_fd,),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    os.close(write_fd)
     bridge: HookBridge | None = None
     try:
-        ready, _, _ = select.select([read_fd], [], [], 10)
-        assert ready
-        body = bytearray()
-        while b"\n" not in body:
-            chunk = os.read(read_fd, 4096)
-            if not chunk:
-                break
-            body.extend(chunk)
-        assert json.loads(bytes(body))["ready"] is True
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                pytest.fail(
+                    f"daemon exited before readiness: {process.returncode}; "
+                    f"stdout={stdout!r}; stderr={stderr!r}"
+                )
+            probe: DaemonClient | None = None
+            try:
+                probe = DaemonClient.connect(home, timeout_seconds=0.25)
+                health = probe.health()
+                status = probe.call("daemon.status", {})
+                if (
+                    _matches_launched_process(
+                        pid=probe.discovery.pid,
+                        process_marker=probe.discovery.process_marker,
+                        launched_pid=process.pid,
+                    )
+                    and probe.discovery.launch_nonce == launch_nonce
+                    and health.get("runtime_ready") is True
+                    and status.get("runtime_ready") is True
+                ):
+                    break
+            except BaseException:
+                pass
+            finally:
+                if probe is not None:
+                    probe.close()
+            time.sleep(0.02)
+        else:
+            pytest.fail("daemon authenticated readiness timed out")
 
         bridge = HookBridge(home, reconnect_delay_seconds=0.01)
         hooks = HermesHooks(bridge)
@@ -2403,7 +2440,6 @@ def test_real_daemon_commit_projection_and_clean_close(tmp_path: Path) -> None:
         assert stdout == b""
         assert stderr == b""
     finally:
-        os.close(read_fd)
         if bridge is not None:
             bridge.stop_worker_for_test()
         if process.poll() is None:

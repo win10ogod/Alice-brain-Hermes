@@ -404,7 +404,7 @@ def test_background_wait_failure_keeps_thread_and_health_error_alive() -> None:
         poll_interval_seconds=0.01,
     )
     first_wait_failed = threading.Event()
-    second_wait_entered = threading.Event()
+    second_iteration_completed = threading.Event()
     original_wait = worker._stop.wait
     wait_calls = 0
 
@@ -414,7 +414,8 @@ def test_background_wait_failure_keeps_thread_and_health_error_alive() -> None:
         if wait_calls == 1:
             first_wait_failed.set()
             raise MemoryError("transient poll wait failure")
-        second_wait_entered.set()
+        if port.claim_count >= 2:
+            second_iteration_completed.set()
         return original_wait(timeout)
 
     worker._stop.wait = transient_wait  # type: ignore[method-assign]
@@ -422,7 +423,7 @@ def test_background_wait_failure_keeps_thread_and_health_error_alive() -> None:
     worker.start()
     try:
         assert first_wait_failed.wait(timeout=1.0)
-        assert second_wait_entered.wait(timeout=1.0)
+        assert second_iteration_completed.wait(timeout=1.0)
         assert worker.worker_started is True
         assert port.claim_count >= 2
         assert worker.last_internal_error_type == "MemoryError"

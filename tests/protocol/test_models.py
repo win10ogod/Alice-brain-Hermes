@@ -593,6 +593,13 @@ def test_closed_hook_union_rejects_payload_from_a_different_hook(
             [{f"k{index}": index for index in range(8)} for _ in range(128)],
         ),
     ],
+    ids=[
+        "multibyte-string",
+        "129-sequence",
+        "int64-overflow",
+        "depth-nine",
+        "node-2049",
+    ],
 )
 def test_observation_rejects_hostile_nested_values_at_fixed_copier_bounds(
     name: str, hostile_value: object

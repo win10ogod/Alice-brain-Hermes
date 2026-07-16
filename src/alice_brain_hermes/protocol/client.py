@@ -18,7 +18,7 @@ from alice_brain_hermes.errors import DaemonClientError, DaemonRpcError
 from alice_brain_hermes.protocol.models import (
     PROTOCOL_VERSION,
     CapabilityProfileV1,
-    DaemonDiscoveryV1,
+    DaemonDiscoveryV2,
     InitializeResultV1,
     ProtocolLimitsV1,
     copy_protocol_limits,
@@ -97,7 +97,7 @@ def _ipv4_endpoint(value: object) -> tuple[str, int] | None:
 
 
 def _validate_connected_loopback(
-    connection: socket.socket, discovery: DaemonDiscoveryV1
+    connection: socket.socket, discovery: DaemonDiscoveryV2
 ) -> None:
     try:
         family = connection.family
@@ -121,7 +121,7 @@ class DaemonClient:
     def __init__(
         self,
         connection: socket.socket,
-        discovery: DaemonDiscoveryV1,
+        discovery: DaemonDiscoveryV2,
         credential: str,
         *,
         timeout_seconds: float,
@@ -187,8 +187,12 @@ class DaemonClient:
                     raise
                 health = client.health()
                 if (
-                    health.get("instance_nonce") != discovery.instance_nonce
+                    health.get("pid") != discovery.pid
+                    or health.get("instance_nonce") != discovery.instance_nonce
                     or health.get("process_marker") != discovery.process_marker
+                    or health.get("launch_nonce") != discovery.launch_nonce
+                    or health.get("protocol_version") != discovery.protocol_version
+                    or health.get("package_version") != discovery.package_version
                 ):
                     raise DaemonClientError("daemon discovery identity changed")
                 if initialize:

@@ -8,7 +8,7 @@ from typing import ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from alice_brain_hermes.core.events import EventEnvelope
+from alice_brain_hermes.core.events import EventEnvelope, thaw_json
 from alice_brain_hermes.core.identity import ActorRecord, ProvenanceAuthorization
 from alice_brain_hermes.errors import ResponseSizeError
 from alice_brain_hermes.ids import validate_id
@@ -170,7 +170,13 @@ def _page_limit_violations(
     max_result_nodes: int,
     max_result_depth: int,
 ) -> tuple[bool, bool, bool]:
-    payload = page.model_dump(mode="json")
+    payload = page.model_dump(mode="json", exclude={"events"})
+    events: list[dict[str, object]] = []
+    for event in page.events:
+        event_payload = event.model_dump(mode="json", exclude={"payload"})
+        event_payload["payload"] = thaw_json(event.payload)
+        events.append(event_payload)
+    payload["events"] = events
     encoded = json.dumps(
         payload,
         ensure_ascii=False,

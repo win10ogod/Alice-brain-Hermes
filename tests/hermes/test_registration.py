@@ -23,6 +23,7 @@ from types import MappingProxyType, ModuleType, SimpleNamespace
 from typing import Any
 from zipfile import ZipFile
 
+import psutil
 import pytest
 import yaml
 from packaging.requirements import Requirement
@@ -3672,10 +3673,9 @@ def test_failed_state_transition_does_not_mask_registration_error(
 
 
 def _real_host_plugins() -> ModuleType:
-    return pytest.importorskip(
-        "hermes_cli.plugins",
-        reason="real Hermes integration requires the local hermes-agent checkout",
-    )
+    from hermes_cli import plugins
+
+    return plugins
 
 
 def _write_enabled_config(home: Path) -> None:
@@ -3879,10 +3879,9 @@ def _run_real_hermes_cli(
     tmp_path: Path,
     *arguments: str,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
-    pytest.importorskip(
-        "hermes_cli.main",
-        reason="real Hermes CLI requires the local hermes-agent checkout",
-    )
+    from hermes_cli import main as _hermes_main
+
+    assert _hermes_main is not None
     home = tmp_path / "Hermes Home CLI 測試"
     alice_home = tmp_path / "Alice runtime 不應出現"
     _write_enabled_config(home)
@@ -4025,11 +4024,28 @@ def test_wheel_entrypoint_loads_outside_checkout(
         timeout=60,
     )
     assert create_result.returncode == 0, create_result.stderr
-    python_executable = (
-        environment / "Scripts" / "python.exe"
-        if os.name == "nt"
-        else environment / "bin" / "python"
+    context_result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                "import json,pathlib,sys,venv; "
+                "target=pathlib.Path(sys.argv[1]); "
+                "context=venv.EnvBuilder(with_pip=False).ensure_directories(target); "
+                "print(json.dumps({'env_exe': context.env_exe}))"
+            ),
+            str(environment),
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
+    assert context_result.returncode == 0, context_result.stderr
+    python_executable = Path(json.loads(context_result.stdout)["env_exe"])
+    assert python_executable.is_file()
     install_result = subprocess.run(
         [
             "uv",
@@ -4120,3 +4136,305 @@ def test_wheel_has_no_separate_alice_brain_dependency(
     }
     assert "packaging" in normalized_names
     assert "alice-brain" not in normalized_names
+
+
+def test_installed_wheel_runs_real_host_daemon_hook_ack_trace_and_restart(
+    task5_release_artifacts: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    wheel, _source_distribution = task5_release_artifacts
+    environment_home = tmp_path / "installed-host-environment"
+    create_result = subprocess.run(
+        ["uv", "venv", "--python", sys.executable, str(environment_home)],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert create_result.returncode == 0, create_result.stderr
+    context_result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                "import json,pathlib,sys,venv; "
+                "target=pathlib.Path(sys.argv[1]); "
+                "context=venv.EnvBuilder(with_pip=False).ensure_directories(target); "
+                "print(json.dumps({'env_exe': context.env_exe}))"
+            ),
+            str(environment_home),
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert context_result.returncode == 0, context_result.stderr
+    installed_python = Path(json.loads(context_result.stdout)["env_exe"])
+    assert installed_python.is_file()
+
+    install_result = subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(installed_python),
+            "hermes-agent==0.18.2",
+            str(wheel),
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert install_result.returncode == 0, install_result.stderr
+
+    hermes_home = tmp_path / "Hermes Home installed"
+    alice_home = tmp_path / "Alice runtime installed"
+    bundled_home = tmp_path / "empty bundled plugins"
+    bundled_home.mkdir()
+    environment = os.environ.copy()
+    for name in tuple(environment):
+        if name.endswith("_API_KEY") or name in {
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+            "UV_PROJECT_ENVIRONMENT",
+        }:
+            environment.pop(name, None)
+    environment.update(
+        {
+            "HERMES_HOME": str(hermes_home),
+            "HERMES_BUNDLED_PLUGINS": str(bundled_home),
+            "ALICE_BRAIN_HERMES_HOME": str(alice_home),
+        }
+    )
+
+    def run_host(
+        *arguments: str,
+        timeout: float = 45,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [installed_python, "-I", "-m", "hermes_cli.main", *arguments],
+            cwd=tmp_path,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    def run_alice(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return run_host("alice-brain", "--timeout", "30", *arguments)
+
+    launched_processes: list[tuple[int, float]] = []
+    final_stop: subprocess.CompletedProcess[str] | None = None
+    try:
+        discovered = run_host("plugins", "list", "--json")
+        assert discovered.returncode == 0, discovered.stderr
+        assert '"name": "alice-brain"' in discovered.stdout
+        assert '"status": "not enabled"' in discovered.stdout
+
+        enabled = run_host(
+            "plugins",
+            "enable",
+            "alice-brain",
+            "--no-allow-tool-override",
+        )
+        assert enabled.returncode == 0, enabled.stderr
+
+        help_result = run_host("alice-brain", "--help")
+        assert help_result.returncode == 0, help_result.stderr
+        assert "Alice-brain-Hermes consciousness runtime commands" in (
+            help_result.stdout
+        )
+
+        started = run_alice("start")
+        assert started.returncode == 0, started.stderr
+        start_payload = json.loads(started.stdout)
+        assert start_payload["data"]["readiness_verified"] is True
+        assert start_payload["data"]["started"] is True
+        started_pid = start_payload["data"]["pid"]
+        launched_processes.append(
+            (started_pid, psutil.Process(started_pid).create_time())
+        )
+
+        status = run_alice("status")
+        assert status.returncode == 0, status.stderr
+        status_payload = json.loads(status.stdout)
+        assert status_payload["data"]["daemon"]["continuous_runtime"] is True
+        assert status_payload["data"]["daemon"]["runtime_ready"] is True
+
+        doctor = run_alice("doctor")
+        assert doctor.returncode == 0, doctor.stderr
+        doctor_payload = json.loads(doctor.stdout)
+        assert doctor_payload["data"]["healthy"] is True
+
+        installed_probe = textwrap.dedent(
+            f"""
+            import json
+            import time
+            from pathlib import Path
+
+            import alice_brain_hermes
+            import hermes_cli
+            from hermes_cli.plugins import PluginManager
+            from alice_brain_hermes.hermes import registration
+
+            project_root = Path({str(PROJECT_ROOT)!r}).resolve()
+            package_path = Path(alice_brain_hermes.__file__).resolve()
+            assert not package_path.is_relative_to(project_root)
+            assert hermes_cli.__version__ == "0.18.2"
+
+            manager = PluginManager()
+            manager.discover_and_load()
+            loaded = manager._plugins["alice-brain"]
+            assert loaded.enabled is True
+            assert loaded.error is None
+            assert len(loaded.hooks_registered) == 16
+            assert set(manager._cli_commands) == {{"alice-brain"}}
+            assert manager.invoke_hook(
+                "on_session_start",
+                session_id="installed-host-session",
+                model="local-test-model",
+                platform="cli",
+            ) == []
+
+            deadline = time.monotonic() + 25
+            ack = None
+            try:
+                while time.monotonic() < deadline:
+                    bridge = registration._BOOTSTRAP._transport_bridge
+                    ack = None if bridge is None else bridge.last_ack
+                    if ack is not None:
+                        break
+                    time.sleep(0.05)
+                assert ack is not None, registration._BOOTSTRAP.health
+                assert ack.through_capture_seq >= 1
+                assert ack.raw_event_sequence >= 2
+                print(
+                    json.dumps(
+                        {{
+                            "brain_id": ack.frame.brain_id,
+                            "hook_count": len(loaded.hooks_registered),
+                            "raw_event_sequence": ack.raw_event_sequence,
+                            "through_capture_seq": ack.through_capture_seq,
+                        }},
+                        sort_keys=True,
+                    )
+                )
+            finally:
+                registration._BOOTSTRAP.stop_worker_for_test()
+            """
+        )
+        probe = subprocess.run(
+            [installed_python, "-I", "-c", installed_probe],
+            cwd=tmp_path,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        assert probe.returncode == 0, probe.stderr
+        probe_payload = json.loads(probe.stdout.strip().splitlines()[-1])
+        brain_id = probe_payload["brain_id"]
+        assert probe_payload["hook_count"] == 16
+
+        traced = run_alice("trace", "--brain-id", brain_id, "--limit", "100")
+        assert traced.returncode == 0, traced.stderr
+        trace_payload = json.loads(traced.stdout)
+        event_types = {
+            event["event_type"] for event in trace_payload["data"]["events"]
+        }
+        assert "hermes.observer.on_session_start" in event_types
+        assert "semantic.session.attributed" in event_types
+        before_restart_sequence = trace_payload["data"]["next_after_sequence"]
+
+        live = run_alice("status")
+        assert live.returncode == 0, live.stderr
+        live_daemon = json.loads(live.stdout)["data"]["daemon"]
+        assert brain_id in live_daemon["brain_ids"]
+        assert live_daemon["running_scheduler_count"] == 1
+        assert live_daemon["scheduler_health"]["status"] == "healthy"
+
+        first_stop = run_alice("stop")
+        assert first_stop.returncode == 0, first_stop.stderr
+        stopped = run_alice("status")
+        assert stopped.returncode == 0, stopped.stderr
+        assert json.loads(stopped.stdout)["data"]["status"] == "stopped"
+
+        restarted = run_alice("start")
+        assert restarted.returncode == 0, restarted.stderr
+        restarted_payload = json.loads(restarted.stdout)
+        assert restarted_payload["data"]["readiness_verified"] is True
+        restarted_pid = restarted_payload["data"]["pid"]
+        launched_processes.append(
+            (restarted_pid, psutil.Process(restarted_pid).create_time())
+        )
+        restarted_status = run_alice("status")
+        assert restarted_status.returncode == 0, restarted_status.stderr
+        restarted_daemon = json.loads(restarted_status.stdout)["data"]["daemon"]
+        assert brain_id in restarted_daemon["brain_ids"]
+        assert restarted_daemon["running_scheduler_count"] == 1
+
+        persisted_trace = run_alice(
+            "trace",
+            "--brain-id",
+            brain_id,
+            "--limit",
+            "100",
+        )
+        assert persisted_trace.returncode == 0, persisted_trace.stderr
+        persisted_event_types = {
+            event["event_type"]
+            for event in json.loads(persisted_trace.stdout)["data"]["events"]
+        }
+        assert "hermes.observer.on_session_start" in persisted_event_types
+
+        c0_deadline = time.monotonic() + 5
+        resumed_c0 = False
+        while time.monotonic() < c0_deadline:
+            resumed_trace = run_alice(
+                "trace",
+                "--brain-id",
+                brain_id,
+                "--after-sequence",
+                str(before_restart_sequence),
+                "--limit",
+                "100",
+            )
+            assert resumed_trace.returncode == 0, resumed_trace.stderr
+            resumed_events = json.loads(resumed_trace.stdout)["data"]["events"]
+            resumed_c0 = any(
+                event["event_type"] == "clock.tick" for event in resumed_events
+            )
+            if resumed_c0:
+                break
+            time.sleep(0.05)
+        assert resumed_c0 is True
+    finally:
+        if installed_python.is_file():
+            final_stop = run_alice("stop")
+
+    assert final_stop is not None
+    assert final_stop.returncode == 0, final_stop.stderr
+    final_status = run_alice("status")
+    assert final_status.returncode == 0, final_status.stderr
+    assert json.loads(final_status.stdout)["data"]["status"] == "stopped"
+    for pid, create_time in launched_processes:
+        deadline = time.monotonic() + 5
+        exact_process_exists = True
+        while exact_process_exists and time.monotonic() < deadline:
+            try:
+                process = psutil.Process(pid)
+                exact_process_exists = process.create_time() == create_time
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                exact_process_exists = False
+            if exact_process_exists:
+                time.sleep(0.02)
+        assert exact_process_exists is False
