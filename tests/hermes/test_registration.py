@@ -28,6 +28,7 @@ import yaml
 from packaging.requirements import Requirement
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ROOT_PLUGIN = PROJECT_ROOT
 INTEGRATION_ROOT = PROJECT_ROOT / "integration" / "alice-brain"
 ENTRY_POINT_GROUP = "hermes_agent.plugins"
 PLUGIN_NAME = "alice-brain"
@@ -71,6 +72,13 @@ def _manifest() -> dict[str, object]:
     return loaded
 
 
+def _root_manifest() -> dict[str, object]:
+    with (ROOT_PLUGIN / "plugin.yaml").open(encoding="utf-8") as stream:
+        loaded = yaml.safe_load(stream)
+    assert isinstance(loaded, dict)
+    return loaded
+
+
 def test_pip_entry_point_loads_module_with_sync_register() -> None:
     entry_point = _alice_entry_point()
     module = entry_point.load()
@@ -97,6 +105,54 @@ def test_manifest_has_exact_schema_and_dual_hook_lists() -> None:
         "hooks": list(APPROVED_HOOKS),
         "provides_hooks": list(APPROVED_HOOKS),
     }
+
+
+def test_git_plugin_root_exposes_the_canonical_manifest() -> None:
+    assert _root_manifest() == _manifest()
+
+
+def test_git_plugin_root_shim_loads_the_repo_source_in_isolation() -> None:
+    probe = textwrap.dedent(
+        f"""
+        import importlib.util
+        import inspect
+        import sys
+        from pathlib import Path
+
+        root = Path({str(ROOT_PLUGIN)!r}).resolve()
+        source_root = str(root / "src")
+        sys.path[:] = [entry for entry in sys.path if entry != source_root]
+        assert source_root not in sys.path
+        init_file = root / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            "hermes_plugins.alice_brain_root_probe",
+            init_file,
+            submodule_search_locations=[str(root)],
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        package = sys.modules["alice_brain_hermes"]
+        package_file = Path(package.__file__).resolve()
+        assert package_file.is_relative_to(root / "src")
+        assert callable(module.register)
+        assert not inspect.iscoroutinefunction(module.register)
+        assert module.__all__ == ["register"]
+        assert source_root not in sys.path
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", probe],
+        cwd=ROOT_PLUGIN,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_directory_shim_reexports_the_same_register() -> None:
@@ -4022,13 +4078,18 @@ def test_wheel_entrypoint_loads_outside_checkout(
     assert probe_result.returncode == 0, probe_result.stderr
 
 
-def test_sdist_contains_directory_integration_artifact(
+def test_sdist_contains_git_root_and_legacy_directory_plugin_artifacts(
     task5_release_artifacts: tuple[Path, Path],
 ) -> None:
     _wheel, source_distribution = task5_release_artifacts
 
     with tarfile.open(source_distribution, mode="r:gz") as archive:
         names = {member.name for member in archive.getmembers()}
+        archive_roots = {Path(name).parts[0] for name in names if Path(name).parts}
+        assert len(archive_roots) == 1
+        archive_root = next(iter(archive_roots))
+        assert f"{archive_root}/plugin.yaml" in names
+        assert f"{archive_root}/__init__.py" in names
         assert any(
             name.endswith("/integration/alice-brain/plugin.yaml") for name in names
         )
