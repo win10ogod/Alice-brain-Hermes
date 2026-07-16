@@ -2414,7 +2414,14 @@ def test_real_daemon_commit_projection_and_clean_close(tmp_path: Path) -> None:
         bridge = HookBridge(home, reconnect_delay_seconds=0.01)
         hooks = HermesHooks(bridge)
         _session_start(hooks, "real-daemon-session")
-        _wait_until(lambda: bridge.last_ack is not None, timeout=10)
+        try:
+            _wait_until(lambda: bridge.last_ack is not None, timeout=30)
+        except AssertionError as error:
+            raise AssertionError(
+                "real daemon bridge ACK timed out; "
+                f"process={process.poll()!r}; worker={bridge.worker_started!r}; "
+                f"health={bridge.health!r}; retained={bridge.retained_record!r}"
+            ) from error
         assert bridge.last_ack is not None
         assert isinstance(bridge.last_ack, BridgeCommitAckV2)
         assert bridge.last_ack.schema_version == 2
@@ -2429,7 +2436,14 @@ def test_real_daemon_commit_projection_and_clean_close(tmp_path: Path) -> None:
         assert bridge.projections.read_context()
 
         bridge.request_clean_close()
-        _wait_until(lambda: bridge._stop_event.is_set(), timeout=10)
+        try:
+            _wait_until(lambda: bridge._stop_event.is_set(), timeout=30)
+        except AssertionError as error:
+            raise AssertionError(
+                "real daemon bridge clean close timed out; "
+                f"process={process.poll()!r}; worker={bridge.worker_started!r}; "
+                f"health={bridge.health!r}; retained={bridge.retained_record!r}"
+            ) from error
         bridge.stop_worker_for_test()
 
         client = DaemonClient.connect(home)

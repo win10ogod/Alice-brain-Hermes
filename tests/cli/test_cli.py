@@ -736,9 +736,12 @@ def test_start_timeout_exactly_terminates_hint_and_returns_redacted_diagnostics(
         "_process_identity_state",
         lambda _pid, _marker: "exact",
     )
+    monotonic_values = iter((0.0, 0.0, 0.01))
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
 
     with pytest.raises(cli._CliFailure) as failure:
-        cli._start(tmp_path / "runtime", timeout_seconds=0.01)
+        cli._start_coordinated(tmp_path / "runtime", timeout_seconds=0.01)
 
     assert failure.value.code == "startup_timeout"
     assert failure.value.data == {
@@ -790,9 +793,12 @@ def test_start_cleanup_fails_closed_when_exact_identity_is_unverifiable(
         "_process_identity_state",
         lambda _pid, _marker: "exact",
     )
+    monotonic_values = iter((0.0, 0.0, 0.01))
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
 
     with pytest.raises(cli._CliFailure) as failure:
-        cli._start(tmp_path / "runtime", timeout_seconds=0.01)
+        cli._start_coordinated(tmp_path / "runtime", timeout_seconds=0.01)
 
     assert failure.value.code == "startup_cleanup_unproven"
 
