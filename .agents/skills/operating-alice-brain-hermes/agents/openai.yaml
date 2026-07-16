@@ -1,0 +1,4 @@
+interface:
+  display_name: "Operate Alice-brain-Hermes"
+  short_description: "Inspect Alice-brain-Hermes runtime evidence"
+  default_prompt: "Use $operating-alice-brain-hermes to start, observe, diagnose, verify, or trace this plugin runtime."
