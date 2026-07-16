@@ -150,13 +150,6 @@ CLI 回應為機器穩定 JSON：
 - `trace [list]` 是有上限的 cursor page；若下一個 event 超過回應 byte budget，它報告被擋住的
   sequence，不跳過該 event。
 
-## 能力與安全合約
-
-Plugin 觀測 lifecycle，不代理或改寫 Hermes 的主 provider 請求。它不降低或覆寫 model/provider、
-context、output/token budget、sampling、retry、tools、tool arguments/results、streaming、reasoning、multimodal
-或 approval objects。關係／信任狀態不是受限知識或安全政策的繞過門；本專案不把
-jailbreak 當成功能或評測目標。
-
 ## 開發與驗證
 
 ```console
