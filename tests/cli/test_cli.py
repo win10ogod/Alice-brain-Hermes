@@ -870,9 +870,12 @@ def test_stop_fails_closed_when_process_identity_is_ambiguous(
         "_process_identity_state",
         lambda _pid, _marker: "ambiguous",
     )
+    monotonic_values = iter((0.0, 0.0, 0.01))
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
 
     with pytest.raises(cli._CliFailure) as failure:
-        cli._stop(home, timeout_seconds=0.01)
+        cli._stop_coordinated(home, timeout_seconds=0.01)
 
     assert failure.value.code == "shutdown_unproven"
 
