@@ -66,7 +66,7 @@ Use the installed CLI help as the command authority. Select one surface for the 
 
 | Goal | Commands on the selected surface | Required evidence |
 |---|---|---|
-| Start | `start`, then `status` | Readiness, owner PID, generation, and runtime identity |
+| Start | `start`, then `status` | Readiness, PID, instance nonce, and runtime mode |
 | Observe | `status`; `identity`; `trace --limit 100` | Current runtime, replay-derived identity, and recent integration events |
 | Diagnose | `status`; `doctor` | Exact exit status and every reported check |
 | Verify | Re-run `status`, `doctor`, and a fresh trace page | Fresh runtime and persisted integration evidence supporting each claim |
