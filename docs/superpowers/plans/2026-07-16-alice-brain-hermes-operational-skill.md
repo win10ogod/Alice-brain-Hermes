@@ -72,7 +72,7 @@ Use the installed CLI help as the command authority. Select one surface for the 
 | Verify | Re-run `status`, `doctor`, and a fresh trace page | Fresh runtime and persisted integration evidence supporting each claim |
 | Trace | `trace [list] [--brain-id <id>] --after-sequence <cursor> --limit <1-1000>` | Ordered events, cursor, gaps, and brain identifiers |
 
-For a complete trace, begin at cursor `0`; while the result reports more events, pass its returned next cursor unchanged.
+For a complete trace, begin at cursor `0`; while `.has_more` is true, pass `.next_after_sequence` unchanged.
 
 ## Operational rules
 
