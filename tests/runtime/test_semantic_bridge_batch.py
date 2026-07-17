@@ -6,8 +6,9 @@ from pathlib import Path
 import pytest
 
 import alice_brain_hermes.runtime.store as store_module
-from alice_brain_hermes.core.action import ActionOutcome, ActionPhase
+from alice_brain_hermes.core.action import ActionOutcome, ActionPhase, RDPhase
 from alice_brain_hermes.core.events import EventEnvelope, FrozenJsonDict
+from alice_brain_hermes.core.workspace import derive_candidates
 from alice_brain_hermes.errors import (
     DomainCapacityError,
     IdempotencyConflictError,
@@ -239,18 +240,122 @@ def test_matched_post_tool_closes_occurrence_and_commits_execution_outcome(
         )
 
         assert ack.raw_event_sequence == 7
-        assert ack.derived_event_count == 2
-        assert ack.last_event_sequence == 9
-        assert ack.frame.state_sequence == 9
+        assert ack.derived_event_count == 3
+        assert ack.last_event_sequence == 10
+        assert ack.frame.state_sequence == 10
         [action] = engine.state.action_records
-        assert action.phase is ActionPhase.RECEIPT
+        assert action.phase is ActionPhase.RECONSTRUCTED
+        assert action.rd_phase is RDPhase.RECONSTRUCT
         assert action.execution_confirmed is True
         assert action.outcome is ActionOutcome.FAILURE
         assert action.effect_confirmed is None
+        assert action.receipt is not None
+        assert action.receipt["status"] == "failure"
+        assert action.reconstruction_history[-1].after_receipt_event_id == (
+            action.receipt_history[-1].event_id
+        )
+        assert action.reconstruction_history[-1].payload["assessment"] == (
+            "execution_failed"
+        )
+        [projected] = ack.frame.a["actions"]
+        assert projected["dispatch_observed"] is True
+        assert projected["execution_confirmed"] is True
+        assert projected["receipt_status"] == "failure"
+        assert ack.frame.rd["retained_action_count"] == 1
+        assert ack.frame.rd["projected_action_count"] == 1
+        assert ack.frame.rd["lifecycle_incomplete_count"] == 0
+        assert ack.frame.rd["execution_unknown_count"] == 0
+        assert ack.frame.rd["effect_unknown_count"] == 1
+        assert ack.frame.rd["phase_counts"] == {
+            "blocked": 0,
+            "dispatched": 0,
+            "prepared": 0,
+            "proposed": 0,
+            "receipt": 0,
+            "reconstructed": 1,
+        }
+        assert ack.frame.rd["outcome_counts"] == {
+            "failure": 1,
+            "success": 0,
+            "unknown": 0,
+        }
         [closed_capture_seq] = ledger._connection.execute(
             "SELECT closed_capture_seq FROM hermes_span"
         ).fetchone()
         assert closed_capture_seq == 2
+
+
+def test_56_completed_tools_are_retained_but_only_four_are_projected(
+    tmp_path: Path,
+) -> None:
+    ledger, engine, instance = make_engine(tmp_path)
+    latest = None
+    with ledger:
+        for index in range(56):
+            pre_capture_seq = index * 2 + 1
+            tool_call_id = f"tool-{index:02d}"
+            engine.commit_bridge_record(
+                instance,
+                tool_observation(
+                    instance,
+                    pre_capture_seq,
+                    hook="pre_tool_call",
+                    tool_call_id=tool_call_id,
+                ),
+            )
+            latest = engine.commit_bridge_record(
+                instance,
+                tool_observation(
+                    instance,
+                    pre_capture_seq + 1,
+                    hook="post_tool_call",
+                    status="error",
+                    tool_call_id=tool_call_id,
+                ),
+            )
+
+        assert latest is not None
+        frame = latest.frame
+        assert frame.rd["action_count"] == 56
+        assert frame.rd["retained_action_count"] == 56
+        assert frame.rd["projected_action_count"] == 4
+        assert frame.rd["lifecycle_incomplete_count"] == 0
+        assert frame.rd["execution_unknown_count"] == 0
+        assert frame.rd["effect_unknown_count"] == 56
+        assert frame.rd["unresolved_count"] == 56
+        assert frame.rd["phase_counts"] == {
+            "blocked": 0,
+            "dispatched": 0,
+            "prepared": 0,
+            "proposed": 0,
+            "receipt": 0,
+            "reconstructed": 56,
+        }
+        assert frame.rd["outcome_counts"] == {
+            "failure": 56,
+            "success": 0,
+            "unknown": 0,
+        }
+        assert len(frame.rd["actions"]) == 4
+        assert len(frame.a["actions"]) == 4
+        assert [item["action_id"] for item in frame.rd["actions"]] == [
+            action.action_id for action in engine.state.action_records[-4:]
+        ]
+        assert all(item["phase"] == "reconstructed" for item in frame.rd["actions"])
+        assert all(item["dispatch_observed"] is True for item in frame.a["actions"])
+        assert all(
+            item["execution_confirmed"] is True for item in frame.a["actions"]
+        )
+        assert all(item["receipt_status"] == "failure" for item in frame.a["actions"])
+        assert frame.omission_counts["rd"]["included"] == 4
+        assert frame.omission_counts["rd"]["omitted"] == 52
+        incomplete = next(
+            candidate
+            for candidate in derive_candidates(engine.state)
+            if candidate.specialist == "incomplete_action"
+        )
+        assert incomplete.content["action_ids"] == ()
+        assert incomplete.score == 0.15
 
 
 def test_contradictory_post_source_semantics_commit_raw_plus_one_gap(
@@ -305,7 +410,9 @@ def test_timeout_preserves_true_host_error_type_through_typed_receipt(
 
         assert ack.semantic_status == "applied"
         [action] = engine.state.action_records
-        assert action.phase is ActionPhase.RECEIPT
+        assert action.phase is ActionPhase.RECONSTRUCTED
+        assert action.execution_confirmed is None
+        assert action.outcome is None
         assert action.receipt_history[-1].status.value == "unknown"
         assert action.receipt_history[-1].source_status == "timeout"
         assert action.receipt_history[-1].source_error_type == "TimeoutError"
@@ -598,15 +705,25 @@ def test_late_receipt_matches_latest_closed_occurrence_without_redispatch(
         )
 
         assert ack.semantic_status == "applied"
-        assert ack.derived_event_count == 1
+        assert ack.derived_event_count == 2
         assert [
             event.event_type
             for event in ledger.list_events(engine.brain_id)
             if event.sequence is not None and event.sequence >= ack.raw_event_sequence
-        ] == ["hermes.observer.post_tool_call", "action.receipt"]
+        ] == [
+            "hermes.observer.post_tool_call",
+            "action.receipt",
+            "action.reconstructed",
+        ]
         [action] = engine.state.action_records
+        assert action.phase is ActionPhase.RECONSTRUCTED
         assert action.outcome is ActionOutcome.SUCCESS
         assert action.receipt_history[-1].late is True
+        assert len(action.receipt_history) == 2
+        assert len(action.reconstruction_history) == 2
+        assert action.reconstruction_history[-1].after_receipt_event_id == (
+            action.receipt_history[-1].event_id
+        )
 
     from alice_brain_hermes.runtime.store import SQLiteLedger
 
@@ -614,14 +731,11 @@ def test_late_receipt_matches_latest_closed_occurrence_without_redispatch(
         assert reopened.observability_snapshot(engine.brain_id).semantic_complete
 
 
-@pytest.mark.parametrize("reconstruct_before_late", [False, True])
 @pytest.mark.parametrize("late_status", ["ok", "error", "timeout", "cancelled"])
 def test_late_completion_after_blocked_is_gap_without_receipt_or_redispatch(
     tmp_path: Path,
     late_status: str,
-    reconstruct_before_late: bool,
 ) -> None:
-    from alice_brain_hermes.core.events import new_event
     from alice_brain_hermes.runtime.engine import ConsciousEngine
     from alice_brain_hermes.runtime.store import SQLiteLedger
 
@@ -643,21 +757,6 @@ def test_late_completion_after_blocked_is_gap_without_receipt_or_redispatch(
             instance,
             tool_observation(instance, 2, hook="post_tool_call", status="blocked"),
         )
-        [blocked_action] = engine.state.action_records
-        if reconstruct_before_late:
-            engine.append(
-                new_event(
-                    "action.reconstructed",
-                    brain_id,
-                    brain_id,
-                    {
-                        "action_id": blocked_action.action_id,
-                        "analysis": "blocked action reconstruction",
-                    },
-                    action_id=blocked_action.action_id,
-                )
-            )
-
         late = engine.commit_bridge_record(instance, late_record)
         duplicate = engine.commit_bridge_record(instance, late_record)
 
@@ -673,16 +772,17 @@ def test_late_completion_after_blocked_is_gap_without_receipt_or_redispatch(
             "late_completion_after_blocked"
         )
         [action] = engine.state.action_records
-        assert action.phase is (
-            ActionPhase.RECONSTRUCTED
-            if reconstruct_before_late
-            else ActionPhase.BLOCKED
-        )
+        assert action.phase is ActionPhase.RECONSTRUCTED
         assert ActionPhase.DISPATCHED not in action.phase_history
         assert ActionPhase.RECEIPT not in action.phase_history
         assert action.execution_confirmed is False
         assert action.outcome is None
         assert action.effect_confirmed is None
+        assert len(action.reconstruction_history) == 1
+        assert action.reconstruction_history[-1].after_receipt_event_id is None
+        assert action.reconstruction_history[-1].payload["assessment"] == (
+            "dispatch_prevented"
+        )
         snapshot = ledger.observability_snapshot(brain_id)
         assert ledger.bridge_stream_state(instance).next_capture_seq == 4
         [closed_capture_seq] = ledger._connection.execute(
@@ -715,11 +815,7 @@ def test_late_completion_after_blocked_is_gap_without_receipt_or_redispatch(
 
         assert duplicate_after_restart.canonical_json() == late.canonical_json()
         [action] = restarted.state.action_records
-        assert action.phase is (
-            ActionPhase.RECONSTRUCTED
-            if reconstruct_before_late
-            else ActionPhase.BLOCKED
-        )
+        assert action.phase is ActionPhase.RECONSTRUCTED
         assert ActionPhase.DISPATCHED not in action.phase_history
         assert ActionPhase.RECEIPT not in action.phase_history
 
@@ -858,16 +954,26 @@ def test_late_conflict_keeps_canonical_outcome_and_projects_typed_disposition(
             tool_observation(instance, 2, hook="post_tool_call", status="ok"),
         )
 
-        late = engine.commit_bridge_record(
-            instance,
-            tool_observation(instance, 3, hook="post_tool_call", status="error"),
+        late_record = tool_observation(
+            instance, 3, hook="post_tool_call", status="error"
         )
+        late = engine.commit_bridge_record(instance, late_record)
+        event_count = len(ledger.list_events(engine.brain_id))
+        duplicate = engine.commit_bridge_record(instance, late_record)
 
         [action] = engine.state.action_records
+        assert duplicate.canonical_json() == late.canonical_json()
+        assert len(ledger.list_events(engine.brain_id)) == event_count
+        assert action.phase is ActionPhase.RECONSTRUCTED
         assert action.outcome is ActionOutcome.SUCCESS
         assert action.receipt is not None
         assert action.receipt["status"] == "success"
         assert action.receipt_history[-1].disposition.value == "conflict"
+        assert len(action.receipt_history) == 2
+        assert len(action.reconstruction_history) == 2
+        assert action.reconstruction_history[-1].after_receipt_event_id == (
+            action.receipt_history[-1].event_id
+        )
         [projected] = late.frame.a["actions"]
         assert projected["receipt_status"] == "success"
         assert projected["outcome"] == "success"
@@ -1005,7 +1111,7 @@ def test_semantic_domain_capacity_gap_does_not_evict_closed_late_span(
     with ledger:
         engine.commit_bridge_record(instance, old_pre)
         engine.commit_bridge_record(instance, old_post)
-        for index in range(MAX_ACTION_RECORDS - 1):
+        for index in range(MAX_ACTION_RECORDS):
             action_id = f"capacity-{index}"
             engine.append(
                 new_event(
@@ -1085,15 +1191,29 @@ def test_semantic_domain_capacity_gap_does_not_evict_closed_late_span(
                 status="error",
             ),
         )
-        assert late.semantic_status == "applied"
-        old_action = next(
-            action
-            for action in restarted.state.action_records
-            if action.intent.get("capture_seq") == 1
+        assert late.semantic_status == "gap"
+        assert late.derived_event_count == 1
+        assert (
+            reopened.list_events(brain_id, after_sequence=late.raw_event_sequence)[
+                0
+            ].payload["reason"]
+            == "late_action_unavailable"
         )
-        assert old_action.outcome is ActionOutcome.SUCCESS
-        assert old_action.receipt_history[-1].disposition.value == "conflict"
-        assert reopened.observability_snapshot(brain_id).semantic_gap_records == 1
+        assert all(
+            action.intent.get("capture_seq") != 1
+            for action in restarted.state.action_records
+        )
+        assert (
+            tuple(
+                tuple(row)
+                for row in reopened._connection.execute(
+                    "SELECT external_id, occurrence_capture_seq, closed_capture_seq "
+                    "FROM hermes_span"
+                )
+            )
+            == before_span
+        )
+        assert reopened.observability_snapshot(brain_id).semantic_gap_records == 2
 
 
 def test_successful_span_open_evicts_only_the_oldest_closed_victim(
@@ -1221,7 +1341,7 @@ def test_unmatched_terminal_does_not_close_an_unrelated_open_span(
         ).fetchall()
         assert tuple(span) == ("expected-tool", 3)
         [action] = engine.state.action_records
-        assert action.phase is ActionPhase.RECEIPT
+        assert action.phase is ActionPhase.RECONSTRUCTED
         assert action.execution_confirmed is True
         assert action.outcome is ActionOutcome.SUCCESS
 

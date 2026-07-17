@@ -552,10 +552,30 @@ def _post_tool_plan(
             causation_id=dispatched.event_id,
         )
         events = (dispatched, receipt)
+    terminal = events[-1]
+    assessment = (
+        "dispatch_prevented"
+        if raw_status == "blocked"
+        else (
+            "execution_succeeded"
+            if outcome == "success"
+            else "execution_failed" if outcome == "failure" else "execution_unknown"
+        )
+    )
+    reconstructed = _derived_event(
+        stream,
+        record,
+        raw_event,
+        role="action.reconstructed",
+        event_type="action.reconstructed",
+        payload={"action_id": action_id, "assessment": assessment},
+        action_id=action_id,
+        causation_id=terminal.event_id,
+    )
     return SemanticPlan(
         semantic_status="applied",
         semantic_complete=True,
-        derived_events=events,
+        derived_events=(*events, reconstructed),
         span_close=None if late else matched_span,
     )
 

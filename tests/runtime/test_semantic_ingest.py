@@ -159,13 +159,43 @@ def test_pre_tool_builds_complete_pc_e_st_rd_chain_without_copying_raw_values() 
 
 
 @pytest.mark.parametrize(
-    ("status", "event_types", "execution", "outcome"),
+    ("status", "event_types", "execution", "outcome", "assessment"),
     [
-        ("ok", ["action.dispatched", "action.receipt"], True, "success"),
-        ("error", ["action.dispatched", "action.receipt"], True, "failure"),
-        ("timeout", ["action.dispatched", "action.receipt"], None, None),
-        ("cancelled", ["action.dispatched", "action.receipt"], None, None),
-        ("blocked", ["action.blocked"], False, None),
+        (
+            "ok",
+            ["action.dispatched", "action.receipt", "action.reconstructed"],
+            True,
+            "success",
+            "execution_succeeded",
+        ),
+        (
+            "error",
+            ["action.dispatched", "action.receipt", "action.reconstructed"],
+            True,
+            "failure",
+            "execution_failed",
+        ),
+        (
+            "timeout",
+            ["action.dispatched", "action.receipt", "action.reconstructed"],
+            None,
+            None,
+            "execution_unknown",
+        ),
+        (
+            "cancelled",
+            ["action.dispatched", "action.receipt", "action.reconstructed"],
+            None,
+            None,
+            "execution_unknown",
+        ),
+        (
+            "blocked",
+            ["action.blocked", "action.reconstructed"],
+            False,
+            None,
+            "dispatch_prevented",
+        ),
     ],
 )
 def test_matched_post_tool_maps_execution_separately_from_outcome(
@@ -173,6 +203,7 @@ def test_matched_post_tool_maps_execution_separately_from_outcome(
     event_types: list[str],
     execution: bool | None,
     outcome: str | None,
+    assessment: str,
 ) -> None:
     instance = new_id()
     source = stream(instance)
@@ -188,9 +219,13 @@ def test_matched_post_tool_maps_execution_separately_from_outcome(
     raw = build_raw_event(source, record)
 
     plan = build_semantic_plan(source, record, raw_event=raw, matched_span=matched)
+    repeated = build_semantic_plan(
+        source, record, raw_event=raw, matched_span=matched
+    )
 
     assert [event.event_type for event in plan.derived_events] == event_types
-    terminal = plan.derived_events[-1]
+    terminal = plan.derived_events[-2]
+    reconstruction = plan.derived_events[-1]
     assert terminal.payload["execution_confirmed"] is execution
     assert terminal.payload["outcome"] == outcome
     assert terminal.payload.get("effect_confirmed") is None
@@ -198,6 +233,16 @@ def test_matched_post_tool_maps_execution_separately_from_outcome(
     assert terminal.payload["source_error_type"] == (
         "SyntheticError" if status == "error" else None
     )
+    assert dict(reconstruction.payload) == {
+        "action_id": "hermes-action-7",
+        "assessment": assessment,
+    }
+    assert reconstruction.action_id == "hermes-action-7"
+    assert reconstruction.causation_id == terminal.event_id
+    assert plan.fingerprint() == repeated.fingerprint()
+    assert [event.event_id for event in plan.derived_events] == [
+        event.event_id for event in repeated.derived_events
+    ]
     assert plan.span_close == matched
     encoded = "\n".join(event.canonical_json() for event in plan.derived_events)
     assert "TOP SECRET RAW RESULT" not in encoded
@@ -231,7 +276,7 @@ def test_thread_missing_result_is_real_error_shape_with_unknown_execution() -> N
         matched_span=matched,
     )
 
-    receipt = plan.derived_events[-1]
+    receipt = plan.derived_events[-2]
     assert receipt.payload["status"] == "unknown"
     assert receipt.payload["execution_confirmed"] is None
     assert receipt.payload["outcome"] is None
@@ -343,7 +388,7 @@ def test_true_host_non_error_status_preserves_nonreserved_error_type(
         matched_span=matched,
     )
 
-    terminal = plan.derived_events[-1]
+    terminal = plan.derived_events[-2]
     assert terminal.event_type == event_type
     assert terminal.payload["source_status"] == status
     assert terminal.payload["source_error_type"] == error_type
@@ -396,9 +441,16 @@ def test_pre_and_matched_blocked_post_reduce_to_non_executed_action() -> None:
     )
 
     [action] = state.action_records
-    assert action.phase is ActionPhase.BLOCKED
+    assert action.phase is ActionPhase.RECONSTRUCTED
+    assert ActionPhase.BLOCKED in action.phase_history
+    assert ActionPhase.DISPATCHED not in action.phase_history
     assert action.execution_confirmed is False
     assert action.outcome is None
+    assert action.effect_confirmed is None
+    assert action.reconstruction_history[-1].after_receipt_event_id is None
+    assert action.reconstruction_history[-1].payload["assessment"] == (
+        "dispatch_prevented"
+    )
 
 
 def test_late_tool_receipt_uses_closed_occurrence_without_redispatch() -> None:
@@ -432,9 +484,13 @@ def test_late_tool_receipt_uses_closed_occurrence_without_redispatch() -> None:
     )
 
     assert [event.event_type for event in late_plan.derived_events] == [
-        "action.receipt"
+        "action.receipt",
+        "action.reconstructed",
     ]
     assert late_plan.derived_events[0].payload["late"] is True
+    assert late_plan.derived_events[1].causation_id == (
+        late_plan.derived_events[0].event_id
+    )
     assert late_plan.span_close is None
     state = reduce_many(
         BrainState.genesis(source.brain_id),
@@ -448,7 +504,13 @@ def test_late_tool_receipt_uses_closed_occurrence_without_redispatch() -> None:
         ),
     )
     [action] = state.action_records
+    assert action.phase is ActionPhase.RECONSTRUCTED
     assert action.outcome is not None and action.outcome.value == "success"
+    assert len(action.receipt_history) == 2
+    assert len(action.reconstruction_history) == 2
+    assert action.reconstruction_history[-1].after_receipt_event_id == (
+        action.receipt_history[-1].event_id
+    )
 
 
 def test_two_indistinguishable_open_occurrences_are_explicitly_ambiguous() -> None:

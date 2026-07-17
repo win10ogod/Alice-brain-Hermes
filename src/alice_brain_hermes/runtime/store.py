@@ -5272,6 +5272,27 @@ class SQLiteLedger:
                 )
             actual_actions.append(projected_action)
 
+        phase_counts = {phase.value: 0 for phase in ActionPhase}
+        outcome_counts = {"failure": 0, "success": 0, "unknown": 0}
+        lifecycle_incomplete_count = 0
+        execution_unknown_count = 0
+        effect_unknown_count = 0
+        unresolved_count = 0
+        for action in state.action_records:
+            phase_counts[action.phase.value] += 1
+            outcome_key = (
+                "unknown" if action.outcome is None else action.outcome.value
+            )
+            outcome_counts[outcome_key] += 1
+            lifecycle_incomplete_count += int(
+                action.phase is not ActionPhase.RECONSTRUCTED
+            )
+            execution_unknown = action.execution_confirmed is None
+            effect_unknown = action.effect_confirmed is None
+            execution_unknown_count += int(execution_unknown)
+            effect_unknown_count += int(effect_unknown)
+            unresolved_count += int(execution_unknown or effect_unknown)
+
         world_sections: dict[str, list[dict[str, object]]] = {}
         world_omissions: dict[str, dict[str, object]] = {}
         world_total = 0
@@ -5310,10 +5331,7 @@ class SQLiteLedger:
                 },
             }
 
-        unresolved = any(
-            item.execution_confirmed is None or item.effect_confirmed is None
-            for item in state.action_records
-        )
+        unresolved = unresolved_count > 0
         frame_semantic_evidence: Mapping[str, object] = semantic_evidence or {
             "schema_version": SEMANTIC_SCHEMA_VERSION,
             "semantic_records": 0,
@@ -5383,10 +5401,14 @@ class SQLiteLedger:
             },
             rd={
                 "action_count": state.working_set.action_records.total,
-                "unresolved_count": sum(
-                    item.execution_confirmed is None or item.effect_confirmed is None
-                    for item in state.action_records
-                ),
+                "retained_action_count": len(state.action_records),
+                "projected_action_count": len(action_items),
+                "lifecycle_incomplete_count": lifecycle_incomplete_count,
+                "execution_unknown_count": execution_unknown_count,
+                "effect_unknown_count": effect_unknown_count,
+                "phase_counts": phase_counts,
+                "outcome_counts": outcome_counts,
+                "unresolved_count": unresolved_count,
                 "actions": rd_actions,
             },
             a={"actions": actual_actions},
