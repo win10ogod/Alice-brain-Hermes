@@ -213,6 +213,9 @@ class EnergyVector(BaseModel):
     )
 
     action_id: str = Field(min_length=1, max_length=512)
+    assessment_source: str | None = Field(default=None, max_length=160)
+    assessment_summary: str | None = Field(default=None, max_length=512)
+    provenance: FrozenJsonDict = Field(default_factory=FrozenJsonDict)
     evidence_basis: FrozenJsonDict = Field(default_factory=FrozenJsonDict)
     unknown_dimensions: tuple[str, ...] = ENERGY_DIMENSIONS
     deficits: FrozenJsonDict = Field(default_factory=FrozenJsonDict)
@@ -241,10 +244,17 @@ class EnergyVector(BaseModel):
         for dimension, source in value.items():
             if dimension not in known:
                 raise ValueError("unknown evidenced energy dimension")
-            if not isinstance(source, str) or not source.strip() or len(source) > 160:
+            if not isinstance(source, str) or not source.strip() or len(source) > 512:
                 raise ValueError(
                     "energy evidence basis requires a non-blank bounded source"
                 )
+        return value
+
+    @field_validator("provenance")
+    @classmethod
+    def _bounded_provenance(cls, value: FrozenJsonDict) -> FrozenJsonDict:
+        if len(value) > 32:
+            raise ValueError("energy provenance exceeds its fixed bound")
         return value
 
     @field_validator("unknown_dimensions", mode="before")
@@ -378,6 +388,9 @@ def energy_from_event(event: EventEnvelope) -> EnergyVector:
     try:
         return EnergyVector(
             action_id=event.payload["action_id"],
+            assessment_source=event.payload.get("assessment_source"),
+            assessment_summary=event.payload.get("assessment_summary"),
+            provenance=event.payload.get("provenance", {}),
             evidence_basis=event.payload.get("evidence_basis", {}),
             unknown_dimensions=event.payload.get(
                 "unknown_dimensions", ENERGY_DIMENSIONS

@@ -18,8 +18,13 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal, Self
 
-from alice_brain_hermes.core.action import ActionPhase
-from alice_brain_hermes.core.events import EventEnvelope, new_event
+from alice_brain_hermes.core.action import ActionPhase, EnergyAssessmentStatus
+from alice_brain_hermes.core.events import (
+    EventEnvelope,
+    FrozenJsonDict,
+    new_event,
+    thaw_json,
+)
 from alice_brain_hermes.core.reducer import reduce_state
 from alice_brain_hermes.core.state import (
     FRAME_PROJECTION_RECORD_BUDGET,
@@ -45,6 +50,12 @@ from alice_brain_hermes.errors import (
     SnapshotConflictError,
 )
 from alice_brain_hermes.ids import new_id, validate_id
+from alice_brain_hermes.protocol.energy import (
+    ENERGY_ASSESSMENT_LEASE_SECONDS,
+    EnergyAssessmentChoiceV1,
+    EnergyAssessmentLeaseV1,
+    EnergyAssessmentProvenanceV1,
+)
 from alice_brain_hermes.protocol.identity import (
     IDENTITY_NAMING_LEASE_SECONDS,
     IdentityChoiceV1,
@@ -81,7 +92,7 @@ from alice_brain_hermes.runtime.semantic_ingest import (
     span_context_fingerprint,
 )
 
-SQLITE_SCHEMA_VERSION = 6
+SQLITE_SCHEMA_VERSION = 7
 SEMANTIC_SCHEMA_VERSION = 1
 MAX_HERMES_SPANS_PER_STREAM = 256
 MAX_PERSISTED_OBSERVABILITY_COUNT = MAX_BRIDGE_INTEGER
@@ -89,7 +100,7 @@ MAX_PAGE_SIZE = 10_000
 DEFAULT_MAX_FRAME_BYTES = 65_536
 DEFAULT_MAX_ACK_BYTES = 4_194_304
 _LEGACY_STATE_SCHEMA_VERSIONS = frozenset({1, 2, 3})
-_SQLITE_BRIDGE_SCHEMA_VERSIONS = frozenset({3, 4, 5, SQLITE_SCHEMA_VERSION})
+_SQLITE_BRIDGE_SCHEMA_VERSIONS = frozenset({3, 4, 5, 6, SQLITE_SCHEMA_VERSION})
 _SQLITE_RUNTIME_NAMES = (
     "runtime.db",
     "runtime.db-wal",
@@ -137,6 +148,11 @@ _IDENTITY_WORKER_FAILURE_CODE = re.compile(
 )
 _IDENTITY_ADAPTER_ID = "alice-brain-hermes-identity-v1"
 _IDENTITY_PURPOSE = "identity_self_naming"
+_ENERGY_WORKER_FAILURE_CODE = re.compile(
+    r"^(?:invalid_structured_assessment|llm_error\.[A-Za-z0-9_]{1,80})$"
+)
+_ENERGY_ADAPTER_ID = "alice-brain-hermes-energy-v1"
+_ENERGY_PURPOSE = "alice_energy_assessment"
 
 
 def _assert_safe_runtime_sqlite_paths(
@@ -390,6 +406,68 @@ CREATE UNIQUE INDEX identity_naming_pending ON identity_naming_lease(brain_id)
 WHERE status = 'pending';
 """
 
+_CREATE_ENERGY_SCHEMA = """
+CREATE TABLE energy_assessment_lease (
+    lease_id TEXT PRIMARY KEY,
+    brain_id TEXT NOT NULL,
+    action_id TEXT NOT NULL CHECK (
+        length(action_id) >= 1 AND length(action_id) <= 512
+    ),
+    action_request_event_id TEXT NOT NULL,
+    request_sequence INTEGER NOT NULL CHECK (request_sequence >= 1),
+    request_event_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN (
+        'pending', 'completed', 'failed', 'superseded'
+    )),
+    requested_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL CHECK (length(input_fingerprint) = 64),
+    input_json TEXT NOT NULL,
+    choice_fingerprint TEXT CHECK (
+        choice_fingerprint IS NULL OR length(choice_fingerprint) = 64
+    ),
+    choice_json TEXT,
+    provenance_fingerprint TEXT CHECK (
+        provenance_fingerprint IS NULL OR length(provenance_fingerprint) = 64
+    ),
+    provenance_json TEXT,
+    failure_code TEXT,
+    terminal_event_id TEXT UNIQUE,
+    terminal_at TEXT,
+    CHECK ((choice_fingerprint IS NULL) = (choice_json IS NULL)),
+    CHECK ((provenance_fingerprint IS NULL) = (provenance_json IS NULL)),
+    CHECK (
+        (status = 'pending'
+         AND choice_json IS NULL AND provenance_json IS NULL
+         AND failure_code IS NULL AND terminal_event_id IS NULL
+         AND terminal_at IS NULL)
+        OR
+        (status = 'completed'
+         AND choice_json IS NOT NULL AND provenance_json IS NOT NULL
+         AND failure_code IS NULL AND terminal_event_id IS NOT NULL
+         AND terminal_at IS NOT NULL)
+        OR
+        (status = 'failed'
+         AND choice_json IS NULL AND provenance_json IS NULL
+         AND failure_code IS NOT NULL AND terminal_event_id IS NOT NULL
+         AND terminal_at IS NOT NULL)
+        OR
+        (status = 'superseded'
+         AND choice_json IS NULL AND provenance_json IS NULL
+         AND failure_code = 'expired' AND terminal_event_id IS NULL
+         AND terminal_at IS NOT NULL)
+    ),
+    FOREIGN KEY (brain_id) REFERENCES brains(brain_id),
+    FOREIGN KEY (action_request_event_id) REFERENCES events(event_id),
+    FOREIGN KEY (request_event_id) REFERENCES events(event_id),
+    FOREIGN KEY (terminal_event_id) REFERENCES events(event_id)
+) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX energy_assessment_pending
+ON energy_assessment_lease(brain_id)
+WHERE status = 'pending';
+"""
+
 _CREATE_V2_SCHEMA = _CREATE_BASE_SCHEMA
 _CREATE_V4_SCHEMA = (
     _CREATE_BASE_SCHEMA
@@ -403,7 +481,8 @@ _CREATE_BRIDGE_SCHEMA = (
     + _CREATE_PROFILE_SCHEMA
 )
 _CREATE_V5_SCHEMA = _CREATE_BASE_SCHEMA + _CREATE_BRIDGE_SCHEMA
-_CREATE_SCHEMA = _CREATE_V5_SCHEMA + _CREATE_IDENTITY_SCHEMA
+_CREATE_V6_SCHEMA = _CREATE_V5_SCHEMA + _CREATE_IDENTITY_SCHEMA
+_CREATE_SCHEMA = _CREATE_V6_SCHEMA + _CREATE_ENERGY_SCHEMA
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,6 +517,41 @@ class IdentityNamingClaimResult:
 class IdentityNamingTerminalResult:
     status: IdentityNamingTerminalStatus
     successor: BrainState | None
+
+
+EnergyAssessmentTerminalStatus = Literal["completed", "failed", "superseded"]
+
+
+@dataclass(frozen=True, slots=True)
+class EnergyAssessmentClaimResult:
+    lease: EnergyAssessmentLeaseV1 | None
+    successor: BrainState | None
+
+
+@dataclass(frozen=True, slots=True)
+class EnergyAssessmentTerminalResult:
+    status: EnergyAssessmentTerminalStatus
+    successor: BrainState | None
+
+
+@dataclass(frozen=True, slots=True)
+class _EnergyAssessmentLeaseStatus:
+    lease_id: str
+    brain_id: str
+    action_id: str
+    action_request_event_id: str
+    state_sequence: int
+    request_event_id: str
+    status: Literal["pending", "completed", "failed", "superseded"]
+    requested_at: datetime
+    expires_at: datetime
+    input_fingerprint: str
+    assessment_input: FrozenJsonDict
+    choice: EnergyAssessmentChoiceV1 | None
+    provenance: EnergyAssessmentProvenanceV1 | None
+    failure_code: str | None
+    terminal_event_id: str | None
+    terminal_at: datetime | None
 
 
 def _schema_statements() -> Iterator[str]:
@@ -689,11 +803,12 @@ class SQLiteLedger:
                         final_states=final_states
                     )
                     self._install_identity_schema(final_states=final_states)
+                    self._install_energy_schema()
                 except SchemaVersionError:
                     raise
                 except Exception as error:
                     raise SchemaVersionError(
-                        "SQLite v2 to v6 migration failed"
+                        "SQLite v2 to v7 migration failed"
                     ) from error
                 self._connection.execute(
                     "UPDATE schema_metadata SET value = ? WHERE key = ?",
@@ -719,11 +834,12 @@ class SQLiteLedger:
                     self._install_identity_schema(
                         final_states=self._startup_audited_final_states
                     )
+                    self._install_energy_schema()
                 except SchemaVersionError:
                     raise
                 except Exception as error:
                     raise SchemaVersionError(
-                        f"SQLite v{version} to v6 migration failed"
+                        f"SQLite v{version} to v7 migration failed"
                     ) from error
                 self._connection.execute(
                     "UPDATE schema_metadata SET value = ? WHERE key = ?",
@@ -746,11 +862,37 @@ class SQLiteLedger:
                     self._install_identity_schema(
                         final_states=self._startup_audited_final_states
                     )
+                    self._install_energy_schema()
                 except SchemaVersionError:
                     raise
                 except Exception as error:
                     raise SchemaVersionError(
-                        "SQLite v5 to v6 migration failed"
+                        "SQLite v5 to v7 migration failed"
+                    ) from error
+                self._connection.execute(
+                    "UPDATE schema_metadata SET value = ? WHERE key = ?",
+                    (str(SQLITE_SCHEMA_VERSION), "schema_version"),
+                )
+                self._connection.execute(
+                    f"PRAGMA user_version = {SQLITE_SCHEMA_VERSION}"
+                )
+                self._startup_audited_final_states = self._validate_schema_contract(
+                    SQLITE_SCHEMA_VERSION, validate_data=True
+                )
+                self._validate_schema_metadata(SQLITE_SCHEMA_VERSION)
+                return
+            if version == 6:
+                self._validate_schema_metadata(6)
+                self._startup_audited_final_states = self._validate_schema_contract(
+                    6, validate_data=True
+                )
+                try:
+                    self._install_energy_schema()
+                except SchemaVersionError:
+                    raise
+                except Exception as error:
+                    raise SchemaVersionError(
+                        "SQLite v6 to v7 migration failed"
                     ) from error
                 self._connection.execute(
                     "UPDATE schema_metadata SET value = ? WHERE key = ?",
@@ -777,6 +919,10 @@ class SQLiteLedger:
     @staticmethod
     def _normalized_identity_name(name: str) -> str:
         return identity_name_normalization_key(name)
+
+    def _install_energy_schema(self) -> None:
+        for statement in _statements(_CREATE_ENERGY_SCHEMA):
+            self._connection.execute(statement)
 
     def _last_identity_name_event_in_transaction(
         self,
@@ -1194,6 +1340,228 @@ class SQLiteLedger:
                 "identity naming reserved evidence is not bijectively lease-bound"
             )
 
+    def _validate_energy_rows_in_transaction(
+        self,
+        historical_states: Mapping[str, Mapping[int, BrainState]],
+        final_states: Mapping[str, BrainState],
+    ) -> None:
+        reserved_event_ids: set[str] = set()
+        events_by_id: dict[str, EventEnvelope] = {}
+        event_cursor = self._connection.execute(
+            "SELECT event_id, brain_id, sequence, body_fingerprint, "
+            "envelope_fingerprint, envelope_json FROM events "
+            "ORDER BY brain_id, sequence"
+        )
+        while event_rows := event_cursor.fetchmany(512):
+            for event_row in event_rows:
+                event = self._decode_event(event_row)
+                events_by_id[event.event_id] = event
+                if event.adapter_id == _ENERGY_ADAPTER_ID:
+                    reserved_event_ids.add(event.event_id)
+
+        covered_event_ids: set[str] = set()
+
+        def cover(event: EventEnvelope) -> None:
+            if event.event_id in covered_event_ids:
+                raise LedgerIntegrityError(
+                    "energy assessment evidence is covered by multiple leases"
+                )
+            covered_event_ids.add(event.event_id)
+
+        lease_rows = self._connection.execute(
+            "SELECT lease_id, brain_id, action_id, action_request_event_id, "
+            "request_sequence, request_event_id, status, requested_at, "
+            "expires_at, input_fingerprint, input_json, choice_fingerprint, "
+            "choice_json, provenance_fingerprint, provenance_json, failure_code, "
+            "terminal_event_id, terminal_at FROM energy_assessment_lease "
+            "ORDER BY lease_id"
+        ).fetchall()
+        for row in lease_rows:
+            status = self._energy_status_from_row(row)
+            if status.brain_id not in final_states:
+                raise LedgerIntegrityError("energy assessment lease brain is missing")
+            if status.expires_at <= status.requested_at:
+                raise LedgerIntegrityError("energy assessment lease expiry is invalid")
+            predecessor = historical_states.get(status.brain_id, {}).get(
+                status.state_sequence - 1
+            )
+            if predecessor is None:
+                raise LedgerIntegrityError(
+                    "energy assessment request predecessor is missing"
+                )
+            action = predecessor.actions.get(status.action_id)
+            if (
+                action is None
+                or action.energy_assessment_status
+                is not EnergyAssessmentStatus.PENDING
+                or action.energy_request_event_id != status.action_request_event_id
+            ):
+                raise LedgerIntegrityError(
+                    "energy assessment request did not follow a pending action"
+                )
+            expected_input = self._energy_assessment_input(
+                predecessor,
+                action_id=status.action_id,
+                action_request_event_id=status.action_request_event_id,
+            )
+            if expected_input != status.assessment_input:
+                raise LedgerIntegrityError(
+                    "energy assessment input is not replay-derived"
+                )
+            action_request = events_by_id.get(status.action_request_event_id)
+            request = events_by_id.get(status.request_event_id)
+            if (
+                action_request is None
+                or action_request.event_type != "action.energy_requested"
+                or action_request.brain_id != status.brain_id
+                or action_request.action_id != status.action_id
+                or request is None
+                or request.sequence != status.state_sequence
+                or request.brain_id != status.brain_id
+                or request.actor_id != status.brain_id
+                or request.action_id != status.action_id
+                or request.event_type != "cognition.requested"
+                or request.adapter_id != _ENERGY_ADAPTER_ID
+                or request.payload
+                != {
+                    "schema_version": 1,
+                    "purpose": _ENERGY_PURPOSE,
+                    "lease_id": status.lease_id,
+                    "action_id": status.action_id,
+                    "action_request_event_id": status.action_request_event_id,
+                    "input_sha256": status.input_fingerprint,
+                    "requested_at": status.requested_at.isoformat(),
+                    "expires_at": status.expires_at.isoformat(),
+                }
+            ):
+                raise LedgerIntegrityError(
+                    "energy assessment request does not match its lease"
+                )
+            cover(request)
+
+            if status.status == "pending":
+                continue
+            if status.status == "superseded":
+                if (
+                    status.failure_code != "expired"
+                    or status.terminal_event_id is not None
+                    or status.terminal_at is None
+                ):
+                    raise LedgerIntegrityError(
+                        "energy assessment supersession is invalid"
+                    )
+                continue
+            if status.terminal_event_id is None or status.terminal_at is None:
+                raise LedgerIntegrityError("energy assessment terminal is missing")
+            terminal = events_by_id.get(status.terminal_event_id)
+            if terminal is None or terminal.sequence is None or terminal.sequence < 2:
+                raise LedgerIntegrityError(
+                    "energy assessment terminal event is missing"
+                )
+            cognition = next(
+                (
+                    event
+                    for event in events_by_id.values()
+                    if event.brain_id == status.brain_id
+                    and event.sequence == terminal.sequence - 1
+                ),
+                None,
+            )
+            if (
+                cognition is None
+                or cognition.adapter_id != _ENERGY_ADAPTER_ID
+                or cognition.actor_id != status.brain_id
+                or cognition.action_id != status.action_id
+                or terminal.adapter_id != _ENERGY_ADAPTER_ID
+                or terminal.actor_id != status.brain_id
+                or terminal.action_id != status.action_id
+            ):
+                raise LedgerIntegrityError(
+                    "energy assessment terminal provenance is invalid"
+                )
+            if status.status == "completed":
+                if status.choice is None or status.provenance is None:
+                    raise LedgerIntegrityError(
+                        "completed energy assessment lost structured evidence"
+                    )
+                choice_fingerprint = self._energy_fingerprint(
+                    status.choice.canonical_json()
+                )
+                provenance_fingerprint = self._energy_fingerprint(
+                    status.provenance.canonical_json()
+                )
+                choice_payload = status.choice.model_dump(
+                    mode="python", exclude={"schema_version"}
+                )
+                if (
+                    status.provenance.input_sha256 != status.input_fingerprint
+                    or cognition.event_type != "cognition.completed"
+                    or cognition.payload
+                    != {
+                        "schema_version": 1,
+                        "purpose": _ENERGY_PURPOSE,
+                        "lease_id": status.lease_id,
+                        "action_id": status.action_id,
+                        "choice_fingerprint": choice_fingerprint,
+                        "provenance_fingerprint": provenance_fingerprint,
+                        "input_sha256": status.input_fingerprint,
+                        "structured": True,
+                        "terminal_at": status.terminal_at.isoformat(),
+                    }
+                    or terminal.event_type != "action.energy_assessed"
+                    or terminal.payload
+                    != {
+                        "action_id": status.action_id,
+                        **choice_payload,
+                        "assessment_source": "hermes_host_llm",
+                        "assessment_summary": status.choice.summary,
+                        "provenance": status.provenance.model_dump(mode="python"),
+                        "lease_id": status.lease_id,
+                        "source_event_id": cognition.event_id,
+                    }
+                ):
+                    raise LedgerIntegrityError(
+                        "completed energy assessment evidence is inconsistent"
+                    )
+            else:
+                if (
+                    status.status != "failed"
+                    or status.choice is not None
+                    or status.provenance is not None
+                    or status.failure_code is None
+                    or _ENERGY_WORKER_FAILURE_CODE.fullmatch(status.failure_code)
+                    is None
+                    or cognition.event_type != "cognition.failed"
+                    or cognition.payload
+                    != {
+                        "schema_version": 1,
+                        "purpose": _ENERGY_PURPOSE,
+                        "lease_id": status.lease_id,
+                        "action_id": status.action_id,
+                        "failure_code": status.failure_code,
+                        "terminal_at": status.terminal_at.isoformat(),
+                    }
+                    or terminal.event_type
+                    != "action.energy_assessment_failed"
+                    or terminal.payload
+                    != {
+                        "action_id": status.action_id,
+                        "failure_code": status.failure_code,
+                        "lease_id": status.lease_id,
+                        "source_event_id": cognition.event_id,
+                    }
+                ):
+                    raise LedgerIntegrityError(
+                        "failed energy assessment evidence is inconsistent"
+                    )
+            cover(cognition)
+            cover(terminal)
+
+        if covered_event_ids != reserved_event_ids:
+            raise LedgerIntegrityError(
+                "energy assessment reserved evidence is not bijectively lease-bound"
+            )
+
     @staticmethod
     def _legacy_semantic_fingerprint(
         *,
@@ -1373,6 +1741,8 @@ class SQLiteLedger:
             if version in {3, 4}
             else _CREATE_V5_SCHEMA
             if version == 5
+            else _CREATE_V6_SCHEMA
+            if version == 6
             else _CREATE_SCHEMA
         )
         rows = self._connection.execute(
@@ -1428,7 +1798,7 @@ class SQLiteLedger:
                 raise SchemaVersionError(
                     f"SQLite v{version} bridge or profile data integrity check failed"
                 ) from error
-        if version == SQLITE_SCHEMA_VERSION:
+        if version in {6, SQLITE_SCHEMA_VERSION}:
             try:
                 self._validate_identity_rows_in_transaction(
                     historical_states,
@@ -1436,12 +1806,22 @@ class SQLiteLedger:
                 )
             except IdentityNameNormalizationError as error:
                 raise SchemaVersionError(
-                    "SQLite v6 identity data violates the stable Unicode 14.0 "
+                    f"SQLite v{version} identity data violates the stable Unicode 14.0 "
                     "normalization boundary"
                 ) from error
             except Exception as error:
                 raise SchemaVersionError(
                     f"SQLite v{version} identity data integrity check failed"
+                ) from error
+        if version == SQLITE_SCHEMA_VERSION:
+            try:
+                self._validate_energy_rows_in_transaction(
+                    historical_states,
+                    final_states,
+                )
+            except Exception as error:
+                raise SchemaVersionError(
+                    f"SQLite v{version} energy data integrity check failed"
                 ) from error
         return final_states
 
@@ -2794,6 +3174,534 @@ class SQLiteLedger:
             if updated.rowcount != 1:
                 raise LedgerIntegrityError("identity naming failure was not persisted")
             return IdentityNamingTerminalResult("failed", successor)
+
+    @staticmethod
+    def _energy_now(value: datetime) -> datetime:
+        if not isinstance(value, datetime):
+            raise TypeError("energy assessment time must be a datetime")
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("energy assessment time must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @staticmethod
+    def _canonical_json_value(value: object) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _energy_fingerprint(canonical_json: str) -> str:
+        return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+    def _energy_lease_row(self, lease_id: str) -> sqlite3.Row:
+        row = self._connection.execute(
+            "SELECT lease_id, brain_id, action_id, action_request_event_id, "
+            "request_sequence, request_event_id, status, requested_at, "
+            "expires_at, input_fingerprint, input_json, choice_fingerprint, "
+            "choice_json, provenance_fingerprint, provenance_json, failure_code, "
+            "terminal_event_id, terminal_at FROM energy_assessment_lease "
+            "WHERE lease_id = ?",
+            (lease_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(lease_id)
+        return row
+
+    def _energy_status_from_row(
+        self,
+        row: sqlite3.Row,
+    ) -> _EnergyAssessmentLeaseStatus:
+        try:
+            raw_input = json.loads(row["input_json"])
+            if type(raw_input) is not dict:
+                raise ValueError("energy assessment input is not an object")
+            input_json = self._canonical_json_value(raw_input)
+            if (
+                input_json != row["input_json"]
+                or self._energy_fingerprint(input_json) != row["input_fingerprint"]
+            ):
+                raise ValueError("energy assessment input integrity failed")
+            assessment_input = FrozenJsonDict(raw_input)
+
+            choice: EnergyAssessmentChoiceV1 | None = None
+            if row["choice_json"] is not None:
+                choice = EnergyAssessmentChoiceV1.model_validate_json(
+                    row["choice_json"], strict=True
+                )
+                if (
+                    choice.canonical_json() != row["choice_json"]
+                    or self._energy_fingerprint(choice.canonical_json())
+                    != row["choice_fingerprint"]
+                ):
+                    raise ValueError("energy choice integrity failed")
+            elif row["choice_fingerprint"] is not None:
+                raise ValueError("energy choice fingerprint is orphaned")
+
+            provenance: EnergyAssessmentProvenanceV1 | None = None
+            if row["provenance_json"] is not None:
+                provenance = EnergyAssessmentProvenanceV1.model_validate_json(
+                    row["provenance_json"], strict=True
+                )
+                if (
+                    provenance.canonical_json() != row["provenance_json"]
+                    or self._energy_fingerprint(provenance.canonical_json())
+                    != row["provenance_fingerprint"]
+                ):
+                    raise ValueError("energy provenance integrity failed")
+            elif row["provenance_fingerprint"] is not None:
+                raise ValueError("energy provenance fingerprint is orphaned")
+
+            return _EnergyAssessmentLeaseStatus(
+                lease_id=validate_id(row["lease_id"]),
+                brain_id=validate_id(row["brain_id"]),
+                action_id=row["action_id"],
+                action_request_event_id=validate_id(row["action_request_event_id"]),
+                state_sequence=int(row["request_sequence"]),
+                request_event_id=validate_id(row["request_event_id"]),
+                status=row["status"],
+                requested_at=self._identity_timestamp(
+                    row["requested_at"], field="energy requested_at"
+                ),
+                expires_at=self._identity_timestamp(
+                    row["expires_at"], field="energy expires_at"
+                ),
+                input_fingerprint=row["input_fingerprint"],
+                assessment_input=assessment_input,
+                choice=choice,
+                provenance=provenance,
+                failure_code=row["failure_code"],
+                terminal_event_id=row["terminal_event_id"],
+                terminal_at=(
+                    None
+                    if row["terminal_at"] is None
+                    else self._identity_timestamp(
+                        row["terminal_at"], field="energy terminal"
+                    )
+                ),
+            )
+        except Exception as error:
+            raise LedgerIntegrityError(
+                "energy assessment lease row is invalid"
+            ) from error
+
+    def energy_assessment_brain_id(self, lease_id: str) -> str:
+        lease_id = validate_id(lease_id)
+        self._assert_creator_process()
+        with self._lock:
+            self._ensure_open()
+            return self._energy_status_from_row(
+                self._energy_lease_row(lease_id)
+            ).brain_id
+
+    @staticmethod
+    def _energy_assessment_input(
+        state: BrainState,
+        *,
+        action_id: str,
+        action_request_event_id: str,
+    ) -> FrozenJsonDict:
+        action = state.actions[action_id]
+        return FrozenJsonDict(
+            {
+                "schema_version": 1,
+                "action_id": action_id,
+                "action_request_event_id": action_request_event_id,
+                "pc": {
+                    "traits": thaw_json(state.personality.traits),
+                    "adaptations": thaw_json(state.personality.adaptations),
+                    "narrative_ideal": thaw_json(
+                        state.personality.narrative_ideal
+                    ),
+                },
+                "st": thaw_json(action.intent),
+                "rd": {
+                    "phase": action.rd_phase.value,
+                    "prepared_branch_id": action.prepared_branch_id,
+                    "execution_confirmed": action.execution_confirmed,
+                    "outcome": (
+                        None if action.outcome is None else action.outcome.value
+                    ),
+                    "reconstruction": (
+                        None
+                        if action.reconstruction is None
+                        else thaw_json(action.reconstruction)
+                    ),
+                },
+                "state_sequence": state.last_sequence,
+            }
+        )
+
+    def _supersede_pending_energy_lease(
+        self,
+        lease_id: str,
+        *,
+        now: datetime,
+        requested_at: datetime,
+    ) -> None:
+        if now < requested_at:
+            raise ValueError("energy assessment terminal time predates its request")
+        updated = self._connection.execute(
+            "UPDATE energy_assessment_lease SET status = 'superseded', "
+            "failure_code = 'expired', terminal_at = ? "
+            "WHERE lease_id = ? AND status = 'pending'",
+            (now.isoformat(), lease_id),
+        )
+        if updated.rowcount != 1:
+            raise LedgerIntegrityError("energy assessment supersession was lost")
+
+    def claim_energy_assessment(
+        self,
+        *,
+        expected_state: BrainState,
+        actor_id: str,
+        now: datetime,
+    ) -> EnergyAssessmentClaimResult:
+        expected_state = expected_state.revalidated()
+        actor_id = validate_id(actor_id)
+        if actor_id != expected_state.brain_id:
+            raise ValueError("energy assessment actor must be the brain self actor")
+        now = self._energy_now(now)
+        expires_at = now + timedelta(seconds=ENERGY_ASSESSMENT_LEASE_SECONDS)
+        with self._transaction(immediate=True):
+            self._require_identity_head_in_transaction(expected_state)
+            pending_row = self._connection.execute(
+                "SELECT lease_id, brain_id, action_id, action_request_event_id, "
+                "request_sequence, request_event_id, status, requested_at, "
+                "expires_at, input_fingerprint, input_json, choice_fingerprint, "
+                "choice_json, provenance_fingerprint, provenance_json, "
+                "failure_code, terminal_event_id, terminal_at "
+                "FROM energy_assessment_lease WHERE brain_id = ? "
+                "AND status = 'pending'",
+                (expected_state.brain_id,),
+            ).fetchone()
+            if pending_row is not None:
+                pending = self._energy_status_from_row(pending_row)
+                if pending.expires_at > now:
+                    return EnergyAssessmentClaimResult(None, None)
+                self._supersede_pending_energy_lease(
+                    pending.lease_id,
+                    now=now,
+                    requested_at=pending.requested_at,
+                )
+
+            terminal_actions = {
+                row["action_id"]
+                for row in self._connection.execute(
+                    "SELECT action_id FROM energy_assessment_lease "
+                    "WHERE brain_id = ? AND status IN ('completed', 'failed')",
+                    (expected_state.brain_id,),
+                ).fetchall()
+            }
+            candidate = next(
+                (
+                    action
+                    for action in expected_state.action_records
+                    if action.energy_assessment_status
+                    is EnergyAssessmentStatus.PENDING
+                    and action.energy_request_event_id is not None
+                    and action.action_id not in terminal_actions
+                ),
+                None,
+            )
+            if candidate is None:
+                return EnergyAssessmentClaimResult(None, None)
+            action_request_event_id = validate_id(candidate.energy_request_event_id)
+            source_row = self._connection.execute(
+                "SELECT event_id, brain_id, sequence, body_fingerprint, "
+                "envelope_fingerprint, envelope_json FROM events "
+                "WHERE event_id = ?",
+                (action_request_event_id,),
+            ).fetchone()
+            if source_row is None:
+                raise LedgerIntegrityError("energy action request event is missing")
+            source = self._decode_event(source_row)
+            if (
+                source.brain_id != expected_state.brain_id
+                or source.event_type != "action.energy_requested"
+                or source.action_id != candidate.action_id
+            ):
+                raise LedgerIntegrityError("energy action request source is invalid")
+
+            assessment_input = self._energy_assessment_input(
+                expected_state,
+                action_id=candidate.action_id,
+                action_request_event_id=action_request_event_id,
+            )
+            input_json = self._canonical_json_value(thaw_json(assessment_input))
+            input_fingerprint = self._energy_fingerprint(input_json)
+            lease_id = new_id()
+            requested = new_event(
+                "cognition.requested",
+                expected_state.brain_id,
+                actor_id,
+                {
+                    "schema_version": 1,
+                    "purpose": _ENERGY_PURPOSE,
+                    "lease_id": lease_id,
+                    "action_id": candidate.action_id,
+                    "action_request_event_id": action_request_event_id,
+                    "input_sha256": input_fingerprint,
+                    "requested_at": now.isoformat(),
+                    "expires_at": expires_at.isoformat(),
+                },
+                action_id=candidate.action_id,
+                adapter_id=_ENERGY_ADAPTER_ID,
+            )
+            events, successor = self._insert_identity_event_batch_in_transaction(
+                expected_state,
+                (requested,),
+            )
+            request_event = events[0]
+            self._connection.execute(
+                "INSERT INTO energy_assessment_lease("
+                "lease_id, brain_id, action_id, action_request_event_id, "
+                "request_sequence, request_event_id, status, requested_at, "
+                "expires_at, input_fingerprint, input_json, choice_fingerprint, "
+                "choice_json, provenance_fingerprint, provenance_json, "
+                "failure_code, terminal_event_id, terminal_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, NULL, NULL, "
+                "NULL, NULL, NULL, NULL, NULL)",
+                (
+                    lease_id,
+                    expected_state.brain_id,
+                    candidate.action_id,
+                    action_request_event_id,
+                    request_event.sequence,
+                    request_event.event_id,
+                    now.isoformat(),
+                    expires_at.isoformat(),
+                    input_fingerprint,
+                    input_json,
+                ),
+            )
+            return EnergyAssessmentClaimResult(
+                EnergyAssessmentLeaseV1(
+                    lease_id=lease_id,
+                    brain_id=expected_state.brain_id,
+                    action_id=candidate.action_id,
+                    request_event_id=request_event.event_id,
+                    state_sequence=request_event.sequence,
+                    expires_at=expires_at,
+                    assessment_input=assessment_input,
+                ),
+                successor,
+            )
+
+    def complete_energy_assessment(
+        self,
+        lease_id: str,
+        choice: EnergyAssessmentChoiceV1,
+        provenance: EnergyAssessmentProvenanceV1,
+        *,
+        expected_state: BrainState,
+        actor_id: str,
+        now: datetime,
+    ) -> EnergyAssessmentTerminalResult:
+        lease_id = validate_id(lease_id)
+        choice = EnergyAssessmentChoiceV1.model_validate(
+            choice.model_dump(mode="python"), strict=True
+        )
+        provenance = EnergyAssessmentProvenanceV1.model_validate(
+            provenance.model_dump(mode="python"), strict=True
+        )
+        expected_state = expected_state.revalidated()
+        actor_id = validate_id(actor_id)
+        if actor_id != expected_state.brain_id:
+            raise ValueError("energy assessment actor must be the brain self actor")
+        now = self._energy_now(now)
+        choice_json = choice.canonical_json()
+        provenance_json = provenance.canonical_json()
+        choice_fingerprint = self._energy_fingerprint(choice_json)
+        provenance_fingerprint = self._energy_fingerprint(provenance_json)
+        with self._transaction(immediate=True):
+            status = self._energy_status_from_row(self._energy_lease_row(lease_id))
+            if status.brain_id != expected_state.brain_id:
+                raise ValueError("energy assessment lease changed brain identity")
+            self._require_identity_head_in_transaction(expected_state)
+            if status.status == "completed":
+                if status.choice != choice or status.provenance != provenance:
+                    raise IdempotencyConflictError(
+                        "energy assessment lease has different completed evidence"
+                    )
+                return EnergyAssessmentTerminalResult("completed", None)
+            if status.status in {"failed", "superseded"}:
+                return EnergyAssessmentTerminalResult("superseded", None)
+            if provenance.input_sha256 != status.input_fingerprint:
+                raise ValueError("energy provenance does not match assessment input")
+            if now < status.requested_at:
+                raise ValueError("energy assessment terminal time predates its request")
+            if now >= status.expires_at:
+                self._supersede_pending_energy_lease(
+                    lease_id,
+                    now=now,
+                    requested_at=status.requested_at,
+                )
+                return EnergyAssessmentTerminalResult("superseded", None)
+            action = expected_state.actions.get(status.action_id)
+            if (
+                action is None
+                or action.energy_assessment_status
+                is not EnergyAssessmentStatus.PENDING
+                or action.energy_request_event_id != status.action_request_event_id
+            ):
+                raise LedgerIntegrityError(
+                    "energy assessment action is not the requested pending action"
+                )
+
+            completed = new_event(
+                "cognition.completed",
+                expected_state.brain_id,
+                actor_id,
+                {
+                    "schema_version": 1,
+                    "purpose": _ENERGY_PURPOSE,
+                    "lease_id": lease_id,
+                    "action_id": status.action_id,
+                    "choice_fingerprint": choice_fingerprint,
+                    "provenance_fingerprint": provenance_fingerprint,
+                    "input_sha256": status.input_fingerprint,
+                    "structured": True,
+                    "terminal_at": now.isoformat(),
+                },
+                action_id=status.action_id,
+                adapter_id=_ENERGY_ADAPTER_ID,
+            )
+            choice_payload = choice.model_dump(
+                mode="python", exclude={"schema_version"}
+            )
+            assessed = new_event(
+                "action.energy_assessed",
+                expected_state.brain_id,
+                actor_id,
+                {
+                    "action_id": status.action_id,
+                    **choice_payload,
+                    "assessment_source": "hermes_host_llm",
+                    "assessment_summary": choice.summary,
+                    "provenance": provenance.model_dump(mode="python"),
+                    "lease_id": lease_id,
+                    "source_event_id": completed.event_id,
+                },
+                action_id=status.action_id,
+                adapter_id=_ENERGY_ADAPTER_ID,
+            )
+            events, successor = self._insert_identity_event_batch_in_transaction(
+                expected_state,
+                (completed, assessed),
+            )
+            updated = self._connection.execute(
+                "UPDATE energy_assessment_lease SET status = 'completed', "
+                "choice_fingerprint = ?, choice_json = ?, "
+                "provenance_fingerprint = ?, provenance_json = ?, "
+                "terminal_event_id = ?, terminal_at = ? "
+                "WHERE lease_id = ? AND status = 'pending'",
+                (
+                    choice_fingerprint,
+                    choice_json,
+                    provenance_fingerprint,
+                    provenance_json,
+                    events[-1].event_id,
+                    now.isoformat(),
+                    lease_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise LedgerIntegrityError("energy assessment result was not persisted")
+            return EnergyAssessmentTerminalResult("completed", successor)
+
+    def fail_energy_assessment(
+        self,
+        lease_id: str,
+        failure_code: str,
+        *,
+        expected_state: BrainState,
+        actor_id: str,
+        now: datetime,
+    ) -> EnergyAssessmentTerminalResult:
+        lease_id = validate_id(lease_id)
+        if not isinstance(
+            failure_code, str
+        ) or not _ENERGY_WORKER_FAILURE_CODE.fullmatch(failure_code):
+            raise ValueError("energy assessment failure code is invalid")
+        expected_state = expected_state.revalidated()
+        actor_id = validate_id(actor_id)
+        if actor_id != expected_state.brain_id:
+            raise ValueError("energy assessment actor must be the brain self actor")
+        now = self._energy_now(now)
+        with self._transaction(immediate=True):
+            status = self._energy_status_from_row(self._energy_lease_row(lease_id))
+            if status.brain_id != expected_state.brain_id:
+                raise ValueError("energy assessment lease changed brain identity")
+            self._require_identity_head_in_transaction(expected_state)
+            if status.status == "failed":
+                if status.failure_code != failure_code:
+                    raise IdempotencyConflictError(
+                        "energy assessment lease has a different failure"
+                    )
+                return EnergyAssessmentTerminalResult("failed", None)
+            if status.status in {"completed", "superseded"}:
+                return EnergyAssessmentTerminalResult("superseded", None)
+            if now < status.requested_at:
+                raise ValueError("energy assessment terminal time predates its request")
+            if now >= status.expires_at:
+                self._supersede_pending_energy_lease(
+                    lease_id,
+                    now=now,
+                    requested_at=status.requested_at,
+                )
+                return EnergyAssessmentTerminalResult("superseded", None)
+            failed = new_event(
+                "cognition.failed",
+                expected_state.brain_id,
+                actor_id,
+                {
+                    "schema_version": 1,
+                    "purpose": _ENERGY_PURPOSE,
+                    "lease_id": lease_id,
+                    "action_id": status.action_id,
+                    "failure_code": failure_code,
+                    "terminal_at": now.isoformat(),
+                },
+                action_id=status.action_id,
+                adapter_id=_ENERGY_ADAPTER_ID,
+            )
+            action_failed = new_event(
+                "action.energy_assessment_failed",
+                expected_state.brain_id,
+                actor_id,
+                {
+                    "action_id": status.action_id,
+                    "failure_code": failure_code,
+                    "lease_id": lease_id,
+                    "source_event_id": failed.event_id,
+                },
+                action_id=status.action_id,
+                adapter_id=_ENERGY_ADAPTER_ID,
+            )
+            events, successor = self._insert_identity_event_batch_in_transaction(
+                expected_state,
+                (failed, action_failed),
+            )
+            updated = self._connection.execute(
+                "UPDATE energy_assessment_lease SET status = 'failed', "
+                "failure_code = ?, terminal_event_id = ?, terminal_at = ? "
+                "WHERE lease_id = ? AND status = 'pending'",
+                (
+                    failure_code,
+                    events[-1].event_id,
+                    now.isoformat(),
+                    lease_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise LedgerIntegrityError(
+                    "energy assessment failure was not persisted"
+                )
+            return EnergyAssessmentTerminalResult("failed", successor)
 
     def _authoritative_brain_head_in_transaction(self, brain_id: str) -> int | None:
         row = self._connection.execute(

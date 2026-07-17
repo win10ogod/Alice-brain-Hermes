@@ -280,9 +280,11 @@ def test_schema_v5_migrates_names_and_rejects_registry_tampering(
     with SQLiteLedger.open(database) as ledger:
         engine = _engine(ledger, name="Mira")
         brain_id = engine.brain_id
-        assert SQLITE_SCHEMA_VERSION == 6
+        assert SQLITE_SCHEMA_VERSION == 7
 
     with sqlite3.connect(database) as connection:
+        connection.execute("DROP INDEX energy_assessment_pending")
+        connection.execute("DROP TABLE energy_assessment_lease")
         connection.execute("DROP INDEX identity_naming_pending")
         connection.execute("DROP TABLE identity_naming_lease")
         connection.execute("DROP TABLE identity_name_registry")
@@ -290,7 +292,7 @@ def test_schema_v5_migrates_names_and_rejects_registry_tampering(
         connection.execute("PRAGMA user_version = 5")
 
     with SQLiteLedger.open(database) as migrated:
-        assert migrated.schema_version == 6
+        assert migrated.schema_version == 7
         row = migrated._connection.execute(
             "SELECT display_name, normalized_name FROM identity_name_registry "
             "WHERE brain_id = ?",
@@ -862,6 +864,8 @@ def test_legacy_identity_backfill_rejects_post_unicode14_name_explicitly(
         engine = _engine(ledger, name="Stable")
 
     with sqlite3.connect(database) as connection:
+        connection.execute("DROP INDEX energy_assessment_pending")
+        connection.execute("DROP TABLE energy_assessment_lease")
         connection.execute("DROP INDEX identity_name_normalized")
         connection.execute("DROP INDEX identity_naming_pending")
         connection.execute("DROP TABLE identity_naming_lease")
@@ -911,6 +915,8 @@ def test_legacy_identity_backfill_rejects_normalized_name_collision_transactiona
         second = _engine(ledger, name="Aster")
 
     with sqlite3.connect(database) as connection:
+        connection.execute("DROP INDEX energy_assessment_pending")
+        connection.execute("DROP TABLE energy_assessment_lease")
         connection.execute("DROP INDEX IF EXISTS identity_name_normalized")
         connection.execute("DROP INDEX identity_naming_pending")
         connection.execute("DROP TABLE identity_naming_lease")
@@ -1050,7 +1056,7 @@ def test_restart_rejects_untrue_identity_supersession_reason(
             (reason, lease.lease_id),
         )
 
-    with pytest.raises(SchemaVersionError, match="v6"):
+    with pytest.raises(SchemaVersionError, match="v7"):
         SQLiteLedger.open(database)
 
 

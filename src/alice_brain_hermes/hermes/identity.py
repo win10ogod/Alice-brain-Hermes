@@ -153,11 +153,11 @@ class _IdentityTerminalIntent:
 def read_identity_llm_mode(
     environ: Mapping[str, str],
 ) -> IdentityLlmMode:
-    """Read an exact opt-in value; absence safely keeps identity naming off."""
+    """Use Hermes host naming by default while preserving an exact opt-out."""
 
     raw = environ.get(IDENTITY_LLM_MODE_ENV)
     if raw is None:
-        return IdentityLlmMode.OFF
+        return IdentityLlmMode.NAME_WHEN_UNNAMED
     try:
         return IdentityLlmMode(raw)
     except ValueError as error:

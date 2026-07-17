@@ -18,6 +18,11 @@ from alice_brain_hermes.core.state import BrainState
 from alice_brain_hermes.core.workspace import WorkspaceCoordinator
 from alice_brain_hermes.errors import EventConflictError, ExpectedSequenceError
 from alice_brain_hermes.ids import validate_id
+from alice_brain_hermes.protocol.energy import (
+    EnergyAssessmentChoiceV1,
+    EnergyAssessmentLeaseV1,
+    EnergyAssessmentProvenanceV1,
+)
 from alice_brain_hermes.protocol.identity import IdentityChoiceV1, IdentityNamingLeaseV1
 from alice_brain_hermes.protocol.models import (
     BridgeCommitAckV2,
@@ -28,6 +33,8 @@ from alice_brain_hermes.protocol.models import (
 from alice_brain_hermes.runtime.store import (
     BridgeAbandonResult,
     BridgeCommitResult,
+    EnergyAssessmentClaimResult,
+    EnergyAssessmentTerminalResult,
     IdentityNamingClaimResult,
     IdentityNamingTerminalResult,
 )
@@ -104,6 +111,35 @@ class EventLedger(Protocol):
         actor_id: str,
         now: datetime,
     ) -> IdentityNamingTerminalResult: ...
+
+    def claim_energy_assessment(
+        self,
+        *,
+        expected_state: BrainState,
+        actor_id: str,
+        now: datetime,
+    ) -> EnergyAssessmentClaimResult: ...
+
+    def complete_energy_assessment(
+        self,
+        lease_id: str,
+        choice: EnergyAssessmentChoiceV1,
+        provenance: EnergyAssessmentProvenanceV1,
+        *,
+        expected_state: BrainState,
+        actor_id: str,
+        now: datetime,
+    ) -> EnergyAssessmentTerminalResult: ...
+
+    def fail_energy_assessment(
+        self,
+        lease_id: str,
+        failure_code: str,
+        *,
+        expected_state: BrainState,
+        actor_id: str,
+        now: datetime,
+    ) -> EnergyAssessmentTerminalResult: ...
 
 
 class Coordinator(Protocol):
@@ -436,6 +472,112 @@ class ConsciousEngine:
                 self._diverged = True
                 raise EventConflictError(
                     "engine sequence divergence during identity failure"
+                ) from error
+            except sqlite3.DatabaseError:
+                self._diverged = True
+                raise
+            if result.successor is not None:
+                self._state = result.successor
+            return result.status
+
+    def claim_energy_assessment(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> EnergyAssessmentLeaseV1 | None:
+        """Claim the next durable host-LLM energy job without fabricating E."""
+
+        self._assert_creator_process()
+        with self._lock:
+            if self._diverged:
+                raise EventConflictError(
+                    "engine sequence divergence requires a replayed restart"
+                )
+            try:
+                result = self.ledger.claim_energy_assessment(
+                    expected_state=self._state,
+                    actor_id=self.actor_id,
+                    now=self._identity_time(now),
+                )
+            except ExpectedSequenceError as error:
+                self._diverged = True
+                raise EventConflictError(
+                    "engine sequence divergence during energy lease claim"
+                ) from error
+            except sqlite3.DatabaseError:
+                self._diverged = True
+                raise
+            if result.successor is not None:
+                self._state = result.successor
+            return result.lease
+
+    def complete_energy_assessment(
+        self,
+        lease_id: str,
+        choice: EnergyAssessmentChoiceV1,
+        provenance: EnergyAssessmentProvenanceV1 | Mapping[str, object],
+        *,
+        now: datetime | None = None,
+    ) -> str:
+        """Persist one exact Hermes-hosted energy vector and its provenance."""
+
+        validated_provenance = EnergyAssessmentProvenanceV1.model_validate(
+            provenance, strict=True
+        )
+        self._assert_creator_process()
+        with self._lock:
+            if self._diverged:
+                raise EventConflictError(
+                    "engine sequence divergence requires a replayed restart"
+                )
+            try:
+                result = self.ledger.complete_energy_assessment(
+                    lease_id,
+                    choice,
+                    validated_provenance,
+                    expected_state=self._state,
+                    actor_id=self.actor_id,
+                    now=self._identity_time(now),
+                )
+            except ExpectedSequenceError as error:
+                self._diverged = True
+                raise EventConflictError(
+                    "engine sequence divergence during energy completion"
+                ) from error
+            except sqlite3.DatabaseError:
+                self._diverged = True
+                raise
+            if result.successor is not None:
+                self._state = result.successor
+            return result.status
+
+    def fail_energy_assessment(
+        self,
+        lease_id: str,
+        failure_code: str,
+        *,
+        now: datetime | None = None,
+    ) -> str:
+        """Persist an explicit host failure without adding a default vector."""
+
+        self._assert_creator_process()
+        with self._lock:
+            if self._diverged:
+                raise EventConflictError(
+                    "engine sequence divergence requires a replayed restart"
+                )
+            try:
+                result = self.ledger.fail_energy_assessment(
+                    lease_id,
+                    failure_code,
+                    expected_state=self._state,
+                    actor_id=self.actor_id,
+                    now=self._identity_time(now),
+                )
+            except ExpectedSequenceError as error:
+                self._diverged = True
+                raise EventConflictError(
+                    "engine sequence divergence during energy failure"
                 ) from error
             except sqlite3.DatabaseError:
                 self._diverged = True

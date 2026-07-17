@@ -69,7 +69,7 @@ class StructuredLlm:
 @pytest.mark.parametrize(
     ("environment", "expected"),
     [
-        ({}, IdentityLlmMode.OFF),
+        ({}, IdentityLlmMode.NAME_WHEN_UNNAMED),
         ({IDENTITY_LLM_MODE_ENV: "off"}, IdentityLlmMode.OFF),
         (
             {IDENTITY_LLM_MODE_ENV: "name_when_unnamed"},
@@ -77,7 +77,7 @@ class StructuredLlm:
         ),
     ],
 )
-def test_identity_mode_is_explicit_and_defaults_off(
+def test_identity_mode_uses_host_llm_by_default_and_allows_explicit_off(
     environment: dict[str, str], expected: IdentityLlmMode
 ) -> None:
     assert read_identity_llm_mode(environment) is expected

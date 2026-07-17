@@ -1011,7 +1011,7 @@ class ObservabilitySnapshotV1(_StrictModel):
 
     schema_version: Literal[1] = 1
     semantic_schema_version: Literal[1] = 1
-    sqlite_schema_version: Literal[6] = 6
+    sqlite_schema_version: Literal[7] = 7
     brain_id: str | None = None
     brain_count: int = Field(ge=0)
     trace_complete: bool

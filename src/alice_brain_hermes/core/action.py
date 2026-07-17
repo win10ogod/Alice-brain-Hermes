@@ -47,6 +47,13 @@ class ActionReceiptDisposition(StrEnum):
     CONFLICT = "conflict"
 
 
+class EnergyAssessmentStatus(StrEnum):
+    UNREQUESTED = "unrequested"
+    PENDING = "pending"
+    ASSESSED = "assessed"
+    FAILED = "failed"
+
+
 MAX_ACTION_RECEIPT_HISTORY = 16
 MAX_ACTION_RECONSTRUCTION_HISTORY = 16
 MAX_ACTION_SOURCE_ERROR_TYPE_LENGTH = 160
@@ -275,6 +282,12 @@ class ActionRecord(BaseModel):
     reconstruction: FrozenJsonDict | None = None
     reconstruction_history: tuple[ActionReconstructionRecord, ...] = ()
     reconstruction_history_evicted: int = Field(default=0, ge=0)
+    energy_assessment_status: EnergyAssessmentStatus = (
+        EnergyAssessmentStatus.UNREQUESTED
+    )
+    energy_request_event_id: str | None = None
+    energy_assessment_event_id: str | None = None
+    energy_failure_code: str | None = Field(default=None, max_length=160)
     proposed_event_id: str
     last_event_id: str
 
@@ -363,6 +376,35 @@ class ActionRecord(BaseModel):
                 raise ValueError(
                     "canonical receipt must match confirmed action outcome"
                 )
+        if self.energy_assessment_status is EnergyAssessmentStatus.UNREQUESTED:
+            if any(
+                value is not None
+                for value in (
+                    self.energy_request_event_id,
+                    self.energy_assessment_event_id,
+                    self.energy_failure_code,
+                )
+            ):
+                raise ValueError("unrequested action energy has terminal evidence")
+        elif self.energy_assessment_status is EnergyAssessmentStatus.PENDING:
+            if (
+                self.energy_request_event_id is None
+                or self.energy_assessment_event_id is not None
+                or self.energy_failure_code is not None
+            ):
+                raise ValueError("pending action energy evidence is inconsistent")
+        elif self.energy_assessment_status is EnergyAssessmentStatus.ASSESSED:
+            if self.energy_assessment_event_id is None or self.energy_failure_code:
+                raise ValueError("assessed action energy evidence is inconsistent")
+        elif (
+            self.energy_assessment_status is EnergyAssessmentStatus.FAILED
+            and (
+                self.energy_request_event_id is None
+                or self.energy_assessment_event_id is not None
+                or self.energy_failure_code is None
+            )
+        ):
+            raise ValueError("failed action energy evidence is inconsistent")
         return self
 
 
@@ -511,6 +553,9 @@ def reduce_actions(
         "action.dispatched",
         "action.receipt",
         "action.reconstructed",
+        "action.energy_requested",
+        "action.energy_assessed",
+        "action.energy_assessment_failed",
     }
     if event.event_type not in lifecycle_events:
         return actions, frozenset()
@@ -536,7 +581,47 @@ def reduce_actions(
 
     action = _find(actions, action_id)
     grounded_ids: frozenset[str] = frozenset()
-    if event.event_type == "action.prepared":
+    if event.event_type == "action.energy_requested":
+        if action.energy_assessment_status is not EnergyAssessmentStatus.UNREQUESTED:
+            raise DomainInvariantError("action energy assessment is already requested")
+        action = ActionRecord.model_validate(
+            {
+                **action.model_dump(mode="python"),
+                "energy_assessment_status": EnergyAssessmentStatus.PENDING,
+                "energy_request_event_id": event.event_id,
+            }
+        )
+    elif event.event_type == "action.energy_assessed":
+        if action.energy_assessment_status not in {
+            EnergyAssessmentStatus.UNREQUESTED,
+            EnergyAssessmentStatus.PENDING,
+        }:
+            raise DomainInvariantError("action energy assessment is already terminal")
+        action = ActionRecord.model_validate(
+            {
+                **action.model_dump(mode="python"),
+                "energy_assessment_status": EnergyAssessmentStatus.ASSESSED,
+                "energy_assessment_event_id": event.event_id,
+                "energy_failure_code": None,
+            }
+        )
+    elif event.event_type == "action.energy_assessment_failed":
+        failure_code = event.payload.get("failure_code")
+        if (
+            action.energy_assessment_status is not EnergyAssessmentStatus.PENDING
+            or not isinstance(failure_code, str)
+            or not failure_code.strip()
+            or len(failure_code) > 160
+        ):
+            raise DomainInvariantError("action energy failure evidence is invalid")
+        action = ActionRecord.model_validate(
+            {
+                **action.model_dump(mode="python"),
+                "energy_assessment_status": EnergyAssessmentStatus.FAILED,
+                "energy_failure_code": failure_code,
+            }
+        )
+    elif event.event_type == "action.prepared":
         branch_id = event.payload.get("branch_id")
         if branch_id is not None and (
             not isinstance(branch_id, str) or not branch_id.strip()
@@ -720,6 +805,7 @@ __all__ = [
     "ActionReceiptStatus",
     "ActionReconstructionRecord",
     "ActionRecord",
+    "EnergyAssessmentStatus",
     "RDPhase",
     "ThoughtBranch",
     "action_id_from_event",
