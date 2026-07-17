@@ -1596,7 +1596,7 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                     )
                     identity_retry_after = current_time + 0.1
                 else:
-                    # Includes the permanent, default-off configuration.
+                    # Includes the explicit, permanent operator opt-out.
                     identity_configured = True
             if (
                 identity_configured
