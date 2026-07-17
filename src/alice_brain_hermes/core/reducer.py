@@ -8,6 +8,7 @@ from typing import Any
 
 from alice_brain_hermes.core.action import (
     ActionPhase,
+    EnergyAssessmentStatus,
     RDPhase,
     ThoughtBranch,
     action_id_from_event,
@@ -258,6 +259,8 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
                 index
                 for index, item in enumerate(actions)
                 if item.phase in {ActionPhase.BLOCKED, ActionPhase.RECONSTRUCTED}
+                and item.energy_assessment_status
+                is not EnergyAssessmentStatus.PENDING
             ),
             None,
         )

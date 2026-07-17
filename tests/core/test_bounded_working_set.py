@@ -102,6 +102,41 @@ def test_terminal_action_details_evict_but_active_overflow_is_explicit() -> None
         )
     assert len(active.action_records) == limit
 
+    pending = BrainState.genesis(new_id())
+    pending = _next(
+        pending,
+        "action.proposed",
+        {"action_id": "pending-energy", "intent": {}},
+    )
+    pending = _next(
+        pending,
+        "action.energy_requested",
+        {"action_id": "pending-energy"},
+    )
+    for event_type, payload in (
+        ("action.prepared", {"action_id": "pending-energy"}),
+        ("action.dispatched", {"action_id": "pending-energy"}),
+        (
+            "action.receipt",
+            {"action_id": "pending-energy", "status": "success"},
+        ),
+        ("action.reconstructed", {"action_id": "pending-energy"}),
+    ):
+        pending = _next(pending, event_type, payload)
+    for index in range(limit - 1):
+        pending = _next(
+            pending,
+            "action.proposed",
+            {"action_id": f"pending-active-{index:04d}", "intent": {}},
+        )
+    with pytest.raises(capacity_error, match="active action capacity"):
+        _next(
+            pending,
+            "action.proposed",
+            {"action_id": "pending-overflow", "intent": {}},
+        )
+    assert pending.actions["pending-energy"].energy_request_event_id is not None
+
     mixed = BrainState.genesis(new_id())
     mixed = _next(
         mixed,
