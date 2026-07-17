@@ -36,6 +36,9 @@ alice-brain = "alice_brain_hermes.hermes_plugin"
 [tool.hatch.build.targets.wheel]
 packages = ["src/alice_brain_hermes"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"skills/operating-alice-brain-hermes" = "alice_brain_hermes/skills/operating-alice-brain-hermes"
+
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers"
 testpaths = ["tests"]

@@ -95,6 +95,7 @@ def test_register_binds_context_without_reading_profile_or_llm(
             super().__init__()
             self.hooks: list[tuple[str, object]] = []
             self.cli: list[dict[str, object]] = []
+            self.skills: list[tuple[str, Path, str]] = []
 
         def register_hook(self, hook: str, callback: object) -> None:
             self.hooks.append((hook, callback))
@@ -102,12 +103,22 @@ def test_register_binds_context_without_reading_profile_or_llm(
         def register_cli_command(self, **kwargs: object) -> None:
             self.cli.append(kwargs)
 
+        def register_skill(
+            self,
+            name: str,
+            path: Path,
+            description: str = "",
+        ) -> None:
+            self.skills.append((name, path, description))
+
     context = Context()
     registration.register(context)
 
     assert bootstrap.host_context_for_worker() is context
     assert context.profile_reads == 0
     assert context.llm_reads == 0
+    assert len(context.skills) == 1
+    assert context.skills[0][1].is_file()
 
 
 def test_host_factory_cache_changes_only_with_context_identity() -> None:

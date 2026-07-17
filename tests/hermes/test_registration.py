@@ -33,6 +33,8 @@ ROOT_PLUGIN = PROJECT_ROOT
 INTEGRATION_ROOT = PROJECT_ROOT / "integration" / "alice-brain"
 ENTRY_POINT_GROUP = "hermes_agent.plugins"
 PLUGIN_NAME = "alice-brain"
+PLUGIN_SKILL_NAME = "operating-alice-brain-hermes"
+PLUGIN_SKILL_ROOT = PROJECT_ROOT / "skills" / PLUGIN_SKILL_NAME
 
 
 def _alice_entry_point() -> metadata.EntryPoint:
@@ -112,6 +114,16 @@ def test_git_plugin_root_exposes_the_canonical_manifest() -> None:
     assert _root_manifest() == _manifest()
 
 
+def test_git_plugin_root_exposes_skill_in_hermes_scanned_directory() -> None:
+    skill_file = PLUGIN_SKILL_ROOT / "SKILL.md"
+
+    assert skill_file.is_file()
+    assert (PLUGIN_SKILL_ROOT / "agents" / "openai.yaml").is_file()
+    assert not (
+        PROJECT_ROOT / ".agents" / "skills" / PLUGIN_SKILL_NAME
+    ).exists()
+
+
 def test_git_plugin_root_shim_loads_the_repo_source_in_isolation() -> None:
     probe = textwrap.dedent(
         f"""
@@ -177,6 +189,7 @@ class RecordingContext:
     def __init__(self) -> None:
         self.hooks: list[tuple[str, object]] = []
         self.cli_calls: list[dict[str, object]] = []
+        self.skill_calls: list[dict[str, object]] = []
 
     @property
     def llm(self) -> object:
@@ -187,6 +200,16 @@ class RecordingContext:
 
     def register_cli_command(self, **kwargs: object) -> None:
         self.cli_calls.append(kwargs)
+
+    def register_skill(
+        self,
+        name: str,
+        path: Path,
+        description: str = "",
+    ) -> None:
+        self.skill_calls.append(
+            {"name": name, "path": path, "description": description}
+        )
 
 
 @pytest.mark.parametrize(
@@ -295,6 +318,13 @@ def test_register_adds_exact_hooks_and_cli_arguments(
             "setup_fn": registration.setup_alice_brain_cli,
             "handler_fn": registration.handle_alice_brain_cli,
             "description": "Alice-brain-Hermes consciousness runtime commands",
+        }
+    ]
+    assert context.skill_calls == [
+        {
+            "name": registration.PLUGIN_SKILL_NAME,
+            "path": PLUGIN_SKILL_ROOT / "SKILL.md",
+            "description": registration.PLUGIN_SKILL_DESCRIPTION,
         }
     ]
 
@@ -428,6 +458,7 @@ def _run_inert_registration_probe() -> dict[str, Any]:
             def __init__(self):
                 self.hooks = []
                 self.cli = []
+                self.skills = []
             @property
             def llm(self):
                 return forbidden("ctx.llm")()
@@ -435,6 +466,8 @@ def _run_inert_registration_probe() -> dict[str, Any]:
                 self.hooks.append((name, callback))
             def register_cli_command(self, **kwargs):
                 self.cli.append(kwargs)
+            def register_skill(self, name, path, description=""):
+                self.skills.append((name, path, description))
 
         entry_points = [
             item
@@ -451,6 +484,7 @@ def _run_inert_registration_probe() -> dict[str, Any]:
         result = {
             "hook_count": len(context.hooks),
             "cli_count": len(context.cli),
+            "skill_count": len(context.skills),
             "operations": operations,
             "operational_modules": sorted(
                 name for name in sys.modules
@@ -541,6 +575,8 @@ def _run_first_callback_purity_probe() -> dict[str, Any]:
                 self.hooks[name] = callback
             def register_cli_command(self, **kwargs):
                 pass
+            def register_skill(self, name, path, description=""):
+                pass
 
         matches = [
             item for item in importlib.metadata.entry_points(
@@ -586,6 +622,7 @@ def test_register_does_not_import_operational_modules() -> None:
 
     assert result["hook_count"] == 16
     assert result["cli_count"] == 1
+    assert result["skill_count"] == 1
     assert result["operational_modules"] == []
 
 
@@ -594,6 +631,7 @@ def test_register_does_not_touch_io_provider_or_threads() -> None:
 
     assert result["hook_count"] == 16
     assert result["cli_count"] == 1
+    assert result["skill_count"] == 1
     assert result["operations"] == []
 
 
@@ -3687,7 +3725,10 @@ def _write_enabled_config(home: Path) -> None:
 
 
 def _assert_real_manager_surface(manager: object, host: ModuleType) -> None:
-    from alice_brain_hermes.hermes.registration import APPROVED_HOOKS
+    from alice_brain_hermes.hermes.registration import (
+        APPROVED_HOOKS,
+        PLUGIN_SKILL_NAME,
+    )
 
     loaded = manager._plugins["alice-brain"]  # type: ignore[attr-defined]
     assert loaded.enabled is True
@@ -3699,6 +3740,13 @@ def _assert_real_manager_surface(manager: object, host: ModuleType) -> None:
         for name in APPROVED_HOOKS
     )
     assert set(manager._cli_commands) == {"alice-brain"}  # type: ignore[attr-defined]
+    qualified_skill_name = f"alice-brain:{PLUGIN_SKILL_NAME}"
+    skill_path = manager.find_plugin_skill(qualified_skill_name)  # type: ignore[attr-defined]
+    assert skill_path == PLUGIN_SKILL_ROOT / "SKILL.md"
+    assert skill_path.is_file()
+    assert manager.list_plugin_skills("alice-brain") == [  # type: ignore[attr-defined]
+        PLUGIN_SKILL_NAME
+    ]
     assert manager._cli_commands["alice-brain"] == {  # type: ignore[attr-defined]
         "name": "alice-brain",
         "help": "Inspect and control the Alice-brain-Hermes runtime",
@@ -4003,6 +4051,14 @@ def test_wheel_contains_entrypoint_and_package_modules(
         assert "alice_brain_hermes/hermes_plugin.py" in names
         assert "alice_brain_hermes/hermes/__init__.py" in names
         assert "alice_brain_hermes/hermes/registration.py" in names
+        assert (
+            "alice_brain_hermes/skills/operating-alice-brain-hermes/SKILL.md"
+            in names
+        )
+        assert (
+            "alice_brain_hermes/skills/operating-alice-brain-hermes/agents/"
+            "openai.yaml" in names
+        )
         assert len(entry_points_names) == 1
         entry_points_text = archive.read(entry_points_names[0]).decode("utf-8")
         assert "[hermes_agent.plugins]" in entry_points_text
@@ -4066,7 +4122,20 @@ def test_wheel_entrypoint_loads_outside_checkout(
         """
         import inspect
         from importlib import metadata
+        from pathlib import Path
         from types import ModuleType
+
+        from alice_brain_hermes.hermes import registration
+
+        class Context:
+            def __init__(self):
+                self.skills = []
+            def register_hook(self, name, callback):
+                pass
+            def register_cli_command(self, **kwargs):
+                pass
+            def register_skill(self, name, path, description=""):
+                self.skills.append((name, path, description))
 
         matches = [
             item
@@ -4081,6 +4150,15 @@ def test_wheel_entrypoint_loads_outside_checkout(
         assert module.__name__ == "alice_brain_hermes.hermes_plugin"
         assert callable(module.register)
         assert not inspect.iscoroutinefunction(module.register)
+        registration.resolve_hermes_version = lambda: "0.18.2"
+        context = Context()
+        module.register(context)
+        assert len(context.skills) == 1
+        skill_name, skill_path, description = context.skills[0]
+        assert skill_name == "operating-alice-brain-hermes"
+        assert isinstance(skill_path, Path)
+        assert skill_path.is_file()
+        assert "starting, observing, diagnosing" in description
         """
     )
     probe_result = subprocess.run(
@@ -4106,6 +4184,10 @@ def test_sdist_contains_git_root_and_legacy_directory_plugin_artifacts(
         archive_root = next(iter(archive_roots))
         assert f"{archive_root}/plugin.yaml" in names
         assert f"{archive_root}/__init__.py" in names
+        assert (
+            f"{archive_root}/skills/operating-alice-brain-hermes/SKILL.md" in names
+        )
+        assert not any("/.agents/skills/" in name for name in names)
         assert any(
             name.endswith("/integration/alice-brain/plugin.yaml") for name in names
         )
@@ -4282,7 +4364,8 @@ def test_installed_wheel_runs_real_host_daemon_hook_ack_trace_and_restart(
 
             import alice_brain_hermes
             import hermes_cli
-            from hermes_cli.plugins import PluginManager
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
+            from tools.skills_tool import skill_view
             from alice_brain_hermes.hermes import registration
 
             project_root = Path({str(PROJECT_ROOT)!r}).resolve()
@@ -4290,13 +4373,24 @@ def test_installed_wheel_runs_real_host_daemon_hook_ack_trace_and_restart(
             assert not package_path.is_relative_to(project_root)
             assert hermes_cli.__version__ == "0.18.2"
 
-            manager = PluginManager()
-            manager.discover_and_load()
+            discover_plugins()
+            manager = get_plugin_manager()
             loaded = manager._plugins["alice-brain"]
             assert loaded.enabled is True
             assert loaded.error is None
             assert len(loaded.hooks_registered) == 16
             assert set(manager._cli_commands) == {{"alice-brain"}}
+            skill_payload = json.loads(
+                skill_view(
+                    "alice-brain:operating-alice-brain-hermes",
+                    preprocess=False,
+                )
+            )
+            assert skill_payload["success"] is True
+            assert skill_payload["name"] == (
+                "alice-brain:operating-alice-brain-hermes"
+            )
+            assert "# Operating Alice-brain-Hermes" in skill_payload["content"]
             assert manager.invoke_hook(
                 "on_session_start",
                 session_id="installed-host-session",

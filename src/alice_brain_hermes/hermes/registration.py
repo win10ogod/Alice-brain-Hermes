@@ -10,6 +10,7 @@ from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from importlib import import_module, metadata
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
@@ -37,6 +38,11 @@ APPROVED_HOOKS = (
 
 
 SUPPORTED_HERMES = ">=0.18,<0.19"
+PLUGIN_SKILL_NAME = "operating-alice-brain-hermes"
+PLUGIN_SKILL_DESCRIPTION = (
+    "Use when starting, observing, diagnosing, verifying, or tracing an "
+    "Alice-brain-Hermes plugin runtime."
+)
 _SUPPORTED_HERMES_SPECIFIER = SpecifierSet(SUPPORTED_HERMES)
 _REGISTRATION_STATE_ATTRIBUTE = "_alice_brain_hermes_registration_v1"
 _REGISTRATION_LOCK = threading.RLock()
@@ -1689,6 +1695,22 @@ def handle_alice_brain_cli(args: Any) -> int:
     return handle(args)
 
 
+def _plugin_skill_path() -> Path:
+    package_root = Path(__file__).resolve().parents[1]
+    relative_path = Path("skills") / PLUGIN_SKILL_NAME / "SKILL.md"
+    candidates = (
+        package_root / relative_path,
+        package_root.parents[1] / relative_path,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"Alice-brain-Hermes skill is missing from {candidates[0]} and "
+        f"{candidates[1]}"
+    )
+
+
 def register(ctx: Any) -> None:
     """Register the inert Task 5 seam with a supported Hermes context."""
 
@@ -1708,8 +1730,14 @@ def register(ctx: Any) -> None:
         require_supported_hermes(resolve_hermes_version())
         register_hook = getattr(ctx, "register_hook", None)
         register_cli_command = getattr(ctx, "register_cli_command", None)
-        if not callable(register_hook) or not callable(register_cli_command):
+        register_skill = getattr(ctx, "register_skill", None)
+        if (
+            not callable(register_hook)
+            or not callable(register_cli_command)
+            or not callable(register_skill)
+        ):
             raise RuntimeError("Hermes plugin context lacks registration callables")
+        skill_path = _plugin_skill_path()
 
         setattr(ctx, _REGISTRATION_STATE_ATTRIBUTE, "registering")
         registered_hook_count = 0
@@ -1724,6 +1752,11 @@ def register(ctx: Any) -> None:
                 setup_fn=setup_alice_brain_cli,
                 handler_fn=handle_alice_brain_cli,
                 description="Alice-brain-Hermes consciousness runtime commands",
+            )
+            register_skill(
+                PLUGIN_SKILL_NAME,
+                skill_path,
+                PLUGIN_SKILL_DESCRIPTION,
             )
             setattr(ctx, _REGISTRATION_STATE_ATTRIBUTE, "registered")
         except BaseException as registration_error:
