@@ -579,7 +579,18 @@ def reduce_actions(
             raise DomainInvariantError("invalid action proposal") from error
         return (*actions, action), frozenset()
 
-    action = _find(actions, action_id)
+    try:
+        action = _find(actions, action_id)
+    except DomainInvariantError as error:
+        if event.event_type in {
+            "action.energy_requested",
+            "action.energy_assessed",
+            "action.energy_assessment_failed",
+        }:
+            raise DomainInvariantError(
+                "energy assessment requires an existing action"
+            ) from error
+        raise
     grounded_ids: frozenset[str] = frozenset()
     if event.event_type == "action.energy_requested":
         legacy_reassessment = (

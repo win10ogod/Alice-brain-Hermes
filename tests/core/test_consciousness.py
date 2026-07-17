@@ -660,7 +660,9 @@ def test_each_required_specialist_bids_and_energy_intervention_changes_drive() -
             }
         }
     ).revalidated()
-    after = derive_candidates(reduce_state(state, stronger))
+    after = derive_candidates(
+        reduce_many(BrainState.genesis(BRAIN), [proposed, stronger])
+    )
 
     assert {item.specialist for item in before} == {
         "prediction_error",
