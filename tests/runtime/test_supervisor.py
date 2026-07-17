@@ -7,6 +7,7 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 
+import psutil
 import pytest
 from dmon.types import DmonMeta
 
@@ -1205,6 +1206,56 @@ def test_dmon_output_capture_is_bounded_and_redacted_log_tail_is_bounded(
     assert nonce not in tail
     assert "<runtime-home>" in tail
     assert "<redacted>" in tail
+
+
+def test_daemon_main_error_is_captured_by_real_dmon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "alice_brain_hermes.runtime.supervisor.PlatformDirs",
+        lambda *_args, **_kwargs: _Dirs(tmp_path / "private"),
+    )
+    bad_home = tmp_path / "runtime-is-a-file"
+    bad_home.write_text("not a directory", encoding="utf-8")
+    release = tmp_path / "release-daemon-child"
+    nonce = "daemon-entry-log-capture"
+    code = "\n".join(
+        (
+            "import sys, time",
+            "from pathlib import Path",
+            "while not Path(sys.argv[3]).exists():",
+            "    time.sleep(0.01)",
+            "from alice_brain_hermes.runtime.daemon import _main",
+            'raise SystemExit(_main(["--runtime-home", sys.argv[1], '
+            '"--launch-nonce", sys.argv[2]]))',
+        )
+    )
+    adapter = DmonAdapter.create(
+        bad_home,
+        [
+            sys.executable,
+            "-c",
+            code,
+            os.fspath(bad_home),
+            nonce,
+            os.fspath(release),
+        ],
+        launch_nonce=nonce,
+    )
+    hint = adapter.start()
+    adapter.release_parent_guard()
+    process = psutil.Process(hint.pid)
+    try:
+        release.touch()
+        process.wait(timeout=10.0)
+        tail = adapter.redacted_log_tail()
+        assert tail == "alice-brain-hermes daemon failed: FileExistsError\n"
+        assert os.fspath(bad_home) not in tail
+    finally:
+        adapter.release_parent_guard()
+        adapter.terminate_exact(hint, timeout_seconds=5.0)
+        assert adapter.remove_meta_hint(hint) is True
 
 
 def test_exact_cleanup_rechecks_process_create_time_before_terminate_and_kill(

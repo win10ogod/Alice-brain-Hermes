@@ -45,7 +45,7 @@ from alice_brain_hermes.runtime.discovery import (
 from alice_brain_hermes.runtime.engine import ConsciousEngine
 from alice_brain_hermes.runtime.lease import RuntimeLease
 from alice_brain_hermes.runtime.process_marker import current_process_marker
-from alice_brain_hermes.runtime.scheduler import SchedulerHealth
+from alice_brain_hermes.runtime.scheduler import ContinuousScheduler, SchedulerHealth
 from alice_brain_hermes.runtime.store import SQLiteLedger
 
 RECOVERY_TOKEN = "ab" * 32
@@ -119,6 +119,11 @@ def test_invalid_abandonment_grace_fails_before_runtime_home_mutation(
         )
 
     assert not home.exists()
+
+
+def test_private_daemon_server_rejects_scheduler_class_as_runtime() -> None:
+    with pytest.raises(TypeError, match="HermesDaemonRuntime instance"):
+        PrivateDaemonServer(ContinuousScheduler)  # type: ignore[arg-type]
 
 
 def test_corrupt_stale_discovery_fails_closed_without_unproven_deletion(
@@ -963,6 +968,46 @@ def test_invalid_server_constructor_unwinds_open_runtime_for_reuse(
         pass
 
 
+def test_run_daemon_passes_opened_runtime_by_keyword(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "runtime"
+    captured: list[HermesDaemonRuntime] = []
+
+    class ExpectedStop(Exception):
+        pass
+
+    def capture_server(
+        *,
+        runtime: HermesDaemonRuntime,
+        abandonment_grace_seconds: float,
+    ) -> None:
+        captured.append(runtime)
+        assert abandonment_grace_seconds == 30.0
+        raise ExpectedStop
+
+    monkeypatch.setattr(
+        "alice_brain_hermes.runtime.daemon.PrivateDaemonServer",
+        capture_server,
+    )
+
+    with pytest.raises(ExpectedStop):
+        asyncio.run(
+            _run_daemon(
+                home,
+                scheduler_interval_seconds=60.0,
+                abandonment_grace_seconds=30.0,
+            )
+        )
+
+    assert len(captured) == 1
+    assert isinstance(captured[0], HermesDaemonRuntime)
+    assert captured[0].closed is True
+    with RuntimeLease.acquire(home):
+        pass
+
+
 def test_run_daemon_does_not_override_transport_quarantine(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1587,6 +1632,26 @@ def test_daemon_main_passes_launch_nonce_without_readiness_descriptor(
         == 0
     )
     assert captured == [(os.fspath(tmp_path), "parent-launch", 60.0, 30.0)]
+
+
+def test_daemon_main_reports_safe_unexpected_error_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail(*_args, **_kwargs) -> None:
+        raise AttributeError("sensitive failure detail")
+
+    monkeypatch.setattr(
+        "alice_brain_hermes.runtime.daemon.run_private_daemon",
+        fail,
+    )
+
+    assert _main(["--runtime-home", os.fspath(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "alice-brain-hermes daemon failed: AttributeError\n"
+    assert "sensitive failure detail" not in captured.err
 
 
 def test_fail_stop_loop_does_not_join_a_stuck_executor_worker() -> None:

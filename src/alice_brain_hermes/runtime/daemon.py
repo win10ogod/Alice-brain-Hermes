@@ -1361,6 +1361,9 @@ class PrivateDaemonServer:
         *,
         abandonment_grace_seconds: float = 30.0,
     ) -> None:
+        if not isinstance(runtime, HermesDaemonRuntime):
+            raise TypeError("runtime must be a HermesDaemonRuntime instance")
+
         from alice_brain_hermes.protocol.service import ProtocolService
 
         abandonment_grace_seconds = _positive_seconds(
@@ -2068,7 +2071,7 @@ async def _run_daemon(
     )
     try:
         daemon = PrivateDaemonServer(
-            runtime,
+            runtime=runtime,
             abandonment_grace_seconds=abandonment_grace_seconds,
         )
     except BaseException:
@@ -2165,7 +2168,12 @@ def _main(argv: list[str] | None = None) -> int:
         # those workers to retain runtime authority, and interpreter shutdown
         # could wait forever.  The daemon CLI therefore fails closed here.
         os._exit(3)
-    except Exception:
+    except Exception as error:
+        print(
+            f"alice-brain-hermes daemon failed: {type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
         return 1
 
 
