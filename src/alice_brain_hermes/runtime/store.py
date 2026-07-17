@@ -3379,14 +3379,57 @@ class SQLiteLedger:
                 self._energy_lease_row(lease_id)
             ).brain_id
 
-    @staticmethod
     def _energy_assessment_input(
+        self,
         state: BrainState,
         *,
         action_id: str,
         action_request_event_id: str,
     ) -> FrozenJsonDict:
         action = state.actions[action_id]
+        st = thaw_json(action.intent)
+        raw_event_id = action.intent.get("raw_event_id")
+        if isinstance(raw_event_id, str):
+            raw_row = self._connection.execute(
+                "SELECT event_id, brain_id, sequence, body_fingerprint, "
+                "envelope_fingerprint, envelope_json FROM events "
+                "WHERE event_id = ?",
+                (validate_id(raw_event_id),),
+            ).fetchone()
+            if raw_row is None:
+                raise LedgerIntegrityError(
+                    "Hermes energy assessment raw observation is missing"
+                )
+            raw_event = self._decode_event(raw_row)
+            try:
+                observation = validate_observation_json(
+                    self._canonical_json_value(thaw_json(raw_event.payload))
+                )
+            except Exception as error:
+                raise LedgerIntegrityError(
+                    "Hermes energy assessment raw observation is invalid"
+                ) from error
+            payload = observation.payload.model_dump(mode="json")
+            if (
+                observation.hook != "pre_tool_call"
+                or raw_event.brain_id != state.brain_id
+                or payload.get("tool_name") != action.intent.get("tool_name")
+                or self._energy_fingerprint(
+                    self._canonical_json_value(payload.get("args"))
+                )
+                != action.intent.get("args_sha256")
+                or self._energy_fingerprint(
+                    self._canonical_json_value(payload.get("middleware_trace"))
+                )
+                != action.intent.get("middleware_trace_sha256")
+            ):
+                raise LedgerIntegrityError(
+                    "Hermes energy assessment raw observation changed action intent"
+                )
+            # Hermes already sanitized this hook payload. Reuse its exact
+            # observable action fields so the host LLM, not a local prior,
+            # determines E from meaningful ST evidence.
+            st = payload
         return FrozenJsonDict(
             {
                 "schema_version": 1,
@@ -3399,7 +3442,7 @@ class SQLiteLedger:
                         state.personality.narrative_ideal
                     ),
                 },
-                "st": thaw_json(action.intent),
+                "st": st,
                 "rd": {
                     "phase": action.rd_phase.value,
                     "prepared_branch_id": action.prepared_branch_id,

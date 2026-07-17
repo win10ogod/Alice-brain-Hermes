@@ -222,6 +222,15 @@ def test_pre_tool_commits_raw_and_complete_pc_e_st_rd_batch_atomically(
             engine.state.action_records[0].action_id,
             None,
         )
+        lease = engine.claim_energy_assessment()
+        assert lease is not None
+        assert lease.assessment_input["st"]["tool_name"] == "shell"
+        assert lease.assessment_input["st"]["args"] == {
+            "command": "TOP SECRET RAW ARGUMENT"
+        }
+        assert lease.assessment_input["st"]["middleware_trace"] == {
+            "private": "TRACE SECRET"
+        }
 
 
 def test_matched_post_tool_closes_occurrence_and_commits_execution_outcome(
