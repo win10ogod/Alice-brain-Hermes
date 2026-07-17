@@ -1254,6 +1254,8 @@ def test_bootstrap_contains_host_binding_prelude_fault_without_rebuilding_access
     assert context.llm_reads == 0
     assert bootstrap.health.degraded is True
     assert bootstrap.health.worker_error == "MemoryError"
+    bootstrap._stop_identity_worker()  # type: ignore[attr-defined]
+    bootstrap._stop_energy_worker()  # type: ignore[attr-defined]
 
 
 def test_identity_monitor_retains_ambiguous_owner_without_duplicate_start() -> None:
