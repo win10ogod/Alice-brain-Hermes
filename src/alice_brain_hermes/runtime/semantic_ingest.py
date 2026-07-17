@@ -10,7 +10,6 @@ from uuid import UUID
 
 from alice_brain_hermes.core.action import MAX_ACTION_SOURCE_ERROR_TYPE_LENGTH
 from alice_brain_hermes.core.events import EventEnvelope, new_event, thaw_json
-from alice_brain_hermes.core.personality import ENERGY_DIMENSIONS
 from alice_brain_hermes.ids import validate_id
 from alice_brain_hermes.protocol.models import (
     HOOK_EVENT_TYPES,
@@ -310,25 +309,16 @@ def _pre_tool_plan(
         action_id=action_id,
         causation_id=proposed.event_id,
     )
-    energy = _derived_event(
+    energy_request = _derived_event(
         stream,
         record,
         raw_event,
-        role="energy.assessed",
-        event_type="action.energy_assessed",
+        role="energy.requested",
+        event_type="action.energy_requested",
         payload={
             "action_id": action_id,
-            "arousal": 0.0,
-            "control": 0.5,
-            "cost": 0.5,
-            "deficits": {},
-            "evidence_basis": {},
-            "personality_relevance": 0.5,
-            "resources": 0.5,
-            "salience": 0.5,
-            "unknown_dimensions": list(ENERGY_DIMENSIONS),
-            "urgency": 0.5,
-            "valence": 0.0,
+            "assessment_source": "hermes_host_llm",
+            "prompt_version": "alice-energy-v1",
         },
         action_id=action_id,
         causation_id=pc.event_id,
@@ -359,7 +349,7 @@ def _pre_tool_plan(
             "uncertainty": 0.5,
         },
         action_id=action_id,
-        causation_id=energy.event_id,
+        causation_id=energy_request.event_id,
     )
     prepared = _derived_event(
         stream,
@@ -382,7 +372,7 @@ def _pre_tool_plan(
     return SemanticPlan(
         semantic_status="applied",
         semantic_complete=True,
-        derived_events=(proposed, pc, energy, simulated, prepared),
+        derived_events=(proposed, pc, energy_request, simulated, prepared),
         span_open=span,
     )
 

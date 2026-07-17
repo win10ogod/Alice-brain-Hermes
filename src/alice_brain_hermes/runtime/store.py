@@ -25,6 +25,7 @@ from alice_brain_hermes.core.events import (
     new_event,
     thaw_json,
 )
+from alice_brain_hermes.core.personality import ENERGY_DIMENSIONS
 from alice_brain_hermes.core.reducer import reduce_state
 from alice_brain_hermes.core.state import (
     FRAME_PROJECTION_RECORD_BUDGET,
@@ -152,6 +153,7 @@ _ENERGY_WORKER_FAILURE_CODE = re.compile(
     r"^(?:invalid_structured_assessment|llm_error\.[A-Za-z0-9_]{1,80})$"
 )
 _ENERGY_ADAPTER_ID = "alice-brain-hermes-energy-v1"
+_ENERGY_MIGRATION_ADAPTER_ID = "alice-brain-hermes-energy-migration-v1"
 _ENERGY_PURPOSE = "alice_energy_assessment"
 
 
@@ -803,7 +805,7 @@ class SQLiteLedger:
                         final_states=final_states
                     )
                     self._install_identity_schema(final_states=final_states)
-                    self._install_energy_schema()
+                    self._install_energy_schema(final_states=final_states)
                 except SchemaVersionError:
                     raise
                 except Exception as error:
@@ -834,7 +836,9 @@ class SQLiteLedger:
                     self._install_identity_schema(
                         final_states=self._startup_audited_final_states
                     )
-                    self._install_energy_schema()
+                    self._install_energy_schema(
+                        final_states=self._startup_audited_final_states
+                    )
                 except SchemaVersionError:
                     raise
                 except Exception as error:
@@ -862,7 +866,9 @@ class SQLiteLedger:
                     self._install_identity_schema(
                         final_states=self._startup_audited_final_states
                     )
-                    self._install_energy_schema()
+                    self._install_energy_schema(
+                        final_states=self._startup_audited_final_states
+                    )
                 except SchemaVersionError:
                     raise
                 except Exception as error:
@@ -887,7 +893,9 @@ class SQLiteLedger:
                     6, validate_data=True
                 )
                 try:
-                    self._install_energy_schema()
+                    self._install_energy_schema(
+                        final_states=self._startup_audited_final_states
+                    )
                 except SchemaVersionError:
                     raise
                 except Exception as error:
@@ -920,9 +928,83 @@ class SQLiteLedger:
     def _normalized_identity_name(name: str) -> str:
         return identity_name_normalization_key(name)
 
-    def _install_energy_schema(self) -> None:
+    def _install_energy_schema(
+        self,
+        *,
+        final_states: dict[str, BrainState],
+    ) -> None:
         for statement in _statements(_CREATE_ENERGY_SCHEMA):
             self._connection.execute(statement)
+        self._migrate_legacy_neutral_energy(final_states)
+
+    @staticmethod
+    def _legacy_neutral_energy_payload(action_id: str) -> dict[str, object]:
+        return {
+            "action_id": action_id,
+            "arousal": 0.0,
+            "control": 0.5,
+            "cost": 0.5,
+            "deficits": {},
+            "evidence_basis": {},
+            "personality_relevance": 0.5,
+            "resources": 0.5,
+            "salience": 0.5,
+            "unknown_dimensions": list(ENERGY_DIMENSIONS),
+            "urgency": 0.5,
+            "valence": 0.0,
+        }
+
+    def _migrate_legacy_neutral_energy(
+        self,
+        final_states: dict[str, BrainState],
+    ) -> None:
+        for brain_id, initial_state in tuple(final_states.items()):
+            state = initial_state
+            for action in initial_state.action_records:
+                event_id = action.energy_assessment_event_id
+                energy = initial_state.energies.get(action.action_id)
+                if event_id is None or energy is None:
+                    continue
+                row = self._connection.execute(
+                    "SELECT event_id, brain_id, sequence, body_fingerprint, "
+                    "envelope_fingerprint, envelope_json FROM events "
+                    "WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()
+                if row is None:
+                    raise LedgerIntegrityError(
+                        "legacy energy assessment source event is missing"
+                    )
+                source = self._decode_event(row)
+                if (
+                    action.intent.get("kind") != "hermes.tool_call"
+                    or source.event_type != "action.energy_assessed"
+                    or source.brain_id != brain_id
+                    or source.action_id != action.action_id
+                    or thaw_json(source.payload)
+                    != self._legacy_neutral_energy_payload(action.action_id)
+                ):
+                    continue
+                requested = new_event(
+                    "action.energy_requested",
+                    brain_id,
+                    brain_id,
+                    {
+                        "action_id": action.action_id,
+                        "assessment_source": "hermes_host_llm",
+                        "prompt_version": "alice-energy-v1",
+                        "reassessment_reason": "legacy_neutral_default",
+                        "replaces_event_id": event_id,
+                    },
+                    adapter_id=_ENERGY_MIGRATION_ADAPTER_ID,
+                    action_id=action.action_id,
+                    causation_id=event_id,
+                )
+                _events, state = self._insert_identity_event_batch_in_transaction(
+                    state,
+                    (requested,),
+                )
+            final_states[brain_id] = state
 
     def _last_identity_name_event_in_transaction(
         self,

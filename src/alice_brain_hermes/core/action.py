@@ -582,13 +582,27 @@ def reduce_actions(
     action = _find(actions, action_id)
     grounded_ids: frozenset[str] = frozenset()
     if event.event_type == "action.energy_requested":
-        if action.energy_assessment_status is not EnergyAssessmentStatus.UNREQUESTED:
+        legacy_reassessment = (
+            event.adapter_id == "alice-brain-hermes-energy-migration-v1"
+            and event.payload.get("reassessment_reason")
+            == "legacy_neutral_default"
+            and event.payload.get("replaces_event_id")
+            == action.energy_assessment_event_id
+        )
+        if action.energy_assessment_status is EnergyAssessmentStatus.UNREQUESTED or (
+            action.energy_assessment_status is EnergyAssessmentStatus.ASSESSED
+            and legacy_reassessment
+        ):
+            pass
+        else:
             raise DomainInvariantError("action energy assessment is already requested")
         action = ActionRecord.model_validate(
             {
                 **action.model_dump(mode="python"),
                 "energy_assessment_status": EnergyAssessmentStatus.PENDING,
                 "energy_request_event_id": event.event_id,
+                "energy_assessment_event_id": None,
+                "energy_failure_code": None,
             }
         )
     elif event.event_type == "action.energy_assessed":

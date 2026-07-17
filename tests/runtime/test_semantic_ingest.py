@@ -114,7 +114,7 @@ def generic_observation(
     )
 
 
-def test_pre_tool_builds_complete_pc_e_st_rd_chain_without_copying_raw_values() -> None:
+def test_pre_tool_builds_host_energy_request_without_copying_raw_values() -> None:
     instance = new_id()
     source = stream(instance)
     record = tool_observation(instance, 7, hook="pre_tool_call")
@@ -126,7 +126,7 @@ def test_pre_tool_builds_complete_pc_e_st_rd_chain_without_copying_raw_values() 
     assert [event.event_type for event in first.derived_events] == [
         "action.proposed",
         "personality.control.sampled",
-        "action.energy_assessed",
+        "action.energy_requested",
         "simulation.created",
         "action.prepared",
     ]
@@ -144,17 +144,10 @@ def test_pre_tool_builds_complete_pc_e_st_rd_chain_without_copying_raw_values() 
     assert "args_sha256" in encoded
     assert "middleware_trace_sha256" in encoded
     energy = first.derived_events[2]
-    assert energy.payload["evidence_basis"] == {}
-    assert set(energy.payload["unknown_dimensions"]) == {
-        "deficits",
-        "salience",
-        "urgency",
-        "valence",
-        "arousal",
-        "control",
-        "resources",
-        "cost",
-        "personality_relevance",
+    assert energy.payload == {
+        "action_id": energy.action_id,
+        "assessment_source": "hermes_host_llm",
+        "prompt_version": "alice-energy-v1",
     }
 
 

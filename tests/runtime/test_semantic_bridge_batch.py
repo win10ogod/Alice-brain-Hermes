@@ -199,7 +199,7 @@ def test_pre_tool_commits_raw_and_complete_pc_e_st_rd_batch_atomically(
             "hermes.observer.pre_tool_call",
             "action.proposed",
             "personality.control.sampled",
-            "action.energy_assessed",
+            "action.energy_requested",
             "simulation.created",
             "action.prepared",
         ]

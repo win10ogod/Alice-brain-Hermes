@@ -26,6 +26,7 @@ from alice_brain_hermes.core.limits import (
     MAX_THOUGHT_BRANCHES,
 )
 from alice_brain_hermes.core.personality import (
+    ENERGY_DIMENSIONS,
     advance_personality_clock,
     energy_from_event,
     reduce_personality,
@@ -367,6 +368,45 @@ def reduce_state(state: BrainState, event: EventEnvelope) -> BrainState:
         )
     elif event.event_type in {"semantic.gap", "trace.gap"}:
         values["trace_complete"] = False
+    elif (
+        event.event_type == "action.energy_requested"
+        and event.payload.get("reassessment_reason") == "legacy_neutral_default"
+    ):
+        action_id = action_id_from_event(event)
+        legacy = state.energies.get(action_id)
+        if (
+            legacy is None
+            or legacy.assessment_source is not None
+            or legacy.assessment_summary is not None
+            or legacy.provenance
+            or legacy.evidence_basis
+            or legacy.unknown_dimensions != ENERGY_DIMENSIONS
+            or legacy.deficits
+            or legacy.salience != 0.5
+            or legacy.urgency != 0.5
+            or legacy.valence != 0.0
+            or legacy.arousal != 0.0
+            or legacy.control != 0.5
+            or legacy.resources != 0.5
+            or legacy.cost != 0.5
+            or legacy.personality_relevance != 0.5
+        ):
+            raise DomainInvariantError(
+                "legacy energy reassessment requires the exact neutral vector"
+            )
+        retained_energy = tuple(
+            item for item in state.energy_records if item.action_id != action_id
+        )
+        if len(retained_energy) == len(state.energy_records):
+            raise DomainInvariantError(
+                "legacy energy reassessment requires its prior vector"
+            )
+        values["energy_records"] = retained_energy
+        working_set = _advance_working_set(
+            working_set,
+            "energy_records",
+            evicted=1,
+        )
     elif event.event_type == "action.energy_assessed":
         action_id = action_id_from_event(event)
         if action_id not in state.actions:
