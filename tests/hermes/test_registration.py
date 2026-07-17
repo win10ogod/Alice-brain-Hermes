@@ -4293,6 +4293,7 @@ def test_installed_wheel_runs_real_host_daemon_hook_ack_trace_and_restart(
             "HERMES_HOME": str(hermes_home),
             "HERMES_BUNDLED_PLUGINS": str(bundled_home),
             "ALICE_BRAIN_HERMES_HOME": str(alice_home),
+            "ALICE_BRAIN_HERMES_IDENTITY_LLM_MODE": "off",
         }
     )
 
