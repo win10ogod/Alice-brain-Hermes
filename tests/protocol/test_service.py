@@ -10,6 +10,7 @@ import pytest
 
 from alice_brain_hermes.core.events import new_event
 from alice_brain_hermes.core.personality import ENERGY_DIMENSIONS
+from alice_brain_hermes.errors import RuntimeOwnedError
 from alice_brain_hermes.ids import new_id
 from alice_brain_hermes.protocol.energy import EnergyAssessmentChoiceV1
 from alice_brain_hermes.protocol.identity import IdentityChoiceV1
@@ -236,6 +237,27 @@ def test_energy_worker_report_is_authenticated_owned_and_stales(
     degraded = decode(connection.handle_frame(request(11, "daemon.status")))["result"]
     assert degraded["energy_worker_health"]["status"] == "degraded"
     assert degraded["energy_worker_health"]["reporter_id"] == second
+
+
+def test_energy_worker_report_does_not_misclassify_runtime_authority_failure(
+    service: ProtocolService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = service.new_connection()
+    initialize(connection)
+
+    def authority_failure(_report: EnergyWorkerReportV1) -> bool:
+        raise RuntimeOwnedError("runtime lease loss")
+
+    monkeypatch.setattr(service.runtime, "report_energy_worker", authority_failure)
+
+    response = decode(
+        connection.handle_frame(
+            request(2, "energy.worker.report", energy_report(new_id(), 1))
+        )
+    )
+
+    assert response["error"]["code"] == "internal_error"
 
 
 @pytest.mark.parametrize(

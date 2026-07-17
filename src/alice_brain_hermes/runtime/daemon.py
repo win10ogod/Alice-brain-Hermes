@@ -25,6 +25,7 @@ from alice_brain_hermes.core.events import EventEnvelope
 from alice_brain_hermes.errors import (
     BridgeBindingError,
     BridgeClosedError,
+    EnergyWorkerHeartbeatOwnedError,
     LedgerIntegrityError,
     RuntimeOwnedError,
     SchedulerShutdownError,
@@ -994,7 +995,7 @@ class HermesDaemonRuntime:
                         now - current.received_monotonic
                         < ENERGY_WORKER_STALE_AFTER_MS / 1_000
                     ):
-                        raise RuntimeOwnedError(
+                        raise EnergyWorkerHeartbeatOwnedError(
                             "energy worker heartbeat belongs to a fresh reporter"
                         )
                 self._energy_worker_heartbeat = _EnergyWorkerHeartbeat(report, now)

@@ -51,6 +51,10 @@ class RuntimeOwnedError(RuntimeOwnershipError):
     """Raised when another process holds the runtime-home lease."""
 
 
+class EnergyWorkerHeartbeatOwnedError(AliceBrainHermesError):
+    """Raised when a fresh host energy heartbeat has another reporter."""
+
+
 class SchedulerShutdownError(RuntimeOwnershipError, RuntimeError):
     """Raised when a continuous writer cannot prove it has stopped."""
 
@@ -122,6 +126,7 @@ __all__ = [
     "DaemonRpcError",
     "DomainCapacityError",
     "DomainInvariantError",
+    "EnergyWorkerHeartbeatOwnedError",
     "EventConflictError",
     "ExpectedSequenceError",
     "FrameSizeError",

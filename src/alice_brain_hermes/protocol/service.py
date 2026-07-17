@@ -24,12 +24,12 @@ from alice_brain_hermes.errors import (
     CaptureGapRequiredError,
     CaptureSequenceError,
     DomainCapacityError,
+    EnergyWorkerHeartbeatOwnedError,
     EventConflictError,
     FrameSizeError,
     IdempotencyConflictError,
     LedgerIntegrityError,
     ResponseSizeError,
-    RuntimeOwnedError,
 )
 from alice_brain_hermes.ids import new_id, validate_id
 from alice_brain_hermes.protocol.diagnostics import (
@@ -656,7 +656,7 @@ class ProtocolConnection:
             report = EnergyWorkerReportV1.model_validate(params, strict=True)
             try:
                 accepted = self.service.runtime.report_energy_worker(report)
-            except RuntimeOwnedError:
+            except EnergyWorkerHeartbeatOwnedError:
                 raise ProtocolFault(
                     "energy_worker_owned",
                     "energy worker heartbeat has a fresh owner",
