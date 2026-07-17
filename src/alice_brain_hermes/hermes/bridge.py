@@ -50,6 +50,15 @@ MAX_COPY_DEPTH = 6
 MAX_COPY_NODES = 1_024
 MAX_COPY_CONTAINER_ITEMS = 64
 _TOKEN = re.compile(r"^[0-9a-f]{64}$")
+_FINALIZED_REASONING_HOOKS = frozenset({"post_api_request", "post_llm_call"})
+_TEXT_REASONING_CARRIERS = frozenset({"reasoning", "reasoning_content"})
+_STRUCTURED_REASONING_CARRIERS = frozenset(
+    {
+        "reasoning_details",
+        "anthropic_content_blocks",
+        "codex_reasoning_items",
+    }
+)
 
 ClientFactory = Callable[..., Any]
 _BootstrapCaptureDisposition = Literal["accepted", "late_after_close"]
@@ -196,6 +205,100 @@ def _detach_json(
         }
     stats.unsupported_paths += 1
     return {"$unsupported_type": type(value).__name__[:160]}
+
+
+def _materialized_object_fields(value: object) -> object:
+    """Unwrap the copier's inert object representation without calling host code."""
+
+    if type(value) is not dict:
+        return value
+    fields = value.get("fields")
+    if type(value.get("$object_type")) is str and type(fields) is dict:
+        return fields
+    return value
+
+
+def _has_finalized_reasoning_carrier(value: object) -> bool:
+    """Recognize only finalized reasoning fields Hermes 0.18.2 actually emits."""
+
+    materialized = _materialized_object_fields(value)
+    if type(materialized) is not dict:
+        return False
+    for key in _TEXT_REASONING_CARRIERS:
+        candidate = materialized.get(key)
+        if type(candidate) is str and bool(candidate.strip()):
+            return True
+    for key in _STRUCTURED_REASONING_CARRIERS:
+        candidate = materialized.get(key)
+        if type(candidate) in {dict, list} and bool(candidate):
+            return True
+    provider_data = materialized.get("provider_data")
+    if type(provider_data) is dict:
+        return _has_finalized_reasoning_carrier(provider_data)
+    return False
+
+
+def _post_llm_has_finalized_reasoning(payload: Mapping[str, object]) -> bool:
+    if _has_finalized_reasoning_carrier(payload.get("assistant_response")):
+        return True
+    history = payload.get("conversation_history")
+    if type(history) is not list:
+        return False
+    last_user_index: int | None = None
+    for index, message in enumerate(history):
+        materialized = _materialized_object_fields(message)
+        if type(materialized) is dict and materialized.get("role") == "user":
+            last_user_index = index
+    if last_user_index is None:
+        return False
+    return any(
+        type(_materialized_object_fields(message)) is dict
+        and _materialized_object_fields(message).get("role") == "assistant"
+        and _has_finalized_reasoning_carrier(message)
+        for message in history[last_user_index + 1 :]
+    )
+
+
+def _count_materialized_object_wrappers(value: object) -> int:
+    """Count fully materialized host-object wrappers in already detached JSON."""
+
+    if type(value) is dict:
+        wrapper = int(
+            type(value.get("$object_type")) is str
+            and type(value.get("fields")) is dict
+        )
+        return wrapper + sum(
+            _count_materialized_object_wrappers(child) for child in value.values()
+        )
+    if type(value) is list:
+        return sum(_count_materialized_object_wrappers(child) for child in value)
+    return 0
+
+
+def _finalized_reasoning_capture(
+    hook: str,
+    payload: Mapping[str, object],
+    stats: _DetachStats,
+) -> str:
+    """Report carrier visibility, never delta capture or reasoning completeness."""
+
+    if hook not in _FINALIZED_REASONING_HOOKS:
+        return "not_applicable"
+    if hook == "post_api_request":
+        emitted = _has_finalized_reasoning_carrier(payload.get("assistant_message"))
+    else:
+        emitted = _post_llm_has_finalized_reasoning(payload)
+    benign_wrappers = _count_materialized_object_wrappers(payload)
+    effective_unsupported = max(0, stats.unsupported_paths - benign_wrappers)
+    copier_omissions = (
+        stats.redacted_paths
+        + stats.truncated_paths
+        + effective_unsupported
+        + stats.omitted_nodes
+    )
+    if copier_omissions:
+        return "partial"
+    return "observed" if emitted else "not_emitted"
 
 
 def _host_identifier(value: object, stats: _DetachStats) -> str | None:
@@ -1031,6 +1134,14 @@ class HookBridge:
                 "hook": "observed",
                 "chunk_capture": "unobserved",
                 "reasoning_capture": "unobserved",
+                "text_delta_capture": "unobserved",
+                "reasoning_delta_capture": "unobserved",
+                "finalized_reasoning_capture": _finalized_reasoning_capture(
+                    hook,
+                    payload,
+                    stats,
+                ),
+                "host_state_scope": "registered_hook_payloads_only",
             },
         }
         raw = {

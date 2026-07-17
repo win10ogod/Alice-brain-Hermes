@@ -540,6 +540,7 @@ def _status(home: Path, *, timeout_seconds: float) -> dict[str, object]:
         "semantic_complete": runtime["semantic_complete"],
         "dropped_events": runtime["dropped_events"],
         "semantic_evidence": runtime["semantic_evidence"],
+        "host_state_scope": runtime["host_state_scope"],
         "unobserved_hermes_fields": runtime["unobserved_hermes_fields"],
         "schema_versions": runtime["schema_versions"],
     }

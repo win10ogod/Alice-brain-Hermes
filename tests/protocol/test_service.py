@@ -508,10 +508,10 @@ def test_daemon_status_is_typed_complete_zero_evidence_for_fresh_runtime(
             "legacy_raw_only_records": 0,
             "semantic_gap_records": 0,
         },
+        "host_state_scope": "registered_hook_payloads_only",
         "unobserved_hermes_fields": [
             "chunk_capture",
             "reasoning_capture",
-            "unregistered_host_state",
         ],
         "schema_versions": {
             "protocol": PROTOCOL_VERSION,

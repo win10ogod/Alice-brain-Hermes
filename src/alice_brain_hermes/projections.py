@@ -115,17 +115,18 @@ class AtomicProjectionCache:
                 "through_capture_seq": frame.through_capture_seq,
                 "trace_complete": frame.trace_complete,
                 "runtime_health": frame.runtime_health,
-                "pc": thaw_json(frame.pc),
-                "energy": thaw_json(frame.energy),
-                "st": thaw_json(frame.st),
-                "rd": thaw_json(frame.rd),
-                "a": thaw_json(frame.a),
-                "semantic_context": thaw_json(frame.semantic_context),
                 "aggregate_semantic_complete": frame.aggregate_semantic_complete,
                 "semantic_evidence": frame.semantic_evidence.model_dump(mode="json"),
                 "unresolved_evidence": frame.unresolved_evidence,
+                "projection_truncated": False,
+                "pc": thaw_json(frame.pc),
+                "rd": thaw_json(frame.rd),
+                "semantic_context": thaw_json(frame.semantic_context),
                 "capabilities": thaw_json(frame.capabilities),
                 "omission_counts": thaw_json(frame.omission_counts),
+                "a": thaw_json(frame.a),
+                "energy": thaw_json(frame.energy),
+                "st": thaw_json(frame.st),
             }
         }
         rendered = json.dumps(
@@ -133,7 +134,7 @@ class AtomicProjectionCache:
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
-            sort_keys=True,
+            sort_keys=False,
         )
         if len(rendered.encode("utf-8")) <= MAX_EPHEMERAL_CONTEXT_BYTES:
             return rendered or None
@@ -170,7 +171,7 @@ class AtomicProjectionCache:
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
-            sort_keys=True,
+            sort_keys=False,
         )
         if len(bounded.encode("utf-8")) > MAX_EPHEMERAL_CONTEXT_BYTES:
             raise AssertionError(

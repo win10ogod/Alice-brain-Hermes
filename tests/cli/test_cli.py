@@ -232,10 +232,10 @@ def test_status_payload_rejects_unknown_or_identity_collision_fields() -> None:
             "legacy_raw_only_records": 0,
             "semantic_gap_records": 0,
         },
+        "host_state_scope": "registered_hook_payloads_only",
         "unobserved_hermes_fields": [
             "chunk_capture",
             "reasoning_capture",
-            "unregistered_host_state",
         ],
         "schema_versions": {
             "protocol": 2,
@@ -1190,10 +1190,10 @@ def test_doctor_fails_visible_persisted_integration_gaps(
         "trace_complete": True,
         "semantic_complete": True,
         "dropped_events": 0,
+        "host_state_scope": "registered_hook_payloads_only",
         "unobserved_hermes_fields": [
             "chunk_capture",
             "reasoning_capture",
-            "unregistered_host_state",
         ],
         "schema_versions": {
             "protocol": 2,

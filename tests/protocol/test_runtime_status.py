@@ -55,7 +55,6 @@ def test_fresh_runtime_status_is_complete_zero_evidence() -> None:
         unobserved_hermes_fields=(
             "chunk_capture",
             "reasoning_capture",
-            "unregistered_host_state",
         ),
         schema_versions=RuntimeSchemaVersionsV1(sqlite=5),
     )
@@ -67,6 +66,7 @@ def test_fresh_runtime_status_is_complete_zero_evidence() -> None:
     assert status.trace_complete is True
     assert status.semantic_complete is True
     assert status.dropped_events == 0
+    assert status.host_state_scope == "registered_hook_payloads_only"
 
 
 @pytest.mark.parametrize(
@@ -128,7 +128,6 @@ def test_runtime_status_rejects_false_completeness_and_count_collisions() -> Non
         "unobserved_hermes_fields": (
             "chunk_capture",
             "reasoning_capture",
-            "unregistered_host_state",
         ),
         "schema_versions": RuntimeSchemaVersionsV1(sqlite=5),
     }

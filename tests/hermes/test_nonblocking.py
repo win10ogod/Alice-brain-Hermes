@@ -2496,6 +2496,46 @@ def test_oversized_projection_falls_back_to_valid_bounded_json(
     assert decoded["alice_brain"]["trace_complete"] is True
 
 
+def test_projection_prefix_prioritizes_identity_health_and_semantic_aggregate(
+    tmp_path: Path,
+) -> None:
+    bridge = HookBridge(
+        tmp_path,
+        bridge_instance_id=new_id(),
+        start_worker_on_capture=False,
+    )
+    raw = _frame(new_id(), 0)
+    raw["a"] = {"large": "a" * 4_000}
+    raw["energy"] = {"large": "e" * 4_000}
+    raw["st"] = {"large": "s" * 4_000}
+    bridge.projections.publish_frame(
+        ConsciousnessFrameV3.model_validate(raw, strict=True)
+    )
+
+    context = bridge.projections.read_context()
+    assert type(context) is str
+    decoded = json.loads(context)["alice_brain"]
+    assert decoded["projection_truncated"] is False
+    ordered_fields = list(decoded)
+    critical_prefix = [
+        "schema_version",
+        "brain_id",
+        "state_sequence",
+        "through_capture_seq",
+        "trace_complete",
+        "runtime_health",
+        "aggregate_semantic_complete",
+        "semantic_evidence",
+        "unresolved_evidence",
+    ]
+    assert ordered_fields[: len(critical_prefix)] == critical_prefix
+    assert ordered_fields.index("aggregate_semantic_complete") < ordered_fields.index(
+        "a"
+    )
+    assert ordered_fields.index("semantic_evidence") < ordered_fields.index("energy")
+    assert ordered_fields.index("unresolved_evidence") < ordered_fields.index("st")
+
+
 def test_projection_thaws_nested_immutable_frame_values(tmp_path: Path) -> None:
     bridge = HookBridge(
         tmp_path,

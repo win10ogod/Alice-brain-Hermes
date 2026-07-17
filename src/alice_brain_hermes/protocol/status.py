@@ -18,7 +18,6 @@ from alice_brain_hermes.protocol.models import (
 UNOBSERVED_HERMES_FIELDS = (
     "chunk_capture",
     "reasoning_capture",
-    "unregistered_host_state",
 )
 
 
@@ -130,10 +129,12 @@ class DaemonRuntimeStatusV1(_StrictStatusModel):
     semantic_complete: bool
     dropped_events: int = Field(ge=0)
     semantic_evidence: SemanticEvidenceSummaryV1
+    host_state_scope: Literal[
+        "registered_hook_payloads_only"
+    ] = "registered_hook_payloads_only"
     unobserved_hermes_fields: tuple[
         Literal["chunk_capture"],
         Literal["reasoning_capture"],
-        Literal["unregistered_host_state"],
     ] = UNOBSERVED_HERMES_FIELDS
     schema_versions: RuntimeSchemaVersionsV1
 

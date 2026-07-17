@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import queue
+from copy import deepcopy
 from datetime import UTC, datetime
+from importlib.metadata import version
 from typing import Any
 
 import pytest
+from agent.transports.types import NormalizedResponse
 
 from alice_brain_hermes.hermes.bridge import HookBridge
 from alice_brain_hermes.hermes.hooks import HermesHooks
@@ -226,6 +229,242 @@ def test_exact_hermes_018_hook_payloads_become_typed_observations(
     pre_tool = records[9]
     assert pre_tool.payload.args == {"command": "true"}
     assert pre_tool.context.api_request_id == "api-request"
+
+
+def _capture_hook(
+    bridge: HookBridge,
+    hook_name: str,
+    payload: dict[str, Any],
+) -> HermesObservationV1:
+    hooks = HermesHooks(bridge)
+    assert (
+        getattr(hooks, hook_name)(
+            telemetry_schema_version="hermes.observer.v1",
+            **payload,
+        )
+        is None
+    )
+    record = bridge.queue.get_nowait()
+    assert isinstance(record, HermesObservationV1)
+    return record
+
+
+def test_real_hermes_018_normalized_reasoning_is_finalized_not_delta_capture(
+    bridge: HookBridge,
+) -> None:
+    assert version("hermes-agent") == "0.18.2"
+    payload = _host_payloads()["post_api_request"]
+    payload["assistant_message"] = NormalizedResponse(
+        content="answer",
+        tool_calls=None,
+        finish_reason="stop",
+        reasoning="provider-emitted finalized reasoning",
+    )
+
+    record = _capture_hook(bridge, "post_api_request", payload)
+
+    assert dict(record.coverage.channels) == {
+        "hook": "observed",
+        "chunk_capture": "unobserved",
+        "reasoning_capture": "unobserved",
+        "text_delta_capture": "unobserved",
+        "reasoning_delta_capture": "unobserved",
+        "finalized_reasoning_capture": "observed",
+        "host_state_scope": "registered_hook_payloads_only",
+    }
+
+
+@pytest.mark.parametrize(
+    "provider_data",
+    [
+        {"reasoning_content": "provider reasoning"},
+        {"reasoning_details": [{"type": "reasoning.text", "text": "thought"}]},
+        {"codex_reasoning_items": [{"type": "reasoning", "id": "item"}]},
+        {
+            "anthropic_content_blocks": [
+                {"type": "thinking", "thinking": "provider reasoning"}
+            ]
+        },
+    ],
+    ids=[
+        "reasoning-content",
+        "reasoning-details",
+        "codex-reasoning-items",
+        "anthropic-thinking-blocks",
+    ],
+)
+def test_real_hermes_018_provider_reasoning_carriers_are_observed(
+    bridge: HookBridge,
+    provider_data: dict[str, Any],
+) -> None:
+    payload = _host_payloads()["post_api_request"]
+    payload["assistant_message"] = NormalizedResponse(
+        content="answer",
+        tool_calls=None,
+        finish_reason="stop",
+        provider_data=provider_data,
+    )
+
+    record = _capture_hook(bridge, "post_api_request", payload)
+
+    assert record.coverage.channels["finalized_reasoning_capture"] == "observed"
+
+
+@pytest.mark.parametrize(
+    "provider_data",
+    [None, {"reasoning_content": " "}, {"reasoning_details": []}],
+    ids=["absent", "hermes-replay-pad", "empty-structured-carrier"],
+)
+def test_real_hermes_018_response_without_reasoning_is_not_emitted(
+    bridge: HookBridge,
+    provider_data: dict[str, Any] | None,
+) -> None:
+    payload = _host_payloads()["post_api_request"]
+    payload["assistant_message"] = NormalizedResponse(
+        content="answer",
+        tool_calls=None,
+        finish_reason="stop",
+        provider_data=provider_data,
+    )
+
+    record = _capture_hook(bridge, "post_api_request", payload)
+
+    assert record.coverage.channels["finalized_reasoning_capture"] == "not_emitted"
+
+
+def test_bootstrap_copier_preserves_real_normalized_reasoning_carrier(
+    bridge: HookBridge,
+) -> None:
+    from alice_brain_hermes.hermes import registration
+
+    payload = _host_payloads()["post_api_request"]
+    payload["telemetry_schema_version"] = "hermes.observer.v1"
+    payload["assistant_message"] = NormalizedResponse(
+        content="answer",
+        tool_calls=None,
+        finish_reason="stop",
+        provider_data={"reasoning_content": "bootstrap reasoning"},
+    )
+    stats = registration._BootstrapCopyStats()  # type: ignore[attr-defined]
+    detached = {
+        key: registration._copy_bootstrap_value(value, stats)  # type: ignore[attr-defined]
+        for key, value in payload.items()
+    }
+
+    bridge.capture_reserved(
+        hook="post_api_request",
+        detached_kwargs=detached,
+        first_capture_seq=1,
+        last_capture_seq=1,
+        gap_cause_counts=None,
+        copy_stats=stats.frozen(),
+    )
+    record = bridge.queue.get_nowait()
+
+    assert isinstance(record, HermesObservationV1)
+    assert record.coverage.unsupported_paths == 1
+    assert record.coverage.channels["finalized_reasoning_capture"] == "observed"
+
+
+def test_truncated_finalized_reasoning_carrier_is_partial_not_complete(
+    bridge: HookBridge,
+) -> None:
+    payload = _host_payloads()["post_api_request"]
+    payload["assistant_message"] = NormalizedResponse(
+        content="answer",
+        tool_calls=None,
+        finish_reason="stop",
+        reasoning="r" * 100_000,
+    )
+
+    record = _capture_hook(bridge, "post_api_request", payload)
+
+    assert record.coverage.truncated_paths > 0
+    assert record.coverage.channels["finalized_reasoning_capture"] == "partial"
+
+
+def test_post_llm_only_uses_current_turn_finalized_reasoning(
+    bridge: HookBridge,
+) -> None:
+    payload = _host_payloads()["post_llm_call"]
+    payload["conversation_history"] = [
+        {
+            "role": "assistant",
+            "content": "old answer",
+            "reasoning_content": "old turn reasoning",
+        },
+        {"role": "user", "content": "new question"},
+        {
+            "role": "assistant",
+            "content": "new answer",
+            "reasoning_details": [{"type": "reasoning", "text": "current"}],
+        },
+    ]
+
+    observed = _capture_hook(bridge, "post_llm_call", payload)
+    assert (
+        observed.coverage.channels["finalized_reasoning_capture"] == "observed"
+    )
+
+    payload["conversation_history"][-1] = {
+        "role": "assistant",
+        "content": "new answer without reasoning",
+    }
+    not_emitted = _capture_hook(bridge, "post_llm_call", payload)
+    assert (
+        not_emitted.coverage.channels["finalized_reasoning_capture"]
+        == "not_emitted"
+    )
+
+
+def test_post_llm_omitted_current_turn_carrier_is_partial(
+    bridge: HookBridge,
+) -> None:
+    payload = _host_payloads()["post_llm_call"]
+    payload["conversation_history"] = [
+        {"role": "user", "content": "old"},
+        *(
+            {"role": "assistant", "content": f"old-{index}"}
+            for index in range(64)
+        ),
+        {"role": "user", "content": "current"},
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "omitted reasoning",
+        },
+    ]
+
+    record = _capture_hook(bridge, "post_llm_call", payload)
+
+    assert record.coverage.omitted_nodes > 0
+    assert record.coverage.channels["finalized_reasoning_capture"] == "partial"
+
+
+def test_non_reasoning_hooks_are_not_applicable_and_request_settings_are_unchanged(
+    bridge: HookBridge,
+) -> None:
+    payload = _host_payloads()["pre_api_request"]
+    payload["request_messages"] = [
+        {"role": "user", "content": "hello"},
+    ]
+    payload["request"] = {
+        "model": "model",
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        "tool_choice": "auto",
+        "temperature": 0.25,
+    }
+    payload["tool_count"] = 1
+    before = deepcopy(payload)
+
+    record = _capture_hook(bridge, "pre_api_request", payload)
+
+    assert payload == before
+    assert record.payload.model == "model"
+    assert record.payload.provider == "provider"
+    assert record.payload.tool_count == 1
+    assert record.payload.request == before["request"]
+    assert record.coverage.channels["finalized_reasoning_capture"] == "not_applicable"
 
 
 def test_pre_llm_is_the_only_hook_that_can_return_plain_cached_context(
