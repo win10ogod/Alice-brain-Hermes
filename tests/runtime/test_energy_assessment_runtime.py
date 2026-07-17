@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 from alice_brain_hermes.core.action import EnergyAssessmentStatus
@@ -34,11 +35,20 @@ def choice() -> EnergyAssessmentChoiceV1:
     )
 
 
-def requested_engine(tmp_path: Path) -> tuple[SQLiteLedger, ConsciousEngine, str]:
+def requested_engine(
+    tmp_path: Path,
+    *,
+    on_state_published: Callable[[str, int], None] | None = None,
+) -> tuple[SQLiteLedger, ConsciousEngine, str]:
     brain_id = new_id()
     action_id = "action-energy-runtime"
     ledger = SQLiteLedger.open(tmp_path / "runtime.db")
-    engine = ConsciousEngine(ledger, brain_id, actor_id=brain_id)
+    engine = ConsciousEngine(
+        ledger,
+        brain_id,
+        actor_id=brain_id,
+        on_state_published=on_state_published,
+    )
     engine.append(
         new_event(
             "action.proposed",
@@ -127,6 +137,95 @@ def test_energy_lease_claim_and_completion_persist_host_vector(
         ) == "completed"
         assert engine.claim_energy_assessment() is None
         assert ledger.replay(engine.brain_id) == engine.state
+    finally:
+        ledger.close()
+
+
+def test_energy_claim_and_completion_publish_each_state_change(
+    tmp_path: Path,
+) -> None:
+    publications: list[tuple[str, int]] = []
+    ledger, engine, _action_id = requested_engine(
+        tmp_path,
+        on_state_published=lambda brain_id, sequence: publications.append(
+            (brain_id, sequence)
+        ),
+    )
+    try:
+        publications.clear()
+        before_claim = engine.state.last_sequence
+        lease = engine.claim_energy_assessment()
+        assert lease is not None
+        assert engine.state.last_sequence == before_claim + 1
+        assert publications == [(engine.brain_id, engine.state.last_sequence)]
+
+        publications.clear()
+        assert engine.claim_energy_assessment() is None
+        assert publications == []
+
+        input_sha256 = ledger._energy_fingerprint(
+            ledger._canonical_json_value(thaw_json(lease.assessment_input))
+        )
+        before_completion = engine.state.last_sequence
+        assert (
+            engine.complete_energy_assessment(
+                lease.lease_id,
+                choice(),
+                provenance(input_sha256),
+            )
+            == "completed"
+        )
+        assert engine.state.last_sequence == before_completion + 2
+        assert publications == [(engine.brain_id, engine.state.last_sequence)]
+
+        publications.clear()
+        assert (
+            engine.complete_energy_assessment(
+                lease.lease_id,
+                choice(),
+                provenance(input_sha256),
+            )
+            == "completed"
+        )
+        assert publications == []
+    finally:
+        ledger.close()
+
+
+def test_energy_failure_publishes_only_its_state_change(tmp_path: Path) -> None:
+    publications: list[tuple[str, int]] = []
+    ledger, engine, _action_id = requested_engine(
+        tmp_path,
+        on_state_published=lambda brain_id, sequence: publications.append(
+            (brain_id, sequence)
+        ),
+    )
+    try:
+        publications.clear()
+        lease = engine.claim_energy_assessment()
+        assert lease is not None
+
+        publications.clear()
+        before_failure = engine.state.last_sequence
+        assert (
+            engine.fail_energy_assessment(
+                lease.lease_id,
+                "llm_error.RuntimeError",
+            )
+            == "failed"
+        )
+        assert engine.state.last_sequence == before_failure + 2
+        assert publications == [(engine.brain_id, engine.state.last_sequence)]
+
+        publications.clear()
+        assert (
+            engine.fail_energy_assessment(
+                lease.lease_id,
+                "llm_error.RuntimeError",
+            )
+            == "failed"
+        )
+        assert publications == []
     finally:
         ledger.close()
 

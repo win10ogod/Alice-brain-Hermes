@@ -544,7 +544,7 @@ class ConsciousEngine:
                 self._diverged = True
                 raise
             if result.successor is not None:
-                self._state = result.successor
+                self._publish_state(result.successor)
             return result.lease
 
     def complete_energy_assessment(
@@ -584,7 +584,7 @@ class ConsciousEngine:
                 self._diverged = True
                 raise
             if result.successor is not None:
-                self._state = result.successor
+                self._publish_state(result.successor)
             return result.status
 
     def fail_energy_assessment(
@@ -619,7 +619,7 @@ class ConsciousEngine:
                 self._diverged = True
                 raise
             if result.successor is not None:
-                self._state = result.successor
+                self._publish_state(result.successor)
             return result.status
 
     def _event(self, event_type: str, payload: Mapping[str, object]) -> EventEnvelope:
