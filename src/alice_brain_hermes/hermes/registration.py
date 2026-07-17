@@ -102,6 +102,9 @@ class _BootstrapHealth:
     degraded: bool = False
     last_error: str | None = None
     worker_error: str | None = None
+    energy_worker_started: bool = False
+    energy_terminal_intent_pending: bool = False
+    energy_worker_error: str | None = None
     registration_attempts: int = 0
     registration_failures: int = 0
     registration_complete: bool = False
@@ -300,6 +303,7 @@ class _BootstrapCaptureBuffer:
         self._host_profile_factory: Any | None = None
         self._host_llm_factory: Any | None = None
         self._identity_worker: Any | None = None
+        self._energy_worker: Any | None = None
         self._start_worker_on_capture = start_worker_on_capture
         self._health = _BootstrapHealth()
         self._handed_off_dropped_events = 0
@@ -314,10 +318,16 @@ class _BootstrapCaptureBuffer:
         with self._capture_lock:
             health = self._health
             worker_started = self.worker_started
+            energy_error = health.energy_worker_error
+            energy_pending = health.energy_terminal_intent_pending
+            energy_diagnostic = energy_error or (
+                "energy_terminal_intent_pending" if energy_pending else None
+            )
             if (
                 not self._health_reconciliation_required
                 and not self._emergency_trace_incomplete
                 and not self._emergency_degraded
+                and energy_diagnostic is None
                 and health.worker_started is worker_started
             ):
                 return health
@@ -346,13 +356,18 @@ class _BootstrapCaptureBuffer:
                     health.degraded
                     or self._health_reconciliation_required
                     or self._emergency_degraded
+                    or energy_diagnostic is not None
                 ),
                 last_error=(
                     self._emergency_last_error
+                    or energy_diagnostic
                     or health.last_error
                     or "health_reconciliation_required"
                 ),
-                worker_error=health.worker_error,
+                worker_error=energy_diagnostic or health.worker_error,
+                energy_worker_started=health.energy_worker_started,
+                energy_terminal_intent_pending=energy_pending,
+                energy_worker_error=energy_error,
                 registration_attempts=health.registration_attempts,
                 registration_failures=health.registration_failures,
                 registration_complete=health.registration_complete,
@@ -472,9 +487,95 @@ class _BootstrapCaptureBuffer:
             if self._identity_worker is owned:
                 self._identity_worker = None
 
+    @property
+    def energy_worker_for_test(self) -> Any | None:
+        return self.energy_worker_for_worker()
+
+    def energy_worker_for_worker(self) -> Any | None:
+        with self._worker_lock:
+            return self._energy_worker
+
+    def _adopt_energy_worker(self, worker: Any) -> None:
+        with self._worker_lock:
+            current = self._energy_worker
+            if current is not None and current is not worker:
+                raise RuntimeError("bootstrap energy worker ownership changed")
+            self._energy_worker = worker
+
+    def _stop_energy_worker(
+        self,
+        worker: Any | None = None,
+        *,
+        release: bool = True,
+    ) -> None:
+        with self._worker_lock:
+            owned = self._energy_worker
+        if owned is None:
+            return
+        if worker is not None and owned is not worker:
+            raise RuntimeError("bootstrap energy worker identity changed")
+        try:
+            stop = getattr(owned, "stop_for_test", None)
+            if not callable(stop):
+                raise RuntimeError("energy worker has no bounded stop operation")
+            stop()
+            strict_probe = getattr(owned, "_worker_alive_strict", None)
+            if not callable(strict_probe):
+                raise RuntimeError("energy worker has no strict liveness probe")
+            try:
+                alive = strict_probe()
+            except BaseException as error:
+                raise RuntimeError("energy worker liveness is unknown") from error
+            if type(alive) is not bool:
+                raise RuntimeError("energy worker liveness is invalid")
+            if alive:
+                raise RuntimeError("energy worker did not stop")
+            try:
+                terminal_intent_pending = owned.terminal_intent_pending
+            except BaseException as error:
+                raise RuntimeError(
+                    "energy worker terminal intent state is unknown"
+                ) from error
+            if type(terminal_intent_pending) is not bool:
+                raise RuntimeError("energy worker terminal intent state is invalid")
+            try:
+                internal_error = owned.last_internal_error_type
+            except BaseException as error:
+                raise RuntimeError("energy worker diagnostic is unknown") from error
+            if internal_error is not None and not isinstance(internal_error, str):
+                raise RuntimeError("energy worker diagnostic is invalid")
+            self.publish_energy_worker_diagnostics(
+                worker_started=False,
+                terminal_intent_pending=terminal_intent_pending,
+                error_type=internal_error,
+            )
+            if not release:
+                return
+        except BaseException as error:
+            cause = error.__cause__ or error
+            try:
+                self.publish_energy_worker_diagnostics(
+                    worker_started=False,
+                    terminal_intent_pending=False,
+                    error_type=type(cause).__name__[:160],
+                )
+            except BaseException as diagnostic_error:
+                self.mark_worker_degraded(diagnostic_error)
+            raise
+        if terminal_intent_pending:
+            error = RuntimeError("energy worker terminal intent remains pending")
+            raise error
+        with self._worker_lock:
+            if self._energy_worker is owned:
+                self._energy_worker = None
+
     def _stop_owned_children(self) -> None:
         errors: list[BaseException] = []
-        for cleanup in (self._stop_identity_worker, self._stop_transport_bridge):
+        for cleanup in (
+            self._stop_identity_worker,
+            self._stop_energy_worker,
+            self._stop_transport_bridge,
+        ):
             try:
                 cleanup()
             except BaseException as error:
@@ -923,6 +1024,37 @@ class _BootstrapCaptureBuffer:
         except BaseException:
             self.mark_unrepresented_callback(error)
 
+    def publish_energy_worker_diagnostics(
+        self,
+        *,
+        worker_started: bool,
+        terminal_intent_pending: bool,
+        error_type: str | None,
+    ) -> None:
+        """Publish source-specific energy state that capture success cannot erase."""
+
+        if type(worker_started) is not bool:
+            raise TypeError("energy worker started state must be an exact bool")
+        if type(terminal_intent_pending) is not bool:
+            raise TypeError("energy terminal intent state must be an exact bool")
+        if error_type is not None and (
+            not isinstance(error_type, str)
+            or not error_type
+            or len(error_type) > 160
+            or any(
+                not (character.isascii() and (character.isalnum() or character == "_"))
+                for character in error_type
+            )
+        ):
+            raise ValueError("energy worker error type is invalid")
+        with self._capture_lock:
+            self._health = replace(
+                self._health,
+                energy_worker_started=worker_started,
+                energy_terminal_intent_pending=terminal_intent_pending,
+                energy_worker_error=error_type,
+            )
+
     def mark_unrepresented_callback(self, error: BaseException) -> None:
         """Publish an allocation-free conservative latch for an unseen callback."""
 
@@ -1203,6 +1335,90 @@ def _ensure_identity_worker_running(buffer: _BootstrapCaptureBuffer) -> bool:
     return False
 
 
+def _configure_energy_worker(
+    buffer: _BootstrapCaptureBuffer,
+    *,
+    runtime_home: Any,
+    profile_factory: Any,
+    llm_factory: Any,
+) -> None:
+    """Create the independent energy worker without resolving host values."""
+
+    from alice_brain_hermes.hermes.energy import EnergyAssessmentWorker
+    from alice_brain_hermes.hermes.energy_client import (
+        DaemonEnergyAssessmentLeasePort,
+    )
+
+    port = DaemonEnergyAssessmentLeasePort(
+        runtime_home,
+        profile_factory=profile_factory,
+    )
+    worker = EnergyAssessmentWorker(
+        lease_port=port,
+        llm_factory=llm_factory,
+    )
+    adopt = getattr(buffer, "_adopt_energy_worker", None)
+    if not callable(adopt):
+        raise RuntimeError("bootstrap cannot own the energy assessment worker")
+    adopt(worker)
+    # The adopted object retains any terminal intent across daemon ACK loss.
+    # It must be restarted in place, never replaced by another host LLM call.
+    worker.start()
+
+
+def _ensure_energy_worker_running(buffer: _BootstrapCaptureBuffer) -> bool:
+    """Restart one exact energy owner and surface its sanitized diagnostic."""
+
+    worker = buffer.energy_worker_for_worker()
+    if worker is None:
+        return True
+
+    def publish_running_diagnostics() -> None:
+        internal_error = worker.last_internal_error_type
+        terminal_intent_pending = worker.terminal_intent_pending
+        buffer.publish_energy_worker_diagnostics(
+            worker_started=True,
+            terminal_intent_pending=terminal_intent_pending,
+            error_type=internal_error,
+        )
+
+    def publish_failure(error: BaseException) -> None:
+        try:
+            buffer.publish_energy_worker_diagnostics(
+                worker_started=False,
+                terminal_intent_pending=False,
+                error_type=type(error).__name__[:160],
+            )
+        except BaseException as diagnostic_error:
+            buffer.mark_worker_degraded(diagnostic_error)
+
+    try:
+        if worker.worker_started:
+            publish_running_diagnostics()
+            return True
+    except BaseException as error:
+        publish_failure(error)
+        return False
+    try:
+        worker.start()
+    except BaseException as error:
+        publish_failure(error)
+        return False
+    try:
+        if worker.worker_started:
+            publish_running_diagnostics()
+            return True
+    except BaseException as error:
+        publish_failure(error)
+        return False
+    buffer.publish_energy_worker_diagnostics(
+        worker_started=False,
+        terminal_intent_pending=False,
+        error_type="RuntimeError",
+    )
+    return False
+
+
 def _bootstrap_worker_entry(buffer: _BootstrapCaptureBuffer) -> None:
     worker = buffer._worker
     if worker is None:
@@ -1214,21 +1430,29 @@ def _bootstrap_worker_entry(buffer: _BootstrapCaptureBuffer) -> None:
         _bootstrap_worker_main(buffer)
     finally:
         identity_cleanup = getattr(buffer, "_stop_identity_worker", None)
+        energy_cleanup = getattr(buffer, "_stop_energy_worker", None)
         transport_cleanup = getattr(buffer, "_stop_transport_bridge", None)
         cleanups = (
             (
                 identity_cleanup,
                 {"release": False},
+                True,
             ),
-            (transport_cleanup, {}),
+            (
+                energy_cleanup,
+                {"release": False},
+                False,
+            ),
+            (transport_cleanup, {}, True),
         )
-        for cleanup, kwargs in cleanups:
+        for cleanup, kwargs, publish_generic_error in cleanups:
             if not callable(cleanup):
                 continue
             try:
                 cleanup(**kwargs)
             except BaseException as error:
-                buffer.mark_worker_degraded(error.__cause__ or error)
+                if publish_generic_error:
+                    buffer.mark_worker_degraded(error.__cause__ or error)
         buffer._publish_worker_exit(worker)
 
 
@@ -1240,6 +1464,8 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
     shared_llm_factory: Any | None = None
     identity_configured = False
     identity_retry_after = 0.0
+    energy_configured = False
+    energy_retry_after = 0.0
     prelude_ready = False
     while True:
         try:
@@ -1284,12 +1510,21 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                 candidate_identity_configured = (
                     callable(identity_owner) and identity_owner() is not None
                 )
+                energy_owner = getattr(
+                    buffer,
+                    "energy_worker_for_worker",
+                    None,
+                )
+                candidate_energy_configured = (
+                    callable(energy_owner) and energy_owner() is not None
+                )
                 bridge = adopted_bridge
                 runtime_home = candidate_runtime_home
                 hook_bridge_factory = HookBridge
                 shared_profile_factory = candidate_profile_factory
                 shared_llm_factory = candidate_llm_factory
                 identity_configured = candidate_identity_configured
+                energy_configured = candidate_energy_configured
                 prelude_ready = True
             terminal = False
             if bridge is None:
@@ -1369,6 +1604,30 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                 and not _ensure_identity_worker_running(buffer)
             ):
                 identity_retry_after = current_time + 0.1
+            if (
+                shared_llm_factory is not None
+                and not energy_configured
+                and current_time >= energy_retry_after
+            ):
+                try:
+                    _configure_energy_worker(
+                        buffer,
+                        runtime_home=runtime_home,
+                        profile_factory=shared_profile_factory,
+                        llm_factory=shared_llm_factory,
+                    )
+                except BaseException as error:
+                    buffer.mark_worker_degraded(error)
+                    energy_configured = buffer.energy_worker_for_worker() is not None
+                    energy_retry_after = current_time + 0.1
+                else:
+                    energy_configured = True
+            if (
+                energy_configured
+                and current_time >= energy_retry_after
+                and not _ensure_energy_worker_running(buffer)
+            ):
+                energy_retry_after = current_time + 0.1
             capture = buffer.next_for_worker()
             if capture is None:
                 buffer.publish_context(bridge.projections.read_context())

@@ -213,6 +213,11 @@ class EnergyAssessmentWorker:
 
     @property
     def worker_started(self) -> bool:
+        return self._worker_alive_strict()
+
+    def _worker_alive_strict(self) -> bool:
+        """Probe the exact owned thread without hiding an ambiguous result."""
+
         with self._lifecycle_lock:
             return self._thread is not None and self._thread.is_alive()
 
@@ -335,6 +340,13 @@ class EnergyAssessmentWorker:
                 raise
 
     def stop(self, *, timeout: float = 5.0) -> None:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be finite and positive")
         with self._lifecycle_lock:
             worker = self._thread
             self._stop_requested = True
@@ -343,12 +355,17 @@ class EnergyAssessmentWorker:
             return
         if worker is threading.current_thread():
             raise RuntimeError("energy worker cannot join its own thread")
-        worker.join(timeout)
+        worker.join(float(timeout))
         if worker.is_alive():
             raise RuntimeError("energy worker did not stop before timeout")
         with self._lifecycle_lock:
             if self._thread is worker:
                 self._thread = None
+
+    def stop_for_test(self, *, timeout: float = 5.0) -> None:
+        """Boundedly stop the worker owned by plugin registration."""
+
+        self.stop(timeout=timeout)
 
 
 __all__ = [

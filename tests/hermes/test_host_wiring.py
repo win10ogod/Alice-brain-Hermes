@@ -1247,7 +1247,10 @@ def test_bootstrap_contains_host_binding_prelude_fault_without_rebuilding_access
     assert first is not None
     assert second is not None
     assert all(left is right for left, right in zip(first, second, strict=True))
-    assert context.profile_reads == 0
+    profile_factory = first[1]
+    assert callable(profile_factory)
+    profile_factory()
+    assert context.profile_reads == 1
     assert context.llm_reads == 0
     assert bootstrap.health.degraded is True
     assert bootstrap.health.worker_error == "MemoryError"

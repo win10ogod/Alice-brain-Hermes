@@ -29,6 +29,11 @@ from alice_brain_hermes.errors import (
     SchedulerShutdownError,
 )
 from alice_brain_hermes.ids import new_id, validate_id
+from alice_brain_hermes.protocol.energy import (
+    EnergyAssessmentChoiceV1,
+    EnergyAssessmentLeaseV1,
+    EnergyAssessmentProvenanceV1,
+)
 from alice_brain_hermes.protocol.identity import IdentityChoiceV1, IdentityNamingLeaseV1
 from alice_brain_hermes.protocol.models import (
     BrainProfileV1,
@@ -896,6 +901,53 @@ class HermesDaemonRuntime:
         try:
             brain_id = self.ledger.identity_naming_brain_id(lease_id)
             return self._engine_once(brain_id).fail_identity_naming(
+                lease_id,
+                failure_code,
+            )
+        finally:
+            self._end_operation()
+
+    def claim_energy_assessment(
+        self,
+        brain_id: str,
+    ) -> EnergyAssessmentLeaseV1 | None:
+        """Claim through the brain's single authoritative engine writer."""
+
+        brain_id = validate_id(brain_id)
+        self._begin_operation()
+        try:
+            return self._engine_once(brain_id).claim_energy_assessment()
+        finally:
+            self._end_operation()
+
+    def complete_energy_assessment(
+        self,
+        lease_id: str,
+        choice: EnergyAssessmentChoiceV1,
+        provenance: EnergyAssessmentProvenanceV1,
+    ) -> str:
+        """Route host evidence using only the lease's durable brain identity."""
+
+        lease_id = validate_id(lease_id)
+        self._begin_operation()
+        try:
+            brain_id = self.ledger.energy_assessment_brain_id(lease_id)
+            return self._engine_once(brain_id).complete_energy_assessment(
+                lease_id,
+                choice,
+                provenance,
+            )
+        finally:
+            self._end_operation()
+
+    def fail_energy_assessment(self, lease_id: str, failure_code: str) -> str:
+        """Route one sanitized host failure through its durable energy lease."""
+
+        lease_id = validate_id(lease_id)
+        self._begin_operation()
+        try:
+            brain_id = self.ledger.energy_assessment_brain_id(lease_id)
+            return self._engine_once(brain_id).fail_energy_assessment(
                 lease_id,
                 failure_code,
             )

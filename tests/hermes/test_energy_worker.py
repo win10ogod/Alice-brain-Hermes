@@ -266,3 +266,18 @@ def test_no_pending_lease_never_resolves_host_llm() -> None:
 
     assert worker.run_once() is EnergyRunResult.IDLE
     assert port.claim_count == 1
+
+
+def test_worker_exposes_strict_bounded_lifecycle_for_registration_cleanup() -> None:
+    worker = EnergyAssessmentWorker(
+        lease_port=LeasePort(None),
+        llm_factory=lambda: StructuredLlm(valid_choice()),
+        poll_interval_seconds=0.01,
+    )
+
+    assert worker._worker_alive_strict() is False
+    worker.start()
+    assert worker._worker_alive_strict() is True
+    worker.stop_for_test()
+    assert worker._worker_alive_strict() is False
+    assert worker.terminal_intent_pending is False

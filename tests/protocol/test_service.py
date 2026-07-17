@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from datetime import UTC, datetime
@@ -8,7 +9,9 @@ from pathlib import Path
 import pytest
 
 from alice_brain_hermes.core.events import new_event
+from alice_brain_hermes.core.personality import ENERGY_DIMENSIONS
 from alice_brain_hermes.ids import new_id
+from alice_brain_hermes.protocol.energy import EnergyAssessmentChoiceV1
 from alice_brain_hermes.protocol.identity import IdentityChoiceV1
 from alice_brain_hermes.protocol.models import (
     MAX_BRIDGE_COMMIT_ENVELOPE_BYTES,
@@ -23,7 +26,7 @@ from alice_brain_hermes.protocol.models import (
 )
 from alice_brain_hermes.protocol.service import ProtocolService
 from alice_brain_hermes.runtime.daemon import HermesDaemonRuntime
-from alice_brain_hermes.runtime.store import SQLiteLedger
+from alice_brain_hermes.runtime.store import SQLITE_SCHEMA_VERSION, SQLiteLedger
 
 TOKEN = "a" * 64
 RECOVERY_TOKEN = "ab" * 32
@@ -520,7 +523,7 @@ def test_daemon_status_is_typed_complete_zero_evidence_for_fresh_runtime(
             "gap": 1,
             "frame": 3,
             "semantic": 1,
-            "sqlite": 6,
+            "sqlite": SQLITE_SCHEMA_VERSION,
         },
     }
 
@@ -1056,6 +1059,220 @@ def test_identity_naming_failure_rpc_rejects_unsanitized_codes(service) -> None:
             request(
                 5,
                 "identity.naming.fail",
+                {
+                    "lease_id": lease["lease_id"],
+                    "failure_code": "llm_error.TimeoutError",
+                },
+            )
+        )
+    )
+
+    assert rejected["error"]["code"] == "invalid_params"
+    assert failed["result"] == {"status": "failed"}
+
+
+def _request_energy_for_action(service: ProtocolService, brain_id: str) -> str:
+    action_id = "service-energy-action"
+    engine = service.runtime.engine(brain_id)
+    engine.append(
+        new_event(
+            "action.proposed",
+            brain_id,
+            brain_id,
+            {
+                "action_id": action_id,
+                "intent": {
+                    "kind": "hermes.tool_call",
+                    "tool_name": "shell",
+                    "args": {"command": "pytest -q"},
+                },
+            },
+            action_id=action_id,
+        )
+    )
+    requested = engine.append(
+        new_event(
+            "action.energy_requested",
+            brain_id,
+            brain_id,
+            {
+                "action_id": action_id,
+                "assessment_source": "hermes_host_llm",
+                "prompt_version": "alice-energy-v1",
+            },
+            action_id=action_id,
+        )
+    )
+    assert requested.event_id == engine.state.actions[action_id].energy_request_event_id
+    return action_id
+
+
+def _service_energy_choice() -> EnergyAssessmentChoiceV1:
+    return EnergyAssessmentChoiceV1(
+        deficits={"completion": 0.8},
+        salience=0.9,
+        urgency=0.7,
+        valence=0.2,
+        arousal=0.4,
+        control=0.8,
+        resources=0.6,
+        cost=0.3,
+        personality_relevance=0.75,
+        evidence_basis={
+            dimension: f"Observable host basis for {dimension}."
+            for dimension in ENERGY_DIMENSIONS
+        },
+        unknown_dimensions=(),
+        summary="Host-assessed action energy.",
+    )
+
+
+def test_energy_assessment_rpc_is_strict_lease_bound_and_idempotent(service) -> None:
+    first = service.new_connection()
+    second = service.new_connection()
+    initialize(first)
+    initialize(second)
+    profile = BrainProfileV1(profile_key="hermes.default", name=None).model_dump(
+        mode="json"
+    )
+    brain = decode(
+        first.handle_frame(request(2, "brain.resolve", {"profile": profile}))
+    )["result"]
+    action_id = _request_energy_for_action(service, brain["brain_id"])
+
+    claimed = decode(
+        first.handle_frame(
+            request(
+                3,
+                "energy.assessment.claim",
+                {"brain_id": brain["brain_id"]},
+            )
+        )
+    )["result"]["lease"]
+    assert claimed["brain_id"] == brain["brain_id"]
+    assert claimed["action_id"] == action_id
+    assert (
+        decode(
+            second.handle_frame(
+                request(
+                    2,
+                    "energy.assessment.claim",
+                    {"brain_id": brain["brain_id"]},
+                )
+            )
+        )["result"]["lease"]
+        is None
+    )
+
+    assessment_json = json.dumps(
+        claimed["assessment_input"],
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    provenance = {
+        "schema_version": 1,
+        "agent_id": "default",
+        "audit": {
+            "plugin_id": "alice-brain",
+            "profile": "",
+            "purpose": "alice_energy_assessment",
+            "schema_name": "alice_energy_assessment_v1",
+        },
+        "input_sha256": hashlib.sha256(assessment_json.encode("utf-8")).hexdigest(),
+        "model": "host-model",
+        "prompt_version": "alice-energy-v1",
+        "provider": "host-provider",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "total_tokens": 30,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cost_usd": None,
+        },
+    }
+    choice = _service_energy_choice().model_dump(mode="json")
+    completed = decode(
+        first.handle_frame(
+            request(
+                4,
+                "energy.assessment.complete",
+                {
+                    "lease_id": claimed["lease_id"],
+                    "choice": choice,
+                    "provenance": provenance,
+                },
+            )
+        )
+    )
+    exact_retry = decode(
+        second.handle_frame(
+            request(
+                3,
+                "energy.assessment.complete",
+                {
+                    "lease_id": claimed["lease_id"],
+                    "choice": choice,
+                    "provenance": provenance,
+                },
+            )
+        )
+    )
+    rejected_extra = decode(
+        second.handle_frame(
+            request(
+                4,
+                "energy.assessment.complete",
+                {
+                    "lease_id": claimed["lease_id"],
+                    "choice": {**choice, "extra": True},
+                    "provenance": provenance,
+                },
+            )
+        )
+    )
+
+    assert completed["result"] == {"status": "completed"}
+    assert exact_retry["result"] == {"status": "completed"}
+    assert rejected_extra["error"]["code"] == "invalid_params"
+    vector = service.runtime.engine(brain["brain_id"]).state.energies[action_id]
+    assert vector.salience == 0.9
+    assert vector.provenance["model"] == "host-model"
+
+
+def test_energy_assessment_failure_rpc_rejects_unsanitized_codes(service) -> None:
+    connection = service.new_connection()
+    initialize(connection)
+    brain = decode(connection.handle_frame(request(2, "brain.create", {"name": None})))[
+        "result"
+    ]
+    _request_energy_for_action(service, brain["brain_id"])
+    lease = decode(
+        connection.handle_frame(
+            request(
+                3,
+                "energy.assessment.claim",
+                {"brain_id": brain["brain_id"]},
+            )
+        )
+    )["result"]["lease"]
+
+    rejected = decode(
+        connection.handle_frame(
+            request(
+                4,
+                "energy.assessment.fail",
+                {"lease_id": lease["lease_id"], "failure_code": "bad code\nraw"},
+            )
+        )
+    )
+    failed = decode(
+        connection.handle_frame(
+            request(
+                5,
+                "energy.assessment.fail",
                 {
                     "lease_id": lease["lease_id"],
                     "failure_code": "llm_error.TimeoutError",

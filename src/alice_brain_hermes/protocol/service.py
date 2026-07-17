@@ -36,6 +36,10 @@ from alice_brain_hermes.protocol.diagnostics import (
     IdentitySnapshotV1,
     build_trace_page,
 )
+from alice_brain_hermes.protocol.energy import (
+    EnergyAssessmentChoiceV1,
+    EnergyAssessmentProvenanceV1,
+)
 from alice_brain_hermes.protocol.identity import IdentityChoiceV1
 from alice_brain_hermes.protocol.models import (
     PROTOCOL_VERSION,
@@ -628,6 +632,45 @@ class ProtocolConnection:
                     "invalid_params", "identity failure code is invalid"
                 )
             status = self.service.runtime.fail_identity_naming(
+                lease_id,
+                failure_code,
+            )
+            return {"status": status}
+        if method == "energy.assessment.claim":
+            self._only(params, {"brain_id"})
+            brain_id = validate_id(params.get("brain_id"))  # type: ignore[arg-type]
+            lease = self.service.runtime.claim_energy_assessment(brain_id)
+            return {"lease": (None if lease is None else lease.model_dump(mode="json"))}
+        if method == "energy.assessment.complete":
+            self._only(params, {"lease_id", "choice", "provenance"})
+            lease_id = validate_id(params.get("lease_id"))  # type: ignore[arg-type]
+            choice_data = params.get("choice")
+            provenance_data = params.get("provenance")
+            if not isinstance(choice_data, dict) or not isinstance(
+                provenance_data, dict
+            ):
+                raise ProtocolFault(
+                    "invalid_params", "energy assessment evidence is invalid"
+                )
+            choice = EnergyAssessmentChoiceV1.model_validate(choice_data, strict=True)
+            provenance = EnergyAssessmentProvenanceV1.model_validate(
+                provenance_data, strict=True
+            )
+            status = self.service.runtime.complete_energy_assessment(
+                lease_id,
+                choice,
+                provenance,
+            )
+            return {"status": status}
+        if method == "energy.assessment.fail":
+            self._only(params, {"lease_id", "failure_code"})
+            lease_id = validate_id(params.get("lease_id"))  # type: ignore[arg-type]
+            failure_code = params.get("failure_code")
+            if not isinstance(failure_code, str):
+                raise ProtocolFault(
+                    "invalid_params", "energy assessment failure code is invalid"
+                )
+            status = self.service.runtime.fail_energy_assessment(
                 lease_id,
                 failure_code,
             )
