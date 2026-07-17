@@ -920,7 +920,7 @@ def test_legacy_v1_rate_free_snapshot_is_a_cache_and_can_be_replaced(
                 ),
             )
 
-        assert STATE_SCHEMA_VERSION == 4
+        assert STATE_SCHEMA_VERSION == 5
         assert ledger.load_snapshot(BRAIN) is None
         replayed = ledger.replay(BRAIN)
         assert replayed == full
@@ -937,7 +937,7 @@ def test_legacy_v1_rate_free_snapshot_is_a_cache_and_can_be_replaced(
         assert ledger.load_snapshot(BRAIN) == full
 
 
-def test_v2_snapshot_is_fingerprint_checked_replay_only_and_replaced_by_v4(
+def test_v2_snapshot_is_fingerprint_checked_replay_only_and_replaced_by_v5(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "legacy-v2.db"
@@ -985,8 +985,82 @@ def test_v2_snapshot_is_fingerprint_checked_replay_only_and_replaced_by_v4(
             "WHERE brain_id = ? AND sequence = ?",
             (BRAIN, full.last_sequence),
         ).fetchone()
-        assert row["schema_version"] == 4
+        assert row["schema_version"] == 5
         assert '"working_set"' in row["state_json"]
+
+
+def test_v4_snapshot_with_pre_host_energy_fields_is_replay_only(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-v4-energy.db"
+    with SQLiteLedger.open(database) as ledger:
+        ledger.append(
+            make_event(
+                "action.proposed",
+                {"action_id": "legacy-energy", "intent": {}},
+            )
+        )
+        ledger.append(
+            make_event(
+                "action.energy_assessed",
+                {
+                    "action_id": "legacy-energy",
+                    "salience": 0.5,
+                    "urgency": 0.5,
+                    "valence": 0.0,
+                    "arousal": 0.0,
+                    "control": 0.5,
+                    "resources": 0.5,
+                    "cost": 0.5,
+                    "personality_relevance": 0.5,
+                },
+            )
+        )
+        full = ledger.replay(BRAIN, use_snapshot=False)
+        legacy = full.model_dump(mode="json")
+        legacy["schema_version"] = 4
+        for field in (
+            "energy_assessment_status",
+            "energy_request_event_id",
+            "energy_assessment_event_id",
+            "energy_failure_code",
+        ):
+            legacy["action_records"][0].pop(field)
+        for field in (
+            "assessment_source",
+            "assessment_summary",
+            "provenance",
+        ):
+            legacy["energy_records"][0].pop(field)
+        legacy_json = json.dumps(
+            legacy,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        with ledger._transaction(immediate=True):
+            ledger._connection.execute(
+                "INSERT INTO snapshots("
+                "brain_id, sequence, schema_version, fingerprint, state_json"
+                ") VALUES (?, ?, 4, ?, ?)",
+                (
+                    BRAIN,
+                    full.last_sequence,
+                    hashlib.sha256(legacy_json.encode("utf-8")).hexdigest(),
+                    legacy_json,
+                ),
+            )
+
+    with SQLiteLedger.open(database) as ledger:
+        assert ledger.load_snapshot(BRAIN) is None
+        assert ledger.replay(BRAIN) == full
+        ledger.save_snapshot(full)
+        row = ledger._connection.execute(
+            "SELECT schema_version FROM snapshots WHERE brain_id = ?",
+            (BRAIN,),
+        ).fetchone()
+        assert row["schema_version"] == STATE_SCHEMA_VERSION
 
 
 @pytest.mark.parametrize(

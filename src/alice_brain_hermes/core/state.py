@@ -33,7 +33,7 @@ from alice_brain_hermes.core.workspace import MemoryRecord, WorkspaceState
 from alice_brain_hermes.core.world import WorldModel
 from alice_brain_hermes.ids import validate_id
 
-STATE_SCHEMA_VERSION = 4
+STATE_SCHEMA_VERSION = 5
 
 
 class WorkingSetCounter(BaseModel):
