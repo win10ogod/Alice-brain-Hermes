@@ -1120,6 +1120,15 @@ def test_semantic_domain_capacity_gap_does_not_evict_closed_late_span(
     with ledger:
         engine.commit_bridge_record(instance, old_pre)
         engine.commit_bridge_record(instance, old_post)
+        energy_lease = engine.claim_energy_assessment()
+        assert energy_lease is not None
+        assert (
+            engine.fail_energy_assessment(
+                energy_lease.lease_id,
+                "llm_error.TestFixture",
+            )
+            == "failed"
+        )
         for index in range(MAX_ACTION_RECORDS):
             action_id = f"capacity-{index}"
             engine.append(
