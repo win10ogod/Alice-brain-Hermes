@@ -875,6 +875,71 @@ def test_snapshot_roundtrip_and_snapshot_plus_tail_equals_full_replay(
         assert ledger.replay(BRAIN).logical_clock == 3.75
 
 
+def test_current_checkpoint_validates_only_the_verified_snapshot_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "hermes.db"
+    with SQLiteLedger.open(database) as ledger:
+        for index in range(3):
+            ledger.append(make_event("opaque.event", {"index": index}))
+        base = ledger.replay(BRAIN, use_snapshot=False)
+        ledger.save_snapshot(base)
+
+        for index in range(3, 5):
+            ledger.append(make_event("opaque.event", {"index": index}))
+        candidate = ledger.replay(BRAIN, use_snapshot=False)
+
+        from alice_brain_hermes.runtime import store as store_module
+
+        real_reduce = store_module.reduce_state
+        reduced_sequences: list[int] = []
+
+        def counted_reduce(state: BrainState, event: EventEnvelope) -> BrainState:
+            assert event.sequence is not None
+            reduced_sequences.append(event.sequence)
+            return real_reduce(state, event)
+
+        monkeypatch.setattr(store_module, "reduce_state", counted_reduce)
+
+        assert ledger.checkpoint_current_state(candidate) == candidate
+        assert reduced_sequences == [4, 5]
+        assert ledger.load_snapshot(BRAIN) == candidate
+        assert ledger.replay(BRAIN) == ledger.replay(BRAIN, use_snapshot=False)
+
+
+def test_current_checkpoint_rejects_a_state_behind_the_authoritative_head(
+    tmp_path: Path,
+) -> None:
+    with SQLiteLedger.open(tmp_path / "hermes.db") as ledger:
+        ledger.append(make_event("opaque.event", {"index": 1}))
+        stale = ledger.replay(BRAIN, use_snapshot=False)
+        ledger.append(make_event("opaque.event", {"index": 2}))
+
+        with pytest.raises(SnapshotConflictError, match="current ledger head"):
+            ledger.checkpoint_current_state(stale)
+
+        assert ledger.load_snapshot(BRAIN) is None
+
+
+def test_current_checkpoint_rejects_replay_mismatch_without_writing_cache(
+    tmp_path: Path,
+) -> None:
+    with SQLiteLedger.open(tmp_path / "hermes.db") as ledger:
+        ledger.append(
+            make_event("capabilities.reported", {"capabilities": {"mode": "real"}})
+        )
+        replayed = ledger.replay(BRAIN, use_snapshot=False)
+        substituted = replayed.model_copy(
+            update={"capabilities": {"mode": "substituted"}}
+        )
+
+        with pytest.raises(SnapshotConflictError, match="snapshot-tail replay"):
+            ledger.checkpoint_current_state(substituted)
+
+        assert ledger.load_snapshot(BRAIN) is None
+
+
 def test_legacy_v1_rate_free_snapshot_is_a_cache_and_can_be_replaced(
     tmp_path: Path,
 ) -> None:

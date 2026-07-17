@@ -112,6 +112,28 @@ class RuntimeSchemaVersionsV1(_StrictStatusModel):
     sqlite: int = Field(ge=1)
 
 
+class SnapshotStatusV1(_StrictStatusModel):
+    """Versioned automatic snapshot persistence health."""
+
+    schema_version: Literal[1] = 1
+    status: Literal["healthy", "degraded"]
+    worker_running: bool
+    interval_events: int = Field(ge=1)
+    pending_brain_count: int = Field(ge=0)
+    snapshot_count: int = Field(ge=0)
+    latest_sequence: int = Field(ge=0)
+    last_error_type: str | None = Field(default=None, max_length=160)
+
+    @model_validator(mode="after")
+    def _status_matches_evidence(self) -> SnapshotStatusV1:
+        healthy = self.worker_running and self.last_error_type is None
+        if (self.status == "healthy") is not healthy:
+            raise ValueError("snapshot status label does not match its error evidence")
+        if self.snapshot_count == 0 and self.latest_sequence != 0:
+            raise ValueError("empty snapshot persistence has a non-zero sequence")
+        return self
+
+
 class DaemonRuntimeStatusV1(_StrictStatusModel):
     """One white-box status projection; no field is inferred from trust."""
 
@@ -187,4 +209,5 @@ __all__ = [
     "RuntimeSchemaVersionsV1",
     "SchedulerHealthSummaryV1",
     "SemanticEvidenceSummaryV1",
+    "SnapshotStatusV1",
 ]

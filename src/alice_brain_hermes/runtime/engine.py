@@ -7,7 +7,7 @@ import os
 import re
 import sqlite3
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -16,7 +16,13 @@ from alice_brain_hermes.core.events import EventEnvelope, new_event
 from alice_brain_hermes.core.reducer import reduce_state
 from alice_brain_hermes.core.state import BrainState
 from alice_brain_hermes.core.workspace import WorkspaceCoordinator
-from alice_brain_hermes.errors import EventConflictError, ExpectedSequenceError
+from alice_brain_hermes.errors import (
+    EventConflictError,
+    ExpectedSequenceError,
+    LedgerIntegrityError,
+    SchemaVersionError,
+    SnapshotConflictError,
+)
 from alice_brain_hermes.ids import validate_id
 from alice_brain_hermes.protocol.energy import (
     EnergyAssessmentChoiceV1,
@@ -54,6 +60,8 @@ class EventLedger(Protocol):
     ) -> tuple[EventEnvelope | None, int]: ...
 
     def replay(self, brain_id: str) -> BrainState: ...
+
+    def checkpoint_current_state(self, state: BrainState) -> BrainState: ...
 
     def commit_bridge_record(
         self,
@@ -172,12 +180,14 @@ class ConsciousEngine:
         actor_id: str,
         cognition: LocalCognitionPort | None = None,
         coordinator: Coordinator | None = None,
+        on_state_published: Callable[[str, int], None] | None = None,
     ) -> None:
         self.ledger = ledger
         self.brain_id = validate_id(brain_id)
         self.actor_id = validate_id(actor_id)
         self.cognition = cognition or LocalCognitionPort()
         self.coordinator = coordinator
+        self._on_state_published = on_state_published
         self._default_coordinator = WorkspaceCoordinator()
         self._creator_pid = os.getpid()
         self._lock = threading.RLock()
@@ -271,8 +281,34 @@ class ConsciousEngine:
                     f"provisionally validated sequence {provisional.sequence}; "
                     "restart from ledger replay is required"
                 )
-            self._state = successor
+            self._publish_state(successor)
             return stored
+
+    def _publish_state(self, successor: BrainState) -> None:
+        self._state = successor
+        if self._on_state_published is not None:
+            self._on_state_published(self.brain_id, successor.last_sequence)
+
+    def checkpoint_current_state(self) -> BrainState:
+        """Persist a cache only while this engine still owns the exact DB head."""
+        self._assert_creator_process()
+        with self._lock:
+            if self._diverged:
+                raise EventConflictError(
+                    "engine sequence divergence requires a replayed restart"
+                )
+            try:
+                return self.ledger.checkpoint_current_state(self._state)
+            except (LedgerIntegrityError, SchemaVersionError, SnapshotConflictError):
+                self._diverged = True
+                raise
+            except (OSError, sqlite3.OperationalError):
+                raise
+            except Exception as error:
+                self._diverged = True
+                raise LedgerIntegrityError(
+                    "unexpected current-head checkpoint validation failure"
+                ) from error
 
     def commit_bridge_record(
         self,
@@ -314,7 +350,7 @@ class ConsciousEngine:
                     raise EventConflictError(
                         "bridge publication does not match committed sequence"
                     )
-                self._state = result.successor
+                self._publish_state(result.successor)
             return result.ack
 
     def abandon_bridge_stream(
@@ -346,7 +382,7 @@ class ConsciousEngine:
                 self._diverged = True
                 raise
             if result.successor is not None:
-                self._state = result.successor
+                self._publish_state(result.successor)
             return result.stream
 
     def project_bridge_frame(
@@ -407,7 +443,7 @@ class ConsciousEngine:
                 self._diverged = True
                 raise
             if result.successor is not None:
-                self._state = result.successor
+                self._publish_state(result.successor)
             return result.lease
 
     def complete_identity_naming(
@@ -442,7 +478,7 @@ class ConsciousEngine:
                 self._diverged = True
                 raise
             if result.successor is not None:
-                self._state = result.successor
+                self._publish_state(result.successor)
             return result.status
 
     def fail_identity_naming(
@@ -477,7 +513,7 @@ class ConsciousEngine:
                 self._diverged = True
                 raise
             if result.successor is not None:
-                self._state = result.successor
+                self._publish_state(result.successor)
             return result.status
 
     def claim_energy_assessment(

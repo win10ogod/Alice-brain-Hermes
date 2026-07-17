@@ -41,6 +41,7 @@ from alice_brain_hermes.protocol.status import (
     RuntimeSchemaVersionsV1,
     SchedulerHealthSummaryV1,
     SemanticEvidenceSummaryV1,
+    SnapshotStatusV1,
 )
 from alice_brain_hermes.runtime.discovery import (
     CredentialFile,
@@ -53,6 +54,11 @@ from alice_brain_hermes.runtime.discovery import (
 from alice_brain_hermes.runtime.engine import ConsciousEngine
 from alice_brain_hermes.runtime.lease import RuntimeLease
 from alice_brain_hermes.runtime.scheduler import ContinuousScheduler
+from alice_brain_hermes.runtime.snapshot import (
+    DEFAULT_SNAPSHOT_INTERVAL_EVENTS,
+    SnapshotWorker,
+    validate_snapshot_interval,
+)
 from alice_brain_hermes.runtime.store import SQLiteLedger
 
 LedgerFactory = Callable[[Path], SQLiteLedger]
@@ -243,6 +249,7 @@ class HermesDaemonRuntime:
         *,
         scheduler_interval_seconds: float,
         scheduler_factory: SchedulerFactory,
+        snapshot_interval_events: int,
     ) -> None:
         self.runtime_home = runtime_home
         self.lease = lease
@@ -274,6 +281,12 @@ class HermesDaemonRuntime:
         self._discovery_cleaned = False
         self._credential_cleaned = False
         self._lease_released = False
+        self.snapshot_worker = SnapshotWorker(
+            ledger,
+            interval_events=snapshot_interval_events,
+            fatal_error_sink=self._mark_fail_stopped,
+        )
+        self._snapshot_worker_stopped = False
 
     @classmethod
     def open(
@@ -283,12 +296,16 @@ class HermesDaemonRuntime:
         ledger_factory: LedgerFactory | None = None,
         scheduler_factory: SchedulerFactory = ContinuousScheduler,
         scheduler_interval_seconds: float = 1.0,
+        snapshot_interval_events: int = DEFAULT_SNAPSHOT_INTERVAL_EVENTS,
         launch_nonce: str | None = None,
     ) -> Self:
         """Acquire the process lease before constructing any SQLite handle."""
         scheduler_interval_seconds = _positive_seconds(
             scheduler_interval_seconds,
             name="scheduler_interval_seconds",
+        )
+        snapshot_interval_events = validate_snapshot_interval(
+            snapshot_interval_events
         )
         home = Path(runtime_home).expanduser().absolute()
         lease = RuntimeLease.acquire(home, launch_nonce=launch_nonce)
@@ -327,6 +344,7 @@ class HermesDaemonRuntime:
                 ledger,
                 scheduler_interval_seconds=scheduler_interval_seconds,
                 scheduler_factory=scheduler_factory,
+                snapshot_interval_events=snapshot_interval_events,
             )
             startup_owner.transfer_to_runtime(ledger)
             lease.assert_authority()
@@ -336,6 +354,7 @@ class HermesDaemonRuntime:
             # expensive.  Reset prior-process streams only after those steps so
             # the first maintenance pass grants a full, fresh restart grace.
             ledger.recover_stale_bridge_connections()
+            runtime.snapshot_worker.start()
             return runtime
         except BaseException as primary_error:
             traceback = primary_error.__traceback__
@@ -608,6 +627,7 @@ class HermesDaemonRuntime:
                 self.ledger,
                 brain_id,
                 actor_id=brain_id,
+                on_state_published=self.snapshot_worker.notify,
             )
             scheduler = self._scheduler_factory(
                 engine,
@@ -627,6 +647,10 @@ class HermesDaemonRuntime:
                     del self._pending_foundations[brain_id]
                 self._engines[brain_id] = engine
                 self._schedulers[brain_id] = scheduler
+            self.snapshot_worker.register(
+                engine,
+                known_snapshot_sequence=0 if owned_cell is not None else None,
+            )
             cell.set_result(engine)
             return engine
         except BaseException as error:
@@ -1051,6 +1075,25 @@ class HermesDaemonRuntime:
         finally:
             self._end_operation()
 
+    def snapshot_status(self) -> SnapshotStatusV1:
+        """Return persisted snapshot coverage and volatile worker health."""
+
+        self._begin_operation()
+        try:
+            persisted = self.ledger.snapshot_observability()
+            worker = self.snapshot_worker.health
+            return SnapshotStatusV1(
+                status=worker.status,
+                worker_running=worker.running,
+                interval_events=self.snapshot_worker.interval_events,
+                pending_brain_count=worker.pending_brain_count,
+                snapshot_count=persisted.snapshot_count,
+                latest_sequence=persisted.latest_sequence,
+                last_error_type=worker.last_error_type,
+            )
+        finally:
+            self._end_operation()
+
     @property
     def closed(self) -> bool:
         self._assert_creator_process()
@@ -1092,6 +1135,9 @@ class HermesDaemonRuntime:
                 if not self._schedulers_stopped:
                     self._stop_all_schedulers()
                     self._schedulers_stopped = True
+                if not self._snapshot_worker_stopped:
+                    self.snapshot_worker.stop()
+                    self._snapshot_worker_stopped = True
                 if not self._ledger_closed:
                     self.ledger.close()
                     self._ledger_closed = True

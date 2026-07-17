@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,6 +30,8 @@ from alice_brain_hermes.protocol.models import (
     validate_observation,
 )
 from alice_brain_hermes.runtime.engine import ConsciousEngine
+from alice_brain_hermes.runtime.scheduler import ContinuousScheduler
+from alice_brain_hermes.runtime.snapshot import SnapshotWorker
 from alice_brain_hermes.runtime.store import SQLiteLedger
 from tests.protocol.test_models import HOOK_CASES
 
@@ -385,6 +388,69 @@ def test_atomic_bridge_commit_persists_typed_event_frame_cursor_and_ack(
 
         with pytest.raises(TypeError):
             ack.frame.capture_coverage["capture_coverage"] = "full"
+
+
+def test_bridge_commit_snapshot_and_scheduler_serialize_without_deadlock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    brain_id = new_id()
+    instance = new_id()
+    with SQLiteLedger.open(tmp_path / "runtime.db") as ledger:
+        ledger.ensure_brain(brain_id)
+        worker = SnapshotWorker(ledger, interval_events=2)
+        engine = ConsciousEngine(
+            ledger,
+            brain_id,
+            actor_id=brain_id,
+            on_state_published=worker.notify,
+        )
+        worker.register(engine, known_snapshot_sequence=0)
+        ledger.attach_bridge_stream(
+            instance,
+            brain_id=brain_id,
+            server_actor_id=brain_id,
+            server_adapter_id="alice-brain-hermes-observer-v1",
+            connected_nonce="daemon-nonce",
+            recovery_token=RECOVERY_TOKEN,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        scheduler_done = threading.Event()
+        real_checkpoint = ledger.checkpoint_current_state
+
+        def blocking_checkpoint(state):
+            entered.set()
+            assert release.wait(2.0)
+            return real_checkpoint(state)
+
+        monkeypatch.setattr(ledger, "checkpoint_current_state", blocking_checkpoint)
+        worker.start()
+        try:
+            ack = engine.commit_bridge_record(instance, observation(instance, 1))
+            assert ack.last_event_sequence == 2
+            assert entered.wait(2.0)
+
+            scheduler = ContinuousScheduler(
+                engine,
+                interval_seconds=60.0,
+                monotonic=lambda: 1.0,
+            )
+            scheduler_thread = threading.Thread(
+                target=lambda: (scheduler.step(), scheduler_done.set())
+            )
+            scheduler_thread.start()
+            assert scheduler_done.wait(0.05) is False
+
+            release.set()
+            scheduler_thread.join(2.0)
+            assert scheduler_done.is_set()
+            worker.wait_idle(timeout=2.0)
+            assert engine.state == ledger.replay(brain_id, use_snapshot=False)
+            assert ledger.load_snapshot(brain_id) == engine.state
+        finally:
+            release.set()
+            worker.stop(timeout=2.0)
 
 
 def test_public_frame_projection_reports_every_omitted_state_collection(

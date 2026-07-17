@@ -52,7 +52,7 @@ from alice_brain_hermes.runtime.daemon import HermesDaemonRuntime
 _BRIDGE_RECORD_ADAPTER = TypeAdapter(BridgeRecordV1)
 _ALLOWED_REQUEST_KEYS = {"jsonrpc", "id", "method", "params", "auth"}
 _PRE_SERVE_READ_METHODS = frozenset(
-    {"daemon.status", "identity.get", "trace.list", "state.get"}
+    {"daemon.status", "snapshot.status", "identity.get", "trace.list", "state.get"}
 )
 
 
@@ -536,6 +536,9 @@ class ProtocolConnection:
         if method == "daemon.status":
             self._only(params, set())
             return self.service.runtime.status_snapshot().model_dump(mode="json")
+        if method == "snapshot.status":
+            self._only(params, set())
+            return self.service.runtime.snapshot_status().model_dump(mode="json")
         if method == "identity.get":
             self._only(params, {"brain_id"})
             brain_id = self._selected_brain_id(params.get("brain_id"))

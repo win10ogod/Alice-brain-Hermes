@@ -26,7 +26,7 @@ from alice_brain_hermes.protocol.diagnostics import (
     TracePageV1,
 )
 from alice_brain_hermes.protocol.models import PROTOCOL_VERSION, DaemonDiscoveryV2
-from alice_brain_hermes.protocol.status import DaemonRuntimeStatusV1
+from alice_brain_hermes.protocol.status import DaemonRuntimeStatusV1, SnapshotStatusV1
 from alice_brain_hermes.runtime.discovery import (
     _private_home,
     load_discovery_and_credential,
@@ -367,7 +367,12 @@ def _live_status(
     home: Path,
     *,
     timeout_seconds: float,
-) -> tuple[DaemonDiscoveryV2, dict[str, object], dict[str, object]]:
+) -> tuple[
+    DaemonDiscoveryV2,
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
     _load_discovery(home)
     try:
         client = DaemonClient.connect(home, timeout_seconds=timeout_seconds)
@@ -387,8 +392,17 @@ def _live_status(
     try:
         health = client.health()
         runtime = client.call("daemon.status", {})
+        snapshot = client.call("snapshot.status", {})
         _validate_status_payloads(health, runtime)
-        return client.discovery, health, runtime
+        encoded = json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        typed_snapshot = SnapshotStatusV1.model_validate_json(encoded, strict=True)
+        return client.discovery, health, runtime, typed_snapshot.model_dump(mode="json")
     except DaemonRpcError as error:
         raise _CliFailure(
             error.code,
@@ -401,6 +415,12 @@ def _live_status(
             "daemon_unreachable",
             "daemon stopped responding during status inspection",
             exit_code=3,
+        ) from error
+    except (ValidationError, TypeError, ValueError) as error:
+        raise _CliFailure(
+            "daemon_status_invalid",
+            "daemon returned an invalid status payload",
+            exit_code=5,
         ) from error
     finally:
         with suppress(BaseException):
@@ -494,7 +514,7 @@ def _status(home: Path, *, timeout_seconds: float) -> dict[str, object]:
     _validate_existing_home(home)
     if not _discovery_exists(home):
         return _stopped_status(home)
-    discovery, health, runtime = _live_status(
+    discovery, health, runtime, snapshot = _live_status(
         home,
         timeout_seconds=timeout_seconds,
     )
@@ -535,6 +555,7 @@ def _status(home: Path, *, timeout_seconds: float) -> dict[str, object]:
         "cognition_mode": runtime["cognition_mode"],
         "continuous_runtime": runtime["continuous_runtime"],
         "scheduler_health": runtime["scheduler_health"],
+        "snapshot_health": snapshot,
         "bridge_connection": runtime["bridge_connection"],
         "trace_complete": runtime["trace_complete"],
         "semantic_complete": runtime["semantic_complete"],
@@ -704,7 +725,7 @@ def _start_coordinated(home: Path, *, timeout_seconds: float) -> dict[str, objec
         _validate_existing_home(home)
         if _discovery_exists(home):
             try:
-                discovery, _health, _runtime = _live_status(
+                discovery, _health, _runtime, _snapshot = _live_status(
                     home,
                     timeout_seconds=timeout_seconds,
                 )
@@ -757,7 +778,7 @@ def _await_started_daemon(
         remaining = deadline - time.monotonic()
         if _discovery_exists(home):
             try:
-                discovery, health, runtime = _live_status(
+                discovery, health, runtime, _snapshot = _live_status(
                     home,
                     timeout_seconds=max(0.01, min(remaining, 0.25)),
                 )
@@ -790,7 +811,7 @@ def _await_started_daemon(
             adapter.remove_meta_hint(hint)
             if _discovery_exists(home):
                 try:
-                    discovery, _health, _runtime = _live_status(
+                    discovery, _health, _runtime, _snapshot = _live_status(
                         home,
                         timeout_seconds=max(0.01, min(remaining, 0.25)),
                     )
@@ -1080,6 +1101,9 @@ def _doctor(home: Path, *, timeout_seconds: float) -> tuple[dict[str, object], i
                         and daemon.get("degraded_brain_count") == 0
                         and isinstance(daemon.get("scheduler_health"), dict)
                         and daemon["scheduler_health"].get("status") == "healthy"
+                        and isinstance(daemon.get("snapshot_health"), dict)
+                        and daemon["snapshot_health"].get("status") == "healthy"
+                        and daemon["snapshot_health"].get("worker_running") is True
                     )
                     checks.append(
                         {
@@ -1101,6 +1125,7 @@ def _doctor(home: Path, *, timeout_seconds: float) -> tuple[dict[str, object], i
                         "cognition_mode",
                         "dropped_events",
                         "scheduler_health",
+                        "snapshot_health",
                         "semantic_complete",
                         "trace_complete",
                         "unobserved_hermes_fields",
@@ -1122,6 +1147,13 @@ def _doctor(home: Path, *, timeout_seconds: float) -> tuple[dict[str, object], i
                             or bridge.get("state") == "degraded"
                         ):
                             failed_evidence.append("bridge_connection")
+                        snapshot = daemon.get("snapshot_health")
+                        if (
+                            not isinstance(snapshot, dict)
+                            or snapshot.get("status") != "healthy"
+                            or snapshot.get("worker_running") is not True
+                        ):
+                            failed_evidence.append("snapshot_health")
                     observable = not missing and not failed_evidence
                     checks.append(
                         {

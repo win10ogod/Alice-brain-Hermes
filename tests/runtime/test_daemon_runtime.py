@@ -89,6 +89,19 @@ def test_invalid_scheduler_interval_fails_before_runtime_home_mutation(
     assert not home.exists()
 
 
+@pytest.mark.parametrize("interval", [0, -1, True, 1.0])
+def test_invalid_snapshot_interval_fails_before_runtime_home_mutation(
+    tmp_path: Path,
+    interval: object,
+) -> None:
+    home = tmp_path / "runtime"
+
+    with pytest.raises(ValueError, match="snapshot interval_events"):
+        HermesDaemonRuntime.open(home, snapshot_interval_events=interval)  # type: ignore[arg-type]
+
+    assert not home.exists()
+
+
 @pytest.mark.parametrize("grace", [0.0, -1.0, float("nan"), float("inf"), True])
 def test_invalid_abandonment_grace_fails_before_runtime_home_mutation(
     tmp_path: Path,
@@ -2344,6 +2357,225 @@ def test_close_waits_for_inflight_engine_publication_before_snapshot(
     assert close_done.is_set()
     assert scheduler_stopped.is_set()
     assert runtime.closed is True
+
+
+def test_runtime_startup_checkpoints_existing_long_history_without_snapshot(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    brain_id = new_id()
+    database = home / "runtime.db"
+    with SQLiteLedger.open(database) as ledger:
+        for index in range(3_915):
+            ledger.append(
+                new_event("opaque.event", brain_id, brain_id, {"index": index})
+            )
+        assert ledger.load_snapshot(brain_id) is None
+
+    runtime = HermesDaemonRuntime.open(
+        home,
+        scheduler_interval_seconds=60.0,
+        snapshot_interval_events=1_024,
+    )
+    try:
+        runtime.snapshot_worker.wait_idle(timeout=5.0)
+        snapshot = runtime.ledger.load_snapshot(brain_id)
+        assert snapshot is not None
+        assert snapshot.last_sequence == 3_915
+        assert runtime.engine(brain_id).state == runtime.ledger.replay(
+            brain_id, use_snapshot=False
+        )
+    finally:
+        runtime.close()
+
+
+def test_snapshot_status_uses_persisted_count_and_latest_sequence_across_restart(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    runtime = HermesDaemonRuntime.open(
+        home,
+        scheduler_interval_seconds=60.0,
+        snapshot_interval_events=2,
+    )
+    engine = runtime.create_brain(name=None)
+    engine.append(new_event("opaque.event", engine.brain_id, engine.brain_id, {}))
+    runtime.snapshot_worker.wait_idle(timeout=2.0)
+    assert runtime.snapshot_status().model_dump(mode="json") == {
+        "schema_version": 1,
+        "status": "healthy",
+        "worker_running": True,
+        "interval_events": 2,
+        "pending_brain_count": 0,
+        "snapshot_count": 1,
+        "latest_sequence": 2,
+        "last_error_type": None,
+    }
+    runtime.close()
+
+    restarted = HermesDaemonRuntime.open(
+        home,
+        scheduler_interval_seconds=60.0,
+        snapshot_interval_events=2,
+    )
+    try:
+        restarted.snapshot_worker.wait_idle(timeout=2.0)
+        status = restarted.snapshot_status()
+        assert status.snapshot_count == 1
+        assert status.latest_sequence == 2
+    finally:
+        restarted.close()
+
+
+def test_snapshot_status_reports_soft_io_failure_without_runtime_fail_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    runtime = HermesDaemonRuntime.open(
+        home,
+        scheduler_interval_seconds=60.0,
+        snapshot_interval_events=2,
+    )
+    engine = runtime.create_brain(name=None)
+
+    def fail_checkpoint(_state):
+        raise OSError("injected snapshot I/O failure")
+
+    monkeypatch.setattr(
+        runtime.ledger,
+        "checkpoint_current_state",
+        fail_checkpoint,
+    )
+    try:
+        engine.append(
+            new_event("opaque.event", engine.brain_id, engine.brain_id, {})
+        )
+        runtime.snapshot_worker.wait_idle(timeout=2.0)
+        status = runtime.snapshot_status()
+        assert status.status == "degraded"
+        assert status.snapshot_count == 0
+        assert status.latest_sequence == 0
+        assert status.last_error_type == "OSError"
+        assert runtime.fail_stopped is False
+    finally:
+        runtime.close()
+
+
+def test_runtime_stops_schedulers_then_snapshot_worker_then_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
+    calls: list[str] = []
+    real_scheduler_stop = runtime._stop_all_schedulers
+    real_snapshot_stop = runtime.snapshot_worker.stop
+    real_ledger_close = runtime.ledger.close
+
+    def stop_schedulers() -> None:
+        calls.append("schedulers")
+        real_scheduler_stop()
+
+    def stop_snapshots(*, timeout: float = 5.0) -> None:
+        calls.append("snapshots")
+        real_snapshot_stop(timeout=timeout)
+
+    def close_ledger() -> None:
+        calls.append("ledger")
+        real_ledger_close()
+
+    monkeypatch.setattr(runtime, "_stop_all_schedulers", stop_schedulers)
+    monkeypatch.setattr(runtime.snapshot_worker, "stop", stop_snapshots)
+    monkeypatch.setattr(runtime.ledger, "close", close_ledger)
+
+    runtime.close()
+
+    assert calls == ["schedulers", "snapshots", "ledger"]
+
+
+def test_runtime_close_drains_inflight_snapshot_before_closing_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    runtime = HermesDaemonRuntime.open(
+        home,
+        scheduler_interval_seconds=60.0,
+        snapshot_interval_events=2,
+    )
+    engine = runtime.create_brain(name=None)
+    entered = threading.Event()
+    release = threading.Event()
+    close_errors: list[BaseException] = []
+    real_checkpoint = runtime.ledger.checkpoint_current_state
+
+    def blocking_checkpoint(state):
+        entered.set()
+        assert release.wait(2.0)
+        return real_checkpoint(state)
+
+    monkeypatch.setattr(
+        runtime.ledger,
+        "checkpoint_current_state",
+        blocking_checkpoint,
+    )
+    engine.append(new_event("opaque.event", engine.brain_id, engine.brain_id, {}))
+    assert entered.wait(2.0)
+
+    def close_runtime() -> None:
+        try:
+            runtime.close()
+        except BaseException as error:
+            close_errors.append(error)
+
+    closer = threading.Thread(target=close_runtime)
+    closer.start()
+    closer.join(0.05)
+    assert closer.is_alive()
+    assert runtime._ledger_closed is False
+
+    release.set()
+    closer.join(2.0)
+    assert closer.is_alive() is False
+    assert close_errors == []
+    assert runtime.closed is True
+
+
+def test_snapshot_worker_shutdown_failure_retains_ledger_and_lease_until_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    runtime = HermesDaemonRuntime.open(home, scheduler_interval_seconds=60.0)
+    real_stop = runtime.snapshot_worker.stop
+    stop_calls = 0
+
+    def fail_once(*, timeout: float = 5.0) -> None:
+        nonlocal stop_calls
+        stop_calls += 1
+        if stop_calls == 1:
+            raise SchedulerShutdownError("snapshot writer still alive")
+        real_stop(timeout=timeout)
+
+    monkeypatch.setattr(runtime.snapshot_worker, "stop", fail_once)
+
+    with pytest.raises(SchedulerShutdownError, match="snapshot writer still alive"):
+        runtime.close()
+    assert runtime.ledger.list_brain_ids() == []
+    with pytest.raises(RuntimeOwnedError):
+        RuntimeLease.acquire(home)
+
+    runtime.close()
+    assert runtime.closed is True
+    with RuntimeLease.acquire(home):
+        pass
 
 
 def test_stable_profile_resolve_is_atomic_concurrent_and_restart_safe(

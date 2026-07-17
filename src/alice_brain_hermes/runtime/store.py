@@ -507,6 +507,12 @@ class BrainResolveResult:
     foundation: EventEnvelope | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SnapshotObservability:
+    snapshot_count: int
+    latest_sequence: int
+
+
 IdentityNamingTerminalStatus = Literal["completed", "failed", "superseded"]
 
 
@@ -7392,6 +7398,103 @@ class SQLiteLedger:
             )
             return state
 
+    def checkpoint_current_state(self, state: BrainState) -> BrainState:
+        """Checkpoint the exact current head from the latest verified cache tail."""
+        if not isinstance(state, BrainState):
+            raise TypeError(
+                "checkpoint_current_state accepts only BrainState instances"
+            )
+        try:
+            state = state.revalidated()
+        except Exception as error:
+            raise SnapshotConflictError("checkpoint state is invalid") from error
+        with self._transaction(immediate=True):
+            self._validate_snapshot_schemas_in_transaction(state.brain_id)
+            head = self._authoritative_brain_head_in_transaction(state.brain_id)
+            if head is None:
+                raise KeyError(state.brain_id)
+            if head != state.last_sequence:
+                raise SnapshotConflictError(
+                    f"checkpoint sequence {state.last_sequence} does not match "
+                    f"current ledger head {head}"
+                )
+
+            latest = self._connection.execute(
+                "SELECT sequence, schema_version, fingerprint, state_json "
+                "FROM snapshots WHERE brain_id = ? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (state.brain_id,),
+            ).fetchone()
+            base_row = self._connection.execute(
+                "SELECT sequence, schema_version, fingerprint, state_json "
+                "FROM snapshots WHERE brain_id = ? AND schema_version = ? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (state.brain_id, STATE_SCHEMA_VERSION),
+            ).fetchone()
+            expected = (
+                BrainState.genesis(state.brain_id)
+                if base_row is None
+                else self._decode_snapshot(base_row, state.brain_id)
+            )
+            cursor = self._connection.execute(
+                "SELECT event_id, brain_id, sequence, body_fingerprint, "
+                "envelope_fingerprint, envelope_json FROM events "
+                "WHERE brain_id = ? AND sequence > ? AND sequence <= ? "
+                "ORDER BY sequence ASC",
+                (state.brain_id, expected.last_sequence, state.last_sequence),
+            )
+            while rows := cursor.fetchmany(512):
+                for row in rows:
+                    try:
+                        event = self._decode_event(row)
+                        expected = reduce_state(expected, event)
+                    except (LedgerIntegrityError, SchemaVersionError):
+                        raise
+                    except Exception as error:
+                        raise LedgerIntegrityError(
+                            "snapshot-tail replay violated deterministic state"
+                        ) from error
+            if expected.canonical_json() != state.canonical_json():
+                raise SnapshotConflictError(
+                    "checkpoint does not equal deterministic snapshot-tail replay"
+                )
+
+            state_json = state.canonical_json()
+            fingerprint = self._snapshot_fingerprint(state_json)
+            if latest is not None and latest["sequence"] == state.last_sequence:
+                if latest["schema_version"] == STATE_SCHEMA_VERSION:
+                    persisted = self._decode_snapshot(latest, state.brain_id)
+                    if persisted.canonical_json() != state_json:
+                        raise SnapshotConflictError(
+                            "snapshot sequence already has a different state"
+                        )
+                    return persisted
+                self._connection.execute(
+                    "UPDATE snapshots SET schema_version = ?, fingerprint = ?, "
+                    "state_json = ? WHERE brain_id = ? AND sequence = ?",
+                    (
+                        STATE_SCHEMA_VERSION,
+                        fingerprint,
+                        state_json,
+                        state.brain_id,
+                        state.last_sequence,
+                    ),
+                )
+                return state
+            self._connection.execute(
+                "INSERT INTO snapshots("
+                "brain_id, sequence, schema_version, fingerprint, state_json"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    state.brain_id,
+                    state.last_sequence,
+                    STATE_SCHEMA_VERSION,
+                    fingerprint,
+                    state_json,
+                ),
+            )
+            return state
+
     @staticmethod
     def _decode_snapshot(row: sqlite3.Row, brain_id: str) -> BrainState:
         if row["schema_version"] != STATE_SCHEMA_VERSION:
@@ -7428,6 +7531,33 @@ class SQLiteLedger:
         with self._transaction(immediate=False):
             self._validate_snapshot_schemas_in_transaction(brain_id)
             return self._load_snapshot_in_transaction(brain_id)
+
+    def snapshot_observability(self) -> SnapshotObservability:
+        """Return exact persisted snapshot counts without decoding state payloads."""
+        with self._transaction(immediate=False):
+            schemas = self._connection.execute(
+                "SELECT DISTINCT schema_version FROM snapshots"
+            ).fetchall()
+            for row in schemas:
+                if row["schema_version"] not in {
+                    *_LEGACY_STATE_SCHEMA_VERSIONS,
+                    STATE_SCHEMA_VERSION,
+                }:
+                    raise SchemaVersionError(
+                        f"unsupported snapshot schema {row['schema_version']!r}"
+                    )
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS snapshot_count, "
+                "COALESCE(MAX(sequence), 0) AS latest_sequence FROM snapshots"
+            ).fetchone()
+            snapshot_count = int(row["snapshot_count"])
+            latest_sequence = int(row["latest_sequence"])
+            if snapshot_count < 0 or latest_sequence < 0:
+                raise LedgerIntegrityError("snapshot observability is invalid")
+            return SnapshotObservability(
+                snapshot_count=snapshot_count,
+                latest_sequence=latest_sequence,
+            )
 
     def replay(self, brain_id: str, *, use_snapshot: bool = True) -> BrainState:
         """Replay a consistent, untruncated ledger view into frozen state."""
@@ -7495,4 +7625,9 @@ class SQLiteLedger:
         self.close()
 
 
-__all__ = ["MAX_PAGE_SIZE", "SQLITE_SCHEMA_VERSION", "SQLiteLedger"]
+__all__ = [
+    "MAX_PAGE_SIZE",
+    "SQLITE_SCHEMA_VERSION",
+    "SQLiteLedger",
+    "SnapshotObservability",
+]

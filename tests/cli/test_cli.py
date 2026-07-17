@@ -400,6 +400,16 @@ def test_start_is_idempotent_status_is_live_and_stop_is_authenticated(
         assert status_data["daemon"]["runtime_mode"] == "continuous_daemon"
         assert status_data["daemon"]["cognition_mode"] == "local"
         assert status_data["daemon"]["scheduler_health"]["status"] == "healthy"
+        assert status_data["daemon"]["snapshot_health"] == {
+            "schema_version": 1,
+            "status": "healthy",
+            "worker_running": True,
+            "interval_events": 1_024,
+            "pending_brain_count": 0,
+            "snapshot_count": 0,
+            "latest_sequence": 0,
+            "last_error_type": None,
+        }
         assert status_data["daemon"]["bridge_connection"]["state"] == (
             "never_connected"
         )
@@ -605,7 +615,12 @@ def test_start_requires_authenticated_exact_v2_identity(
     monkeypatch.setattr(
         cli,
         "_live_status",
-        lambda *_args, **_kwargs: (discovery, health, {"runtime_ready": True}),
+        lambda *_args, **_kwargs: (
+            discovery,
+            health,
+            {"runtime_ready": True},
+            {},
+        ),
     )
 
     class Process:
@@ -1160,6 +1175,15 @@ def test_doctor_never_claims_green_without_bridge_and_trace_evidence(
             },
             "bridge_connection",
         ),
+        (
+            {
+                "snapshot_health": {
+                    "status": "degraded",
+                    "worker_running": True,
+                }
+            },
+            "snapshot_health",
+        ),
     ],
 )
 def test_doctor_fails_visible_persisted_integration_gaps(
@@ -1178,6 +1202,10 @@ def test_doctor_fails_visible_persisted_integration_gaps(
         "degraded_brain_count": 0,
         "instance_nonce": "nonce",
         "scheduler_health": {"status": "healthy"},
+        "snapshot_health": {
+            "status": "healthy",
+            "worker_running": True,
+        },
         "bridge_connection": {
             "state": "never_connected",
             "total_bridges": 0,

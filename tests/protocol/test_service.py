@@ -525,6 +525,26 @@ def test_daemon_status_is_typed_complete_zero_evidence_for_fresh_runtime(
     }
 
 
+def test_snapshot_status_is_versioned_and_complete_for_fresh_runtime(
+    service,
+) -> None:
+    connection = service.new_connection()
+    assert "result" in initialize(connection)
+
+    result = decode(connection.handle_frame(request(3, "snapshot.status")))["result"]
+
+    assert result == {
+        "schema_version": 1,
+        "status": "healthy",
+        "worker_running": True,
+        "interval_events": 1_024,
+        "pending_brain_count": 0,
+        "snapshot_count": 0,
+        "latest_sequence": 0,
+        "last_error_type": None,
+    }
+
+
 def test_daemon_status_reports_connected_disconnected_and_gap_evidence(
     service: ProtocolService,
 ) -> None:
