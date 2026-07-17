@@ -9,6 +9,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import weakref
 from collections.abc import Callable, Coroutine
 from concurrent.futures import Future
@@ -41,8 +42,11 @@ from alice_brain_hermes.protocol.models import (
     LoopbackEndpointV1,
 )
 from alice_brain_hermes.protocol.status import (
+    ENERGY_WORKER_STALE_AFTER_MS,
     BridgeConnectionSummaryV1,
     DaemonRuntimeStatusV1,
+    EnergyWorkerHealthV1,
+    EnergyWorkerReportV1,
     RuntimeSchemaVersionsV1,
     SchedulerHealthSummaryV1,
     SemanticEvidenceSummaryV1,
@@ -135,6 +139,12 @@ class _DynamicFoundationReceipt:
         ):
             raise RuntimeError("dynamic profile receipt integrity failed")
         return foundation, profile
+
+
+@dataclass(frozen=True, slots=True)
+class _EnergyWorkerHeartbeat:
+    report: EnergyWorkerReportV1
+    received_monotonic: float
 
 
 def _positive_seconds(value: object, *, name: str) -> float:
@@ -279,6 +289,8 @@ class HermesDaemonRuntime:
         self._daemon_serving_active = True
         self._closing = False
         self._fatal_error: BaseException | None = None
+        self._energy_worker_heartbeat: _EnergyWorkerHeartbeat | None = None
+        self._energy_worker_monotonic: Callable[[], float] = time.monotonic
         self._closed = False
         self._stopped_scheduler_ids: set[str] = set()
         self._schedulers_stopped = False
@@ -954,6 +966,82 @@ class HermesDaemonRuntime:
         finally:
             self._end_operation()
 
+    def report_energy_worker(self, report: EnergyWorkerReportV1) -> bool:
+        """Accept one strict heartbeat while preventing fresh-owner replacement."""
+
+        if type(report) is not EnergyWorkerReportV1:
+            raise TypeError("report must be an exact EnergyWorkerReportV1")
+        self._begin_operation()
+        try:
+            now = self._energy_worker_monotonic()
+            if (
+                isinstance(now, bool)
+                or not isinstance(now, (int, float))
+                or not math.isfinite(float(now))
+                or now < 0
+            ):
+                raise RuntimeError("energy worker monotonic clock is invalid")
+            now = float(now)
+            with self._registry_lock:
+                current = self._energy_worker_heartbeat
+                if current is not None:
+                    if current.report.reporter_id == report.reporter_id:
+                        if report.report_sequence <= current.report.report_sequence:
+                            raise ValueError(
+                                "energy worker report sequence must increase"
+                            )
+                    elif (
+                        now - current.received_monotonic
+                        < ENERGY_WORKER_STALE_AFTER_MS / 1_000
+                    ):
+                        raise RuntimeOwnedError(
+                            "energy worker heartbeat belongs to a fresh reporter"
+                        )
+                self._energy_worker_heartbeat = _EnergyWorkerHeartbeat(report, now)
+            return True
+        finally:
+            self._end_operation()
+
+    def _energy_worker_health_locked(self) -> EnergyWorkerHealthV1:
+        heartbeat = self._energy_worker_heartbeat
+        if heartbeat is None:
+            return EnergyWorkerHealthV1.unreported(
+                stale_after_ms=ENERGY_WORKER_STALE_AFTER_MS
+            )
+        now = self._energy_worker_monotonic()
+        if (
+            isinstance(now, bool)
+            or not isinstance(now, (int, float))
+            or not math.isfinite(float(now))
+            or now < heartbeat.received_monotonic
+        ):
+            raise RuntimeError("energy worker monotonic clock is invalid")
+        elapsed = float(now) - heartbeat.received_monotonic
+        age_ms = min(int(elapsed * 1_000), 2**63 - 1)
+        if elapsed >= ENERGY_WORKER_STALE_AFTER_MS / 1_000:
+            age_ms = max(age_ms, ENERGY_WORKER_STALE_AFTER_MS)
+        report = heartbeat.report
+        if age_ms >= ENERGY_WORKER_STALE_AFTER_MS:
+            status = "stale"
+        elif (
+            not report.worker_started
+            or report.terminal_intent_pending
+            or report.last_error_type is not None
+        ):
+            status = "degraded"
+        else:
+            status = "healthy"
+        return EnergyWorkerHealthV1(
+            status=status,
+            worker_started=report.worker_started,
+            terminal_intent_pending=report.terminal_intent_pending,
+            last_error_type=report.last_error_type,
+            reporter_id=report.reporter_id,
+            report_sequence=report.report_sequence,
+            last_report_age_ms=age_ms,
+            stale_after_ms=ENERGY_WORKER_STALE_AFTER_MS,
+        )
+
     @property
     def brain_ids(self) -> tuple[str, ...]:
         self._begin_operation()
@@ -1060,6 +1148,7 @@ class HermesDaemonRuntime:
                         or self._daemon_serving_active
                     )
                     fail_stopped = self._fatal_error is not None
+                    energy_worker_health = self._energy_worker_health_locked()
             if observability.brain_count != len(persisted):
                 raise LedgerIntegrityError(
                     "persisted observability coverage does not match runtime brains"
@@ -1119,6 +1208,7 @@ class HermesDaemonRuntime:
                     legacy_raw_only_records=observability.legacy_raw_only_records,
                     semantic_gap_records=observability.semantic_gap_records,
                 ),
+                energy_worker_health=energy_worker_health,
                 schema_versions=RuntimeSchemaVersionsV1(
                     semantic=observability.semantic_schema_version,
                     sqlite=sqlite_schema_version,

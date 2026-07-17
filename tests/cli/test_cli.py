@@ -232,6 +232,17 @@ def test_status_payload_rejects_unknown_or_identity_collision_fields() -> None:
             "legacy_raw_only_records": 0,
             "semantic_gap_records": 0,
         },
+        "energy_worker_health": {
+            "schema_version": 1,
+            "status": "unreported",
+            "worker_started": False,
+            "terminal_intent_pending": False,
+            "last_error_type": None,
+            "reporter_id": None,
+            "report_sequence": 0,
+            "last_report_age_ms": None,
+            "stale_after_ms": 5_000,
+        },
         "host_state_scope": "registered_hook_payloads_only",
         "unobserved_hermes_fields": [
             "chunk_capture",
@@ -419,7 +430,16 @@ def test_start_is_idempotent_status_is_live_and_stop_is_authenticated(
 
         doctor = _success(_run_cli(home, "doctor"))
         assert doctor["data"]["healthy"] is True
-        assert {item["status"] for item in doctor["data"]["checks"]} == {"pass"}
+        assert {item["status"] for item in doctor["data"]["checks"]} == {
+            "pass",
+            "warn",
+        }
+        energy_check = next(
+            item
+            for item in doctor["data"]["checks"]
+            if item["id"] == "energy_worker"
+        )
+        assert energy_check["status"] == "warn"
 
         stopped = _success(_run_cli(home, "stop", timeout=20))
         assert stopped["command"] == "daemon.stop"
@@ -1206,6 +1226,12 @@ def test_doctor_fails_visible_persisted_integration_gaps(
             "status": "healthy",
             "worker_running": True,
         },
+        "energy_worker_health": {
+            "status": "healthy",
+            "worker_started": True,
+            "terminal_intent_pending": False,
+            "last_error_type": None,
+        },
         "bridge_connection": {
             "state": "never_connected",
             "total_bridges": 0,
@@ -1253,3 +1279,132 @@ def test_doctor_fails_visible_persisted_integration_gaps(
     )
     assert integration["status"] == "fail"
     assert failed_evidence in integration["data"]["failed_evidence"]
+
+
+@pytest.mark.parametrize(
+    ("energy", "bridge_state", "expected_status", "expected_exit"),
+    [
+        (
+            {
+                "status": "healthy",
+                "worker_started": True,
+                "terminal_intent_pending": False,
+                "last_error_type": None,
+            },
+            "connected",
+            "pass",
+            0,
+        ),
+        (
+            {
+                "status": "degraded",
+                "worker_started": False,
+                "terminal_intent_pending": False,
+                "last_error_type": "RuntimeError",
+            },
+            "connected",
+            "fail",
+            4,
+        ),
+        (
+            {
+                "status": "degraded",
+                "worker_started": True,
+                "terminal_intent_pending": True,
+                "last_error_type": None,
+            },
+            "connected",
+            "fail",
+            4,
+        ),
+        (
+            {
+                "status": "stale",
+                "worker_started": True,
+                "terminal_intent_pending": False,
+                "last_error_type": None,
+            },
+            "connected",
+            "fail",
+            4,
+        ),
+        (
+            {
+                "status": "unreported",
+                "worker_started": False,
+                "terminal_intent_pending": False,
+                "last_error_type": None,
+            },
+            "never_connected",
+            "warn",
+            0,
+        ),
+        (
+            {
+                "status": "unreported",
+                "worker_started": False,
+                "terminal_intent_pending": False,
+                "last_error_type": None,
+            },
+            "connected",
+            "fail",
+            4,
+        ),
+    ],
+)
+def test_doctor_uses_daemon_energy_worker_heartbeat_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    energy: dict[str, object],
+    bridge_state: str,
+    expected_status: str,
+    expected_exit: int,
+) -> None:
+    from alice_brain_hermes import cli
+
+    home = tmp_path / "runtime"
+    home.mkdir(mode=0o700)
+    bridge_counts = {
+        "never_connected": (0, 0),
+        "connected": (1, 1),
+    }
+    total, connected = bridge_counts[bridge_state]
+    daemon: dict[str, object] = {
+        "runtime_ready": True,
+        "shutting_down": False,
+        "degraded_brain_count": 0,
+        "instance_nonce": "nonce",
+        "scheduler_health": {"status": "healthy"},
+        "snapshot_health": {"status": "healthy", "worker_running": True},
+        "bridge_connection": {
+            "state": bridge_state,
+            "total_bridges": total,
+            "connected_open_bridges": connected,
+            "disconnected_open_bridges": 0,
+            "clean_closed_bridges": 0,
+            "abandoned_bridges": 0,
+        },
+        "energy_worker_health": energy,
+        "cognition_mode": "local",
+        "trace_complete": True,
+        "semantic_complete": True,
+        "dropped_events": 0,
+        "host_state_scope": "registered_hook_payloads_only",
+        "unobserved_hermes_fields": ["chunk_capture", "reasoning_capture"],
+        "schema_versions": {},
+    }
+    monkeypatch.setattr(cli, "_validate_existing_home", lambda _home: None)
+    monkeypatch.setattr(cli, "_discovery_exists", lambda _home: True)
+    monkeypatch.setattr(
+        cli,
+        "_status",
+        lambda _home, *, timeout_seconds: {"running": True, "daemon": daemon},
+    )
+
+    data, exit_code = cli._doctor(home, timeout_seconds=1.0)
+
+    energy_check = next(
+        item for item in data["checks"] if item["id"] == "energy_worker"
+    )
+    assert energy_check["status"] == expected_status
+    assert exit_code == expected_exit

@@ -556,6 +556,7 @@ def _status(home: Path, *, timeout_seconds: float) -> dict[str, object]:
         "continuous_runtime": runtime["continuous_runtime"],
         "scheduler_health": runtime["scheduler_health"],
         "snapshot_health": snapshot,
+        "energy_worker_health": runtime["energy_worker_health"],
         "bridge_connection": runtime["bridge_connection"],
         "trace_complete": runtime["trace_complete"],
         "semantic_complete": runtime["semantic_complete"],
@@ -1105,6 +1106,26 @@ def _doctor(home: Path, *, timeout_seconds: float) -> tuple[dict[str, object], i
                         and daemon["snapshot_health"].get("status") == "healthy"
                         and daemon["snapshot_health"].get("worker_running") is True
                     )
+                    bridge_for_energy = daemon.get("bridge_connection")
+                    energy = daemon.get("energy_worker_health")
+                    energy_status = (
+                        energy.get("status") if isinstance(energy, dict) else None
+                    )
+                    host_inactive = (
+                        isinstance(bridge_for_energy, dict)
+                        and bridge_for_energy.get("state")
+                        in {"never_connected", "idle"}
+                    )
+                    energy_check_status = (
+                        "pass"
+                        if energy_status == "healthy"
+                        else (
+                            "warn"
+                            if energy_status == "unreported" and host_inactive
+                            else "fail"
+                        )
+                    )
+                    healthy = healthy and energy_check_status != "fail"
                     checks.append(
                         {
                             "id": "daemon",
@@ -1120,10 +1141,29 @@ def _doctor(home: Path, *, timeout_seconds: float) -> tuple[dict[str, object], i
                             },
                         }
                     )
+                    checks.append(
+                        {
+                            "id": "energy_worker",
+                            "status": energy_check_status,
+                            "summary": (
+                                "Hermes-hosted energy worker heartbeat is healthy"
+                                if energy_check_status == "pass"
+                                else (
+                                    "Hermes host has not connected or reported "
+                                    "energy health"
+                                    if energy_check_status == "warn"
+                                    else "Hermes-hosted energy worker heartbeat "
+                                    "is unhealthy"
+                                )
+                            ),
+                            "data": energy if isinstance(energy, dict) else {},
+                        }
+                    )
                     required_observability = {
                         "bridge_connection",
                         "cognition_mode",
                         "dropped_events",
+                        "energy_worker_health",
                         "scheduler_health",
                         "snapshot_health",
                         "semantic_complete",

@@ -56,6 +56,7 @@ _BOOTSTRAP_MAX_STRING_BYTES = 16_384
 # final int64 value is therefore reserved for ``next_capture_seq``.  Keep this
 # stdlib-only registration boundary inert instead of importing runtime models.
 _BOOTSTRAP_MAX_CAPTURE_SEQUENCE = 2**63 - 2
+_ENERGY_HEALTH_REPORT_INTERVAL_SECONDS = 1.0
 _EMPTY_BOOTSTRAP_COPY_STATS: MappingProxyType[str, int] = MappingProxyType({})
 _HOST_VALUE_UNRESOLVED = object()
 
@@ -1466,6 +1467,10 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
     identity_retry_after = 0.0
     energy_configured = False
     energy_retry_after = 0.0
+    energy_health_port: Any | None = None
+    energy_health_retry_after = 0.0
+    energy_health_next_report = 0.0
+    last_energy_health_report: tuple[bool, bool, str | None] | None = None
     prelude_ready = False
     while True:
         try:
@@ -1579,6 +1584,20 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
             current_time = time.monotonic()
             if (
                 shared_llm_factory is not None
+                and energy_health_port is None
+                and current_time >= energy_health_retry_after
+            ):
+                try:
+                    from alice_brain_hermes.hermes.energy_client import (
+                        DaemonEnergyWorkerHealthPort,
+                    )
+
+                    energy_health_port = DaemonEnergyWorkerHealthPort(runtime_home)
+                except BaseException as error:
+                    buffer.mark_worker_degraded(error)
+                    energy_health_retry_after = current_time + 0.1
+            if (
+                shared_llm_factory is not None
                 and not identity_configured
                 and current_time >= identity_retry_after
             ):
@@ -1617,7 +1636,14 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                         llm_factory=shared_llm_factory,
                     )
                 except BaseException as error:
-                    buffer.mark_worker_degraded(error)
+                    try:
+                        buffer.publish_energy_worker_diagnostics(
+                            worker_started=False,
+                            terminal_intent_pending=False,
+                            error_type=type(error).__name__[:160],
+                        )
+                    except BaseException as diagnostic_error:
+                        buffer.mark_worker_degraded(diagnostic_error)
                     energy_configured = buffer.energy_worker_for_worker() is not None
                     energy_retry_after = current_time + 0.1
                 else:
@@ -1628,6 +1654,37 @@ def _bootstrap_worker_main(buffer: _BootstrapCaptureBuffer) -> None:
                 and not _ensure_energy_worker_running(buffer)
             ):
                 energy_retry_after = current_time + 0.1
+            if energy_health_port is not None:
+                health = buffer.health
+                energy_diagnostics = (
+                    health.energy_worker_started,
+                    health.energy_terminal_intent_pending,
+                    health.energy_worker_error,
+                )
+                if (
+                    energy_diagnostics != last_energy_health_report
+                    or current_time >= energy_health_next_report
+                ):
+                    try:
+                        accepted = energy_health_port.report(
+                            worker_started=energy_diagnostics[0],
+                            terminal_intent_pending=energy_diagnostics[1],
+                            error_type=energy_diagnostics[2],
+                        )
+                        if accepted is not True:
+                            raise RuntimeError(
+                                "daemon rejected the energy worker health report"
+                            )
+                    except BaseException:
+                        # The daemon will expose this transport break as
+                        # unreported/stale. Do not overwrite the underlying
+                        # worker/capture diagnostic with a reporter symptom.
+                        energy_health_next_report = current_time + 0.1
+                    else:
+                        last_energy_health_report = energy_diagnostics
+                        energy_health_next_report = (
+                            current_time + _ENERGY_HEALTH_REPORT_INTERVAL_SECONDS
+                        )
             capture = buffer.next_for_worker()
             if capture is None:
                 buffer.publish_context(bridge.projections.read_context())

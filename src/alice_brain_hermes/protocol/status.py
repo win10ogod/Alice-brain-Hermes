@@ -15,6 +15,9 @@ from alice_brain_hermes.protocol.models import (
     RECORD_SCHEMA_VERSION,
 )
 
+ENERGY_WORKER_STALE_AFTER_MS = 5_000
+_MAX_HEARTBEAT_INTEGER = 2**63 - 1
+
 UNOBSERVED_HERMES_FIELDS = (
     "chunk_capture",
     "reasoning_capture",
@@ -134,6 +137,108 @@ class SnapshotStatusV1(_StrictStatusModel):
         return self
 
 
+def _validate_error_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not value or len(value) > 160 or any(
+        not (character.isascii() and (character.isalnum() or character == "_"))
+        for character in value
+    ):
+        raise ValueError("energy worker error type is invalid")
+    return value
+
+
+class EnergyWorkerReportV1(_StrictStatusModel):
+    """One authenticated host-process heartbeat with strict ownership evidence."""
+
+    schema_version: Literal[1] = 1
+    reporter_id: str
+    report_sequence: int = Field(ge=1, le=_MAX_HEARTBEAT_INTEGER)
+    worker_started: bool
+    terminal_intent_pending: bool
+    last_error_type: str | None = Field(default=None, max_length=160)
+
+    @field_validator("reporter_id")
+    @classmethod
+    def _reporter_id(cls, value: str) -> str:
+        return validate_id(value)
+
+    @field_validator("last_error_type")
+    @classmethod
+    def _last_error_type(cls, value: str | None) -> str | None:
+        return _validate_error_type(value)
+
+
+class EnergyWorkerHealthV1(_StrictStatusModel):
+    """Daemon-owned bounded projection of one host energy worker heartbeat."""
+
+    schema_version: Literal[1] = 1
+    status: Literal["unreported", "healthy", "degraded", "stale"]
+    worker_started: bool
+    terminal_intent_pending: bool
+    last_error_type: str | None = Field(default=None, max_length=160)
+    reporter_id: str | None = None
+    report_sequence: int = Field(ge=0, le=_MAX_HEARTBEAT_INTEGER)
+    last_report_age_ms: int | None = Field(
+        default=None,
+        ge=0,
+        le=_MAX_HEARTBEAT_INTEGER,
+    )
+    stale_after_ms: int = Field(ge=1, le=60_000)
+
+    @field_validator("reporter_id")
+    @classmethod
+    def _reporter_id(cls, value: str | None) -> str | None:
+        return None if value is None else validate_id(value)
+
+    @field_validator("last_error_type")
+    @classmethod
+    def _last_error_type(cls, value: str | None) -> str | None:
+        return _validate_error_type(value)
+
+    @classmethod
+    def unreported(cls, *, stale_after_ms: int) -> EnergyWorkerHealthV1:
+        return cls(
+            status="unreported",
+            worker_started=False,
+            terminal_intent_pending=False,
+            last_error_type=None,
+            reporter_id=None,
+            report_sequence=0,
+            last_report_age_ms=None,
+            stale_after_ms=stale_after_ms,
+        )
+
+    @model_validator(mode="after")
+    def _status_matches_evidence(self) -> EnergyWorkerHealthV1:
+        if self.reporter_id is None:
+            if (
+                self.status != "unreported"
+                or self.worker_started
+                or self.terminal_intent_pending
+                or self.last_error_type is not None
+                or self.report_sequence != 0
+                or self.last_report_age_ms is not None
+            ):
+                raise ValueError("unreported energy health carries report evidence")
+            return self
+        if self.report_sequence == 0 or self.last_report_age_ms is None:
+            raise ValueError("reported energy health is missing heartbeat evidence")
+        if self.last_report_age_ms >= self.stale_after_ms:
+            expected = "stale"
+        elif (
+            not self.worker_started
+            or self.terminal_intent_pending
+            or self.last_error_type is not None
+        ):
+            expected = "degraded"
+        else:
+            expected = "healthy"
+        if self.status != expected:
+            raise ValueError("energy worker status conflicts with heartbeat evidence")
+        return self
+
+
 class DaemonRuntimeStatusV1(_StrictStatusModel):
     """One white-box status projection; no field is inferred from trust."""
 
@@ -151,6 +256,7 @@ class DaemonRuntimeStatusV1(_StrictStatusModel):
     semantic_complete: bool
     dropped_events: int = Field(ge=0)
     semantic_evidence: SemanticEvidenceSummaryV1
+    energy_worker_health: EnergyWorkerHealthV1
     host_state_scope: Literal[
         "registered_hook_payloads_only"
     ] = "registered_hook_payloads_only"
@@ -203,9 +309,12 @@ class DaemonRuntimeStatusV1(_StrictStatusModel):
 
 
 __all__ = [
+    "ENERGY_WORKER_STALE_AFTER_MS",
     "UNOBSERVED_HERMES_FIELDS",
     "BridgeConnectionSummaryV1",
     "DaemonRuntimeStatusV1",
+    "EnergyWorkerHealthV1",
+    "EnergyWorkerReportV1",
     "RuntimeSchemaVersionsV1",
     "SchedulerHealthSummaryV1",
     "SemanticEvidenceSummaryV1",

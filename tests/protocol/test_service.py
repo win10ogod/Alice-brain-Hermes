@@ -25,6 +25,7 @@ from alice_brain_hermes.protocol.models import (
     ProtocolLimitsV1,
 )
 from alice_brain_hermes.protocol.service import ProtocolService
+from alice_brain_hermes.protocol.status import EnergyWorkerReportV1
 from alice_brain_hermes.runtime.daemon import HermesDaemonRuntime
 from alice_brain_hermes.runtime.store import SQLITE_SCHEMA_VERSION, SQLiteLedger
 
@@ -139,6 +140,135 @@ def initialize(connection, request_id: int = 1) -> dict[str, object]:
             )
         )
     )
+
+
+def energy_report(
+    reporter_id: str,
+    sequence: int,
+    *,
+    worker_started: bool = True,
+    terminal_intent_pending: bool = False,
+    last_error_type: str | None = None,
+) -> dict[str, object]:
+    return EnergyWorkerReportV1(
+        reporter_id=reporter_id,
+        report_sequence=sequence,
+        worker_started=worker_started,
+        terminal_intent_pending=terminal_intent_pending,
+        last_error_type=last_error_type,
+    ).model_dump(mode="json")
+
+
+def test_energy_worker_report_is_authenticated_owned_and_stales(
+    service: ProtocolService,
+) -> None:
+    connection = service.new_connection()
+    initialize(connection)
+    now = 100.0
+    service.runtime._energy_worker_monotonic = lambda: now
+    first = new_id()
+    second = new_id()
+
+    unreported = decode(connection.handle_frame(request(2, "daemon.status")))[
+        "result"
+    ]["energy_worker_health"]
+    assert unreported["status"] == "unreported"
+
+    accepted = decode(
+        connection.handle_frame(
+            request(3, "energy.worker.report", energy_report(first, 1))
+        )
+    )
+    assert accepted["result"] == {"accepted": True}
+    healthy = decode(connection.handle_frame(request(4, "daemon.status")))["result"]
+    assert healthy["energy_worker_health"] == {
+        "schema_version": 1,
+        "status": "healthy",
+        "worker_started": True,
+        "terminal_intent_pending": False,
+        "last_error_type": None,
+        "reporter_id": first,
+        "report_sequence": 1,
+        "last_report_age_ms": 0,
+        "stale_after_ms": 5_000,
+    }
+
+    duplicate = decode(
+        connection.handle_frame(
+            request(5, "energy.worker.report", energy_report(first, 1))
+        )
+    )
+    assert duplicate["error"]["code"] == "invalid_params"
+    competing = decode(
+        connection.handle_frame(
+            request(6, "energy.worker.report", energy_report(second, 1))
+        )
+    )
+    assert competing["error"]["code"] == "energy_worker_owned"
+
+    now = 104.999
+    still_fresh = decode(connection.handle_frame(request(7, "daemon.status")))[
+        "result"
+    ]
+    assert still_fresh["energy_worker_health"]["status"] == "healthy"
+    still_owned = decode(
+        connection.handle_frame(
+            request(8, "energy.worker.report", energy_report(second, 1))
+        )
+    )
+    assert still_owned["error"]["code"] == "energy_worker_owned"
+
+    now = 105.0
+    stale = decode(connection.handle_frame(request(9, "daemon.status")))["result"]
+    assert stale["energy_worker_health"]["status"] == "stale"
+    assert stale["energy_worker_health"]["last_report_age_ms"] == 5_000
+
+    takeover = decode(
+        connection.handle_frame(
+            request(
+                10,
+                "energy.worker.report",
+                energy_report(second, 1, last_error_type="RuntimeError"),
+            )
+        )
+    )
+    assert takeover["result"] == {"accepted": True}
+    degraded = decode(connection.handle_frame(request(11, "daemon.status")))["result"]
+    assert degraded["energy_worker_health"]["status"] == "degraded"
+    assert degraded["energy_worker_health"]["reporter_id"] == second
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},
+        {**energy_report(new_id(), 1), "extra": True},
+        {**energy_report(new_id(), 1), "worker_started": 1},
+        {**energy_report(new_id(), 1), "last_error_type": "bad-error"},
+        {
+            key: value
+            for key, value in energy_report(new_id(), 1).items()
+            if key != "schema_version"
+        },
+        {
+            key: value
+            for key, value in energy_report(new_id(), 1).items()
+            if key != "last_error_type"
+        },
+    ],
+)
+def test_energy_worker_report_rejects_non_exact_wire(
+    service: ProtocolService,
+    params: dict[str, object],
+) -> None:
+    connection = service.new_connection()
+    initialize(connection)
+
+    rejected = decode(
+        connection.handle_frame(request(2, "energy.worker.report", params))
+    )
+
+    assert rejected["error"]["code"] == "invalid_params"
 
 
 def test_closed_connection_rejects_late_worker_dispatch_without_mutation(
@@ -510,6 +640,17 @@ def test_daemon_status_is_typed_complete_zero_evidence_for_fresh_runtime(
             "semantic_records": 0,
             "legacy_raw_only_records": 0,
             "semantic_gap_records": 0,
+        },
+        "energy_worker_health": {
+            "schema_version": 1,
+            "status": "unreported",
+            "worker_started": False,
+            "terminal_intent_pending": False,
+            "last_error_type": None,
+            "reporter_id": None,
+            "report_sequence": 0,
+            "last_report_age_ms": None,
+            "stale_after_ms": 5_000,
         },
         "host_state_scope": "registered_hook_payloads_only",
         "unobserved_hermes_fields": [

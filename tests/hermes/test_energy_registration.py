@@ -54,6 +54,7 @@ def test_bootstrap_background_wires_energy_when_identity_is_opted_out(
 
     bridge_arguments: dict[str, object] = {}
     port_arguments: dict[str, object] = {}
+    health_reports: list[dict[str, object]] = []
     workers: list[Worker] = []
 
     class Projection:
@@ -86,6 +87,16 @@ def test_bootstrap_background_wires_energy_when_identity_is_opted_out(
             super().__init__(**kwargs)
             workers.append(self)
 
+    class HealthPort:
+        def __init__(self, runtime_home: object) -> None:
+            assert runtime_home == tmp_path
+
+        def report(self, **kwargs: object) -> bool:
+            health_reports.append(kwargs)
+            if len(health_reports) == 1:
+                raise ConnectionError("first heartbeat transport failed")
+            return True
+
     monkeypatch.setenv(
         identity_module.IDENTITY_LLM_MODE_ENV,
         identity_module.IdentityLlmMode.OFF.value,
@@ -107,6 +118,11 @@ def test_bootstrap_background_wires_energy_when_identity_is_opted_out(
         ),
     )
     monkeypatch.setattr(energy_client_module, "DaemonEnergyAssessmentLeasePort", Port)
+    monkeypatch.setattr(
+        energy_client_module,
+        "DaemonEnergyWorkerHealthPort",
+        HealthPort,
+    )
     monkeypatch.setattr(energy_module, "EnergyAssessmentWorker", EnergyWorker)
 
     bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
@@ -115,7 +131,8 @@ def test_bootstrap_background_wires_energy_when_identity_is_opted_out(
     bootstrap.bind_host_context(Context())
 
     def stop_on_next_record() -> None:
-        bootstrap._stop_requested = True
+        if len(health_reports) >= 2:
+            bootstrap._stop_requested = True
         return None
 
     monkeypatch.setattr(bootstrap, "next_for_worker", stop_on_next_record)
@@ -131,6 +148,18 @@ def test_bootstrap_background_wires_energy_when_identity_is_opted_out(
     assert bridge_arguments["profile_factory"] is port_arguments["profile_factory"]
     assert worker.arguments["llm_factory"]() is Context.llm
     assert set(worker.arguments) == {"lease_port", "llm_factory"}
+    assert health_reports == [
+        {
+            "worker_started": True,
+            "terminal_intent_pending": False,
+            "error_type": None,
+        },
+        {
+            "worker_started": True,
+            "terminal_intent_pending": False,
+            "error_type": None,
+        },
+    ]
     assert not {
         "agent_id",
         "max_tokens",

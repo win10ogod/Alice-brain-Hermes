@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from alice_brain_hermes.errors import DaemonClientError
-from alice_brain_hermes.ids import validate_id
+from alice_brain_hermes.ids import new_id, validate_id
 from alice_brain_hermes.protocol.client import DaemonClient
 from alice_brain_hermes.protocol.energy import (
     EnergyAssessmentChoiceV1,
@@ -19,6 +20,7 @@ from alice_brain_hermes.protocol.energy import (
     EnergyAssessmentProvenanceV1,
 )
 from alice_brain_hermes.protocol.models import BrainProfileV1
+from alice_brain_hermes.protocol.status import EnergyWorkerReportV1
 
 ClientFactory = Callable[..., Any]
 ProfileFactory = Callable[[], BrainProfileV1]
@@ -177,4 +179,71 @@ class DaemonEnergyAssessmentLeasePort:
         return status
 
 
-__all__ = ["DaemonEnergyAssessmentLeasePort"]
+class DaemonEnergyWorkerHealthPort:
+    """Publish bounded source health through fresh authenticated connections."""
+
+    def __init__(
+        self,
+        runtime_home: str | Path,
+        *,
+        reporter_id: str | None = None,
+        client_factory: ClientFactory = DaemonClient.connect,
+        timeout_seconds: float = 0.5,
+    ) -> None:
+        if not callable(client_factory):
+            raise TypeError("client_factory must be callable")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(float(timeout_seconds))
+            or not 0 < float(timeout_seconds) <= 300
+        ):
+            raise ValueError("timeout_seconds must be finite and between 0 and 300")
+        self._runtime_home = Path(runtime_home)
+        self._reporter_id = validate_id(reporter_id or new_id())
+        self._client_factory = client_factory
+        self._timeout_seconds = float(timeout_seconds)
+        self._sequence = 0
+        self._lock = threading.Lock()
+
+    def report(
+        self,
+        *,
+        worker_started: bool,
+        terminal_intent_pending: bool,
+        error_type: str | None,
+    ) -> bool:
+        with self._lock:
+            report = EnergyWorkerReportV1(
+                reporter_id=self._reporter_id,
+                report_sequence=self._sequence + 1,
+                worker_started=worker_started,
+                terminal_intent_pending=terminal_intent_pending,
+                last_error_type=error_type,
+            )
+            self._sequence = report.report_sequence
+            client = self._client_factory(
+                self._runtime_home,
+                initialize=True,
+                timeout_seconds=self._timeout_seconds,
+            )
+            try:
+                result = client.call(
+                    "energy.worker.report",
+                    report.model_dump(mode="json"),
+                )
+                if not isinstance(result, dict) or set(result) != {"accepted"}:
+                    raise DaemonClientError(
+                        "energy worker report result fields are invalid"
+                    )
+                if type(result["accepted"]) is not bool:
+                    raise DaemonClientError("energy worker report result is invalid")
+                return result["accepted"]
+            finally:
+                DaemonEnergyAssessmentLeasePort._close(client)
+
+
+__all__ = [
+    "DaemonEnergyAssessmentLeasePort",
+    "DaemonEnergyWorkerHealthPort",
+]

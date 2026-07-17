@@ -29,6 +29,7 @@ from alice_brain_hermes.errors import (
     IdempotencyConflictError,
     LedgerIntegrityError,
     ResponseSizeError,
+    RuntimeOwnedError,
 )
 from alice_brain_hermes.ids import new_id, validate_id
 from alice_brain_hermes.protocol.diagnostics import (
@@ -51,6 +52,7 @@ from alice_brain_hermes.protocol.models import (
     copy_protocol_limits,
     validate_bridge_record_tree,
 )
+from alice_brain_hermes.protocol.status import EnergyWorkerReportV1
 from alice_brain_hermes.runtime.daemon import HermesDaemonRuntime
 
 _BRIDGE_RECORD_ADAPTER = TypeAdapter(BridgeRecordV1)
@@ -641,6 +643,25 @@ class ProtocolConnection:
             brain_id = validate_id(params.get("brain_id"))  # type: ignore[arg-type]
             lease = self.service.runtime.claim_energy_assessment(brain_id)
             return {"lease": (None if lease is None else lease.model_dump(mode="json"))}
+        if method == "energy.worker.report":
+            if set(params) != {
+                "schema_version",
+                "reporter_id",
+                "report_sequence",
+                "worker_started",
+                "terminal_intent_pending",
+                "last_error_type",
+            }:
+                raise ProtocolFault("invalid_params", "request params are invalid")
+            report = EnergyWorkerReportV1.model_validate(params, strict=True)
+            try:
+                accepted = self.service.runtime.report_energy_worker(report)
+            except RuntimeOwnedError:
+                raise ProtocolFault(
+                    "energy_worker_owned",
+                    "energy worker heartbeat has a fresh owner",
+                ) from None
+            return {"accepted": accepted}
         if method == "energy.assessment.complete":
             self._only(params, {"lease_id", "choice", "provenance"})
             lease_id = validate_id(params.get("lease_id"))  # type: ignore[arg-type]
