@@ -217,3 +217,58 @@ def test_v6_legacy_neutral_energy_is_requeued_for_hermes_host_llm(
         lease = engine.claim_energy_assessment()
         assert lease is not None
         assert lease.action_id == action_id
+
+
+def test_v6_receipt_terminal_action_is_reconstructed_during_upgrade(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-receipt-action.db"
+    brain_id = new_id()
+    action_id = "legacy-receipt-action"
+    with SQLiteLedger.open(database) as ledger:
+        engine = ConsciousEngine(ledger, brain_id, actor_id=brain_id)
+        for event_type, payload in (
+            (
+                "action.proposed",
+                {"action_id": action_id, "intent": {"kind": "hermes.tool_call"}},
+            ),
+            ("action.prepared", {"action_id": action_id, "branch_id": None}),
+            ("action.dispatched", {"action_id": action_id}),
+            (
+                "action.receipt",
+                {
+                    "action_id": action_id,
+                    "status": "success",
+                    "effect_observation_ids": [],
+                },
+            ),
+        ):
+            engine.append(
+                new_event(
+                    event_type,
+                    brain_id,
+                    brain_id,
+                    payload,
+                    action_id=action_id,
+                )
+            )
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP INDEX energy_assessment_pending")
+        connection.execute("DROP TABLE energy_assessment_lease")
+        connection.execute(
+            "UPDATE schema_metadata SET value = '6' WHERE key = 'schema_version'"
+        )
+        connection.execute("PRAGMA user_version = 6")
+
+    with SQLiteLedger.open(database) as migrated:
+        state = migrated.replay(brain_id)
+        action = state.actions[action_id]
+        assert action.phase.value == "reconstructed"
+        assert action.reconstruction == {
+            "action_id": action_id,
+            "assessment": "execution_succeeded",
+        }
+        migration = migrated.get_event(action.last_event_id)
+        assert migration is not None
+        assert migration.adapter_id == "alice-brain-hermes-action-migration-v1"

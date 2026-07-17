@@ -155,6 +155,7 @@ _ENERGY_WORKER_FAILURE_CODE = re.compile(
 _ENERGY_ADAPTER_ID = "alice-brain-hermes-energy-v1"
 _ENERGY_MIGRATION_ADAPTER_ID = "alice-brain-hermes-energy-migration-v1"
 _ENERGY_PURPOSE = "alice_energy_assessment"
+_ACTION_MIGRATION_ADAPTER_ID = "alice-brain-hermes-action-migration-v1"
 
 
 def _assert_safe_runtime_sqlite_paths(
@@ -935,7 +936,49 @@ class SQLiteLedger:
     ) -> None:
         for statement in _statements(_CREATE_ENERGY_SCHEMA):
             self._connection.execute(statement)
+        self._migrate_legacy_terminal_actions(final_states)
         self._migrate_legacy_neutral_energy(final_states)
+
+    def _migrate_legacy_terminal_actions(
+        self,
+        final_states: dict[str, BrainState],
+    ) -> None:
+        for brain_id, initial_state in tuple(final_states.items()):
+            state = initial_state
+            for action in initial_state.action_records:
+                if action.phase is ActionPhase.BLOCKED:
+                    assessment = "dispatch_prevented"
+                elif action.phase is ActionPhase.RECEIPT:
+                    assessment = (
+                        "execution_succeeded"
+                        if action.outcome is not None
+                        and action.outcome.value == "success"
+                        else (
+                            "execution_failed"
+                            if action.outcome is not None
+                            and action.outcome.value == "failure"
+                            else "execution_unknown"
+                        )
+                    )
+                else:
+                    continue
+                reconstructed = new_event(
+                    "action.reconstructed",
+                    brain_id,
+                    brain_id,
+                    {
+                        "action_id": action.action_id,
+                        "assessment": assessment,
+                    },
+                    adapter_id=_ACTION_MIGRATION_ADAPTER_ID,
+                    action_id=action.action_id,
+                    causation_id=action.last_event_id,
+                )
+                _events, state = self._insert_identity_event_batch_in_transaction(
+                    state,
+                    (reconstructed,),
+                )
+            final_states[brain_id] = state
 
     @staticmethod
     def _legacy_neutral_energy_payload(action_id: str) -> dict[str, object]:
