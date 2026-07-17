@@ -330,6 +330,26 @@ def test_energy_worker_diagnostics_surface_sanitized_internal_error() -> None:
     bootstrap._stop_energy_worker()  # type: ignore[attr-defined]
 
 
+def test_energy_diagnostic_does_not_mask_prior_bootstrap_worker_error() -> None:
+    from alice_brain_hermes.hermes import registration
+
+    bootstrap = registration._BootstrapCaptureBuffer(  # type: ignore[attr-defined]
+        start_worker_on_capture=False
+    )
+    bootstrap.mark_worker_degraded(MemoryError("bootstrap prelude failed"))
+    bootstrap.publish_energy_worker_diagnostics(
+        worker_started=False,
+        terminal_intent_pending=False,
+        error_type="DaemonClientError",
+    )
+
+    health = bootstrap.health
+    assert health.degraded is True
+    assert health.last_error == "MemoryError"
+    assert health.worker_error == "MemoryError"
+    assert health.energy_worker_error == "DaemonClientError"
+
+
 @pytest.mark.parametrize(
     ("internal_error", "terminal_pending", "expected_error"),
     [

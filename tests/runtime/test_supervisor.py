@@ -1250,7 +1250,9 @@ def test_daemon_main_error_is_captured_by_real_dmon(
         release.touch()
         process.wait(timeout=10.0)
         tail = adapter.redacted_log_tail()
-        assert tail == "alice-brain-hermes daemon failed: FileExistsError\n"
+        assert tail.splitlines() == [
+            "alice-brain-hermes daemon failed: FileExistsError"
+        ]
         assert os.fspath(bad_home) not in tail
     finally:
         adapter.release_parent_guard()

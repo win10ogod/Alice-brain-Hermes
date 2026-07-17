@@ -361,11 +361,11 @@ class _BootstrapCaptureBuffer:
                 ),
                 last_error=(
                     self._emergency_last_error
-                    or energy_diagnostic
                     or health.last_error
+                    or energy_diagnostic
                     or "health_reconciliation_required"
                 ),
-                worker_error=energy_diagnostic or health.worker_error,
+                worker_error=health.worker_error or energy_diagnostic,
                 energy_worker_started=health.energy_worker_started,
                 energy_terminal_intent_pending=energy_pending,
                 energy_worker_error=energy_error,
